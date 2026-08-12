@@ -4,6 +4,26 @@ import { config } from "../config.js";
 
 const KEEPALIVE_INTERVAL_MS = 5000;
 
+/** セグメント内の単語の多数決で話者番号を決める */
+function dominantSpeaker(words?: Array<{ speaker?: number }>): number | undefined {
+  if (!words?.length) return undefined;
+  const counts = new Map<number, number>();
+  for (const w of words) {
+    if (typeof w.speaker === "number") {
+      counts.set(w.speaker, (counts.get(w.speaker) ?? 0) + 1);
+    }
+  }
+  let best: number | undefined;
+  let bestCount = 0;
+  for (const [speaker, count] of counts) {
+    if (count > bestCount) {
+      best = speaker;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 /**
  * Deepgram streaming STT アダプタ。
  * wss://api.deepgram.com/v1/listen に 16kHz mono PCM16 を流し、
@@ -27,6 +47,7 @@ export class DeepgramSttAdapter implements SttAdapter {
       interim_results: "true",
       punctuate: "true",
       smart_format: "true",
+      diarize: "true",
     });
     // nova-3 系は keyterm(日本語対応・最大約100語)、nova-2 以前は keywords でブースト
     const useKeyterm = config.deepgramModel.startsWith("nova-3");
@@ -57,9 +78,14 @@ export class DeepgramSttAdapter implements SttAdapter {
         try {
           const msg = JSON.parse(data.toString());
           if (msg.type === "Results") {
-            const text: string = msg.channel?.alternatives?.[0]?.transcript ?? "";
+            const alt = msg.channel?.alternatives?.[0];
+            const text: string = alt?.transcript ?? "";
             if (text.length > 0) {
-              this.transcriptCb?.({ text, isFinal: msg.is_final === true });
+              this.transcriptCb?.({
+                text,
+                isFinal: msg.is_final === true,
+                speaker: dominantSpeaker(alt?.words),
+              });
             }
           }
         } catch {

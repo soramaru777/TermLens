@@ -27,7 +27,7 @@ export type ClientMessage =
 
 export type ServerMessage =
   | { type: "ready" }
-  | { type: "transcript"; text: string; isFinal: boolean }
+  | { type: "transcript"; text: string; isFinal: boolean; speaker: number | null }
   | { type: "cards"; cards: TermCard[] }
   | { type: "card_update"; term: string; description: string; links: TermLink[] }
   | { type: "status"; state: "stt_connecting" | "stt_open" | "stt_closed" | "extracting" }

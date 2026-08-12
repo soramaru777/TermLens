@@ -20,7 +20,7 @@ export class MockSttAdapter implements SttAdapter {
 
   private playLine(index: number): void {
     if (this.stopped) return;
-    const line = MOCK_SCRIPT[index % MOCK_SCRIPT.length];
+    const { text, speaker } = MOCK_SCRIPT[index % MOCK_SCRIPT.length];
     const steps = 3; // interim 回数
     let step = 0;
 
@@ -28,11 +28,11 @@ export class MockSttAdapter implements SttAdapter {
       if (this.stopped) return;
       step += 1;
       if (step <= steps) {
-        const len = Math.ceil((line.length * step) / (steps + 1));
-        this.transcriptCb?.({ text: line.slice(0, len), isFinal: false });
+        const len = Math.ceil((text.length * step) / (steps + 1));
+        this.transcriptCb?.({ text: text.slice(0, len), isFinal: false, speaker });
         this.timer = setTimeout(tick, 600);
       } else {
-        this.transcriptCb?.({ text: line, isFinal: true });
+        this.transcriptCb?.({ text, isFinal: true, speaker });
         this.timer = setTimeout(() => this.playLine(index + 1), 1500);
       }
     };

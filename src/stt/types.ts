@@ -1,6 +1,8 @@
 export interface TranscriptEvent {
   text: string;
   isFinal: boolean;
+  /** 話者番号(diarization有効時。不明なら undefined) */
+  speaker?: number;
 }
 
 export interface SttAdapter {

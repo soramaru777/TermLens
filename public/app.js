@@ -140,8 +140,8 @@ function connectWs(token, glossary) {
         break;
       case "transcript":
         if (msg.isFinal) {
-          finalLines.push(msg.text);
-          finalText.append(renderLine(msg.text));
+          finalLines.push({ text: msg.text, speaker: msg.speaker });
+          renderTranscript();
           interimText.textContent = "";
         } else {
           interimText.textContent = msg.text;
@@ -155,7 +155,7 @@ function connectWs(token, glossary) {
           addHighlightTerm(card.correctedFrom, card.term);
           for (const form of card.surfaceForms ?? []) addHighlightTerm(form, card.term);
         }
-        rebuildTranscript();
+        renderTranscript();
         setStatus("聞き取り中");
         break;
       case "card_update":
@@ -235,10 +235,27 @@ function jumpToCard(term) {
   card.classList.add("flash");
 }
 
-// 新しいカードが出たら、既に表示済みの文字起こしにもハイライトを反映する
-function rebuildTranscript() {
+function speakerLabel(speaker) {
+  return "話者" + String.fromCharCode(65 + (speaker % 26)); // 話者A, 話者B, …
+}
+
+// 文字起こし全体を再描画する。連続する同一話者の発言は1つの段落にまとめ、
+// 話者が変わったら新しい段落+話者チップを付ける。カード追加時のハイライト反映も兼ねる。
+function renderTranscript() {
   finalText.textContent = "";
-  for (const text of finalLines) finalText.append(renderLine(text));
+  let group = null;
+  let groupSpeaker;
+  for (const { text, speaker } of finalLines) {
+    if (!group || speaker !== groupSpeaker) {
+      group = el("div", "utterance");
+      groupSpeaker = speaker;
+      if (speaker != null) {
+        group.append(el("span", `speaker-chip sp-${speaker % 6}`, speakerLabel(speaker)));
+      }
+      finalText.append(group);
+    }
+    group.append(renderLine(text));
+  }
 }
 
 function el(tag, className, text) {

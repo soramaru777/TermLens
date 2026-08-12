@@ -68,7 +68,7 @@ export class Session {
     const stt = createSttAdapter();
     this.stt = stt;
     stt.onTranscript((e) => {
-      this.send({ type: "transcript", text: e.text, isFinal: e.isFinal });
+      this.send({ type: "transcript", text: e.text, isFinal: e.isFinal, speaker: e.speaker ?? null });
       if (e.isFinal) this.scheduler?.addFinal(e.text);
     });
     stt.onError((err) => {

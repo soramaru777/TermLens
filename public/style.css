@@ -85,6 +85,23 @@ button.primary {
   font-size: 0.95rem;
 }
 #interim-text { color: var(--muted); }
+.utterance { margin-bottom: 10px; }
+.speaker-chip {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #fff;
+  border-radius: 6px;
+  padding: 1px 8px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.sp-0 { background: #0e7a6f; }
+.sp-1 { background: #5a67b5; }
+.sp-2 { background: #b3661b; }
+.sp-3 { background: #8a4f9e; }
+.sp-4 { background: #2f7fb0; }
+.sp-5 { background: #a5405e; }
 #transcript .hl {
   color: #e07000;
   font-weight: 700;
