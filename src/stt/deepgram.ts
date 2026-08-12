@@ -19,7 +19,7 @@ export class DeepgramSttAdapter implements SttAdapter {
 
   async start(opts: { keywords: string[] }): Promise<void> {
     const params = new URLSearchParams({
-      model: "nova-2",
+      model: config.deepgramModel,
       language: "ja",
       encoding: "linear16",
       sample_rate: "16000",
@@ -28,9 +28,13 @@ export class DeepgramSttAdapter implements SttAdapter {
       punctuate: "true",
       smart_format: "true",
     });
+    // nova-3 系は keyterm(日本語対応・最大約100語)、nova-2 以前は keywords でブースト
+    const useKeyterm = config.deepgramModel.startsWith("nova-3");
     for (const kw of opts.keywords) {
       const term = kw.trim();
-      if (term) params.append("keywords", `${term}:2`);
+      if (!term) continue;
+      if (useKeyterm) params.append("keyterm", term);
+      else params.append("keywords", `${term}:2`);
     }
     const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
 

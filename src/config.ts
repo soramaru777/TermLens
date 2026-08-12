@@ -20,6 +20,7 @@ export const config = {
   authToken: process.env.AUTH_TOKEN ?? "",
   sttProvider: sttProvider as "mock" | "deepgram",
   deepgramApiKey: process.env.DEEPGRAM_API_KEY ?? "",
+  deepgramModel: process.env.DEEPGRAM_MODEL ?? "nova-3",
   anthropicModel: process.env.ANTHROPIC_MODEL ?? "claude-opus-4-8",
 };
 
