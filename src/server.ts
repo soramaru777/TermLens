@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import { WebSocketServer } from "ws";
 import { createHash, timingSafeEqual } from "node:crypto";
+import type { IncomingMessage } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.js";
@@ -31,14 +32,32 @@ function tokenMatches(provided: string): boolean {
 
 const wss = new WebSocketServer({ noServer: true });
 
+// トークンは URL クエリではなく Sec-WebSocket-Protocol で受け取る
+// (プロキシやアクセスログの URL 欄・ブラウザ履歴にトークンを残さないため)。
+// クライアントは new WebSocket(url, ["termlens.v1", "auth." + encodeURIComponent(token)]) で送る。
+function extractToken(req: IncomingMessage): string {
+  const header = req.headers["sec-websocket-protocol"];
+  if (!header) return "";
+  for (const part of String(header).split(",")) {
+    const p = part.trim();
+    if (p.startsWith("auth.")) {
+      try {
+        return decodeURIComponent(p.slice("auth.".length));
+      } catch {
+        return "";
+      }
+    }
+  }
+  return "";
+}
+
 app.server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   if (url.pathname !== "/ws") {
     socket.destroy();
     return;
   }
-  const token = url.searchParams.get("token") ?? "";
-  if (!tokenMatches(token)) {
+  if (!tokenMatches(extractToken(req))) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
     return;

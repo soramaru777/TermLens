@@ -119,7 +119,10 @@ startBtn.addEventListener("click", async () => {
 
 function connectWs(token, glossary) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+  // トークンは URL に載せず Sec-WebSocket-Protocol で送る(ログ・履歴への漏えい防止)
+  const protocols = ["termlens.v1"];
+  if (token) protocols.push("auth." + encodeURIComponent(token));
+  ws = new WebSocket(`${proto}://${location.host}/ws`, protocols);
   ws.binaryType = "arraybuffer";
 
   ws.addEventListener("open", () => {
