@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>TermLens — 会議用語リアルタイム解説</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#0e7a6f">
+</head>
+<body>
+  <!-- 準備画面 -->
+  <section id="setup">
+    <h1>TermLens</h1>
+    <p class="sub">会議の会話をリアルタイムに文字起こしし、専門用語を自動解説します。</p>
+
+    <label for="token">アクセストークン</label>
+    <input id="token" type="password" autocomplete="current-password" placeholder="共有トークン(ローカル開発では空でOK)">
+
+    <label for="glossary">用語集(1行に1語: 参加者名・社名・専門用語など)</label>
+    <textarea id="glossary" rows="8" placeholder="例)&#10;田中太郎&#10;Kubernetes&#10;RAG"></textarea>
+
+    <button id="start-btn" class="primary">開始</button>
+    <p id="setup-info" class="info"></p>
+    <p id="setup-error" class="error" hidden></p>
+  </section>
+
+  <!-- 本番画面 -->
+  <section id="live" hidden>
+    <header>
+      <span id="status-badge" class="badge">接続中…</span>
+      <button id="stop-btn">停止</button>
+    </header>
+    <div id="transcript" aria-label="文字起こし">
+      <span id="final-text"></span><span id="interim-text"></span>
+    </div>
+    <div id="cards" aria-label="用語カード"></div>
+  </section>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
