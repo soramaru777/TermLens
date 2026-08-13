@@ -1,0 +1,69 @@
+name: Deploy
+
+# develop がリリースブランチ。マージ(push)されると Fly.io へデプロイする。
+# develop 宛の PR ではビルド確認のみ行い、デプロイはしない。
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+# 既定を最小権限にする。デプロイは Fly のトークンで行うため書き込み権限は不要。
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ビルド確認
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Dockerfile の実行環境(node:22-slim)に合わせる
+          node-version: "22"
+          cache: npm
+
+      - name: 依存関係のインストール
+        run: npm ci
+
+      # 型エラーはここで落とす。リモートビルドを回す前に速く失敗させるため。
+      - name: TypeScript ビルド
+        run: npm run build
+
+  deploy:
+    name: Fly.io へデプロイ
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # デプロイの同時実行を防ぐ。後から来たものを待たせる(取り消さない)。
+    concurrency:
+      group: fly-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # タグも可変(付け替え可能)なため、コミット SHA に固定する
+      - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
+
+      - name: デプロイ
+        run: flyctl deploy --remote-only
+        env:
+          # アプリスコープ限定のデプロイトークン(リポジトリシークレット)
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: ヘルスチェック
+        run: |
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" https://termlens-tatsu.fly.dev/healthz || true)
+            if [ "$code" = "200" ]; then
+              echo "healthz OK"
+              exit 0
+            fi
+            echo "healthz — 応答 $code (${i}/10)"
+            sleep 5
+          done
+          echo "デプロイ後に healthz が 200 を返しませんでした"
+          exit 1
