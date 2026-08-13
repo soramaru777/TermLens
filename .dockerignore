@@ -1,0 +1,12 @@
+# ビルドコンテキストから除外(Fly のリモートビルダーへ送信しない)
+# .env は APIキーを含むため必須。node_modules/dist はイメージ内で再生成される。
+.env
+.env.*
+!.env.example
+node_modules
+dist
+.git
+.gitignore
+docs
+.DS_Store
+*.log
