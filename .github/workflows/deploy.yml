@@ -45,8 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # タグも可変(付け替え可能)なため、コミット SHA に固定する
-      - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
+      # タグも可変(付け替え可能)なため、コミット SHA に固定する。
+      # 1.6 で node24 対応(1.5 は node20 で非推奨警告が出る)。
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
 
       - name: デプロイ
         run: flyctl deploy --remote-only
