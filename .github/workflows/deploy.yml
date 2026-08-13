@@ -18,9 +18,9 @@ jobs:
     name: ビルド確認
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           # Dockerfile の実行環境(node:22-slim)に合わせる
           node-version: "22"
@@ -43,7 +43,7 @@ jobs:
       group: fly-deploy
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # タグも可変(付け替え可能)なため、コミット SHA に固定する
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5

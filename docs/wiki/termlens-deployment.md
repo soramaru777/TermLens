@@ -9,7 +9,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-architecture]], [[termlens-open-issues]], [[termlens-stt-pipeline]]
 confidence: high
-updated: 2026-08-13
+updated: 2026-08-14
 ---
 
 # TermLens デプロイと運用
@@ -39,9 +39,34 @@ localhost は secure context 扱いのため、**マイクテストに HTTPS は
 
 **値そのものは `.env` にのみ置き、Wiki には書かない。**
 
-## Fly.io デプロイ
+## リリース: develop へマージすると自動デプロイ
 
-**公開先: https://termlens-tatsu.fly.dev/** （2026-08-13 デプロイ完了、リージョン nrt、イメージ 70MB）
+**公開先: https://termlens-tatsu.fly.dev/** （リージョン nrt、イメージ 70MB）
+
+**`develop` がリリースブランチ。** ここに push（マージ）されると GitHub Actions
+（`.github/workflows/deploy.yml`）が走り、本番へデプロイされる。手動操作は不要。
+
+| イベント | 動作 |
+|---|---|
+| `develop` への push | ビルド確認 → `flyctl deploy --remote-only` → `/healthz` を最大10回ポーリング |
+| `develop` 宛の PR | ビルド確認のみ。デプロイはしない |
+| 手動 | `workflow_dispatch` で任意に実行できる |
+
+build ジョブで先に `tsc` を通すのは、型エラーをリモートビルド前に落として失敗を速くするため。
+
+**環境は1つだけ**（develop → 本番）。`main` は 2026-08-13 時点の状態で止まっており、
+現在は使っていない。ステージングは設けていない。
+
+### CI の認証
+
+`flyctl tokens create deploy` で発行した**アプリスコープ限定のトークン**を、リポジトリの
+シークレット `FLY_API_TOKEN` に登録している。組織全体の権限を持つ個人トークンは使わない。
+有効期限は1年（2027-08 頃に更新が必要）。
+
+サードパーティのアクションは**コミット SHA に固定**する。タグは付け替え可能なため、
+バージョンタグでも固定にはならない。ワークフローの既定権限は `contents: read`。
+
+### 手動デプロイ（初回構築時・CI が使えないとき）
 
 ```sh
 flyctl apps create termlens-tatsu
@@ -102,6 +127,32 @@ curl の手書き Upgrade ヘッダでは正しいハンドシェイクになら
 - WebSocket 認証トークンは URL クエリではなく **`Sec-WebSocket-Protocol` ヘッダ**で送信する。URL に載せるとログや履歴に残るため
 - カード描画は DOM API（`textContent`）ベースで XSS 対策済み
 - 認証は**単一の共有トークン**で、ローテーションは手動（[[termlens-open-issues]] の運用11）
+
+## git push が 404 になるとき
+
+private リポジトリへの push が `Repository not found` で失敗する場合、リポジトリの不在ではなく
+**権限のないアカウントで認証されている**可能性が高い。GitHub は権限のない private リポジトリに
+403 ではなく 404 を返すため。
+
+原因は credential helper の**評価順**にあることが多い。git は helper を上から順に試し、
+最初に資格情報を返したものを採用する。macOS では システム設定の `osxkeychain` が先に評価され、
+リポジトリローカルに `!gh auth git-credential` を設定していても呼ばれない。
+
+```sh
+git config --get-all credential.helper          # 適用順を確認
+printf 'protocol=https\nhost=github.com\n\n' | git credential-osxkeychain get   # keychain 側の username を確認
+```
+
+リポジトリローカルで**空文字を挟んで前段をリセット**すると解決する。
+
+```sh
+git config --local --unset-all credential.helper
+git config --local --add credential.helper ""            # ここまでをリセット
+git config --local --add credential.helper "!gh auth git-credential"
+```
+
+この設定は `.git/config` に入るのでこのリポジトリ限定。keychain の資格情報は削除しないので、
+他のアカウントを使う作業には影響しない。
 
 ## コスト（1時間の会議）
 
