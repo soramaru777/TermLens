@@ -9,6 +9,10 @@
 
 * { box-sizing: border-box; }
 
+/* hidden 属性は UA スタイルシートの display:none で実現されるため、
+   作者側の display 宣言(#home/#settings/#live の flex)に負ける。明示的に打ち消す。 */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
@@ -17,26 +21,45 @@ body {
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-/* ---- 準備画面 ---- */
-#setup {
+/* ---- ホーム / 設定 の共通 ---- */
+#home, #settings {
   max-width: 560px;
   margin: 0 auto;
-  padding: 24px 16px;
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  padding: 0 16px 20px;
 }
-#setup h1 { color: var(--accent); margin: 0; }
-#setup .sub { margin-top: 0; color: var(--muted); }
-#setup label { font-size: 0.85rem; font-weight: 600; margin-top: 8px; }
-#setup input, #setup textarea {
+.screen-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 0 8px;
+  min-height: 56px;
+}
+.screen-header h1 { color: var(--accent); margin: 0; font-size: 1.5rem; }
+.screen-header h2 { margin: 0; font-size: 1.05rem; font-weight: 700; }
+.icon-btn {
+  border: none;
+  background: transparent;
+  font-size: 1.5rem;
+  line-height: 1;
+  padding: 8px;
+  cursor: pointer;
+  color: var(--muted);
+}
+.back-btn {
+  border: none;
+  background: transparent;
+  color: var(--accent);
   font-size: 1rem;
-  padding: 10px;
-  border: 1px solid #cfd6d4;
-  border-radius: 8px;
-  background: #fff;
-  font-family: inherit;
+  padding: 8px 4px 8px 0;
+  cursor: pointer;
 }
+/* 見出しを中央に保つためのダミー幅 */
+#settings .screen-header h2 { flex: 1; text-align: center; margin-right: 56px; }
+
 button.primary {
   margin-top: 16px;
   font-size: 1.1rem;
@@ -46,9 +69,60 @@ button.primary {
   background: var(--accent);
   color: #fff;
   font-weight: 700;
+  width: 100%;
 }
+button.primary:disabled { opacity: 0.5; }
 .info { color: var(--muted); font-size: 0.8rem; }
+.hint { color: var(--muted); font-size: 0.78rem; margin: 4px 0 0; }
 .error { color: #b02a2a; }
+
+/* ---- ホーム画面 ---- */
+.home-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: stretch;
+  gap: 4px;
+}
+.home-body .sub { margin: 0 0 12px; color: var(--muted); text-align: center; }
+.home-body .primary { font-size: 1.25rem; padding: 20px; }
+.home-footer { display: flex; flex-direction: column; gap: 8px; }
+.row-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 14px 16px;
+  border: 1px solid #dfe4e2;
+  border-radius: 10px;
+  background: #fff;
+  font-size: 0.95rem;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+}
+.row-value { color: var(--muted); }
+
+/* ---- 設定画面 ---- */
+.settings-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.settings-body label { font-size: 0.85rem; font-weight: 600; margin-top: 16px; }
+.settings-body input, .settings-body textarea {
+  font-size: 1rem;
+  padding: 10px;
+  border: 1px solid #cfd6d4;
+  border-radius: 8px;
+  background: #fff;
+  font-family: inherit;
+  width: 100%;
+}
+.settings-body textarea { resize: vertical; }
+.settings-body .primary { margin-top: 24px; }
 
 /* ---- 本番画面 ---- */
 #live {

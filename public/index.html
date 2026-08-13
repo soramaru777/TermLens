@@ -11,20 +11,46 @@
   <meta name="theme-color" content="#0e7a6f">
 </head>
 <body>
-  <!-- 準備画面 -->
-  <section id="setup">
-    <h1>TermLens</h1>
-    <p class="sub">会議の会話をリアルタイムに文字起こしし、専門用語を自動解説します。</p>
+  <!-- ホーム画面 -->
+  <section id="home">
+    <header class="screen-header">
+      <h1>TermLens</h1>
+      <button id="open-settings" class="icon-btn" aria-label="設定を開く">⚙</button>
+    </header>
 
-    <label for="token">アクセストークン</label>
-    <input id="token" type="password" autocomplete="current-password" placeholder="共有トークン(ローカル開発では空でOK)">
+    <div class="home-body">
+      <p class="sub">会議の会話をリアルタイムに文字起こしし、専門用語を自動解説します。</p>
+      <button id="start-btn" class="primary">開始</button>
+      <p id="home-error" class="error" hidden></p>
+    </div>
 
-    <label for="glossary">用語集(1行に1語: 参加者名・社名・専門用語など)</label>
-    <textarea id="glossary" rows="8" placeholder="例)&#10;田中太郎&#10;Kubernetes&#10;RAG"></textarea>
+    <footer class="home-footer">
+      <button id="glossary-row" class="row-link">
+        <span>用語集</span>
+        <span class="row-value"><span id="glossary-count">0語</span> ›</span>
+      </button>
+      <p id="home-info" class="info"></p>
+    </footer>
+  </section>
 
-    <button id="start-btn" class="primary">開始</button>
-    <p id="setup-info" class="info"></p>
-    <p id="setup-error" class="error" hidden></p>
+  <!-- 設定画面 -->
+  <section id="settings" hidden>
+    <header class="screen-header">
+      <button id="close-settings" class="back-btn" aria-label="戻る">‹ 戻る</button>
+      <h2>設定</h2>
+    </header>
+
+    <div class="settings-body">
+      <label for="token">アクセストークン</label>
+      <input id="token" type="password" autocomplete="current-password" placeholder="共有トークン(ローカル開発では空でOK)">
+      <p class="hint">この端末にのみ保存されます。</p>
+
+      <label for="glossary">用語集(1行に1語)</label>
+      <textarea id="glossary" rows="10" placeholder="例)&#10;田中太郎&#10;Kubernetes&#10;RAG"></textarea>
+      <p class="hint">参加者名・社名・専門用語を入れると、音声認識の段階で精度が上がります。</p>
+
+      <button id="save-settings" class="primary">保存</button>
+    </div>
   </section>
 
   <!-- 本番画面 -->

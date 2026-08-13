@@ -3,7 +3,8 @@
 
 const $ = (id) => document.getElementById(id);
 
-const setup = $("setup");
+const home = $("home");
+const settings = $("settings");
 const live = $("live");
 const tokenInput = $("token");
 const glossaryInput = $("glossary");
@@ -13,8 +14,13 @@ const statusBadge = $("status-badge");
 const finalText = $("final-text");
 const interimText = $("interim-text");
 const cardsEl = $("cards");
-const setupError = $("setup-error");
-const setupInfo = $("setup-info");
+const homeError = $("home-error");
+const homeInfo = $("home-info");
+const glossaryRow = $("glossary-row");
+const glossaryCount = $("glossary-count");
+const openSettingsBtn = $("open-settings");
+const closeSettingsBtn = $("close-settings");
+const saveSettingsBtn = $("save-settings");
 
 let ws = null;
 let audioContext = null;
@@ -23,27 +29,55 @@ let mediaStream = null;
 let wakeLock = null;
 let sendAudio = false;
 
-// ---- 保存値の復元 / サーバー情報 ----
-tokenInput.value = localStorage.getItem("termlens.token") ?? "";
-glossaryInput.value = localStorage.getItem("termlens.glossary") ?? "";
+// ---- 保存値の読み出し ----
+// 設定は localStorage が正。入力欄は設定画面を開いたときにそこから復元する。
+const getToken = () => localStorage.getItem("termlens.token") ?? "";
+const getGlossaryText = () => localStorage.getItem("termlens.glossary") ?? "";
+const getGlossary = () =>
+  getGlossaryText()
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
+function refreshGlossaryCount() {
+  glossaryCount.textContent = `${getGlossary().length}語`;
+}
+refreshGlossaryCount();
+
+// ---- サーバー情報 ----
 let serverInfo = null;
 fetch("/api/info")
   .then((r) => r.json())
   .then((info) => {
     serverInfo = info;
-    setupInfo.textContent = `STT: ${info.sttProvider} / モデル: ${info.model} / 認証: ${info.authRequired ? "あり" : "なし"}`;
+    homeInfo.textContent = `STT: ${info.sttProvider} / モデル: ${info.model} / 認証: ${info.authRequired ? "あり" : "なし"}`;
+    // 初回起動: 認証が必要なのにトークン未設定なら、設定画面へ誘導する
+    if (info.authRequired && !getToken()) {
+      showSettings();
+      showError("アクセストークンを設定してください。");
+    }
   })
   .catch(() => {});
 
 // ---- 画面遷移 ----
 function showLive() {
-  setup.hidden = true;
+  home.hidden = true;
+  settings.hidden = true;
   live.hidden = false;
 }
-function showSetup() {
+function showHome() {
   live.hidden = true;
-  setup.hidden = false;
+  settings.hidden = true;
+  home.hidden = false;
+  refreshGlossaryCount();
+}
+function showSettings() {
+  // 入力欄は開くたびに保存値から復元する(「戻る」で破棄できるようにするため)
+  tokenInput.value = getToken();
+  glossaryInput.value = getGlossaryText();
+  home.hidden = true;
+  live.hidden = true;
+  settings.hidden = false;
 }
 
 function setStatus(text) {
@@ -51,9 +85,21 @@ function setStatus(text) {
 }
 
 function showError(message) {
-  setupError.textContent = message;
-  setupError.hidden = false;
+  homeError.textContent = message;
+  homeError.hidden = false;
 }
+
+// ---- 設定画面 ----
+openSettingsBtn.addEventListener("click", () => showSettings());
+glossaryRow.addEventListener("click", () => showSettings());
+// 「戻る」は保存せずに破棄する
+closeSettingsBtn.addEventListener("click", () => showHome());
+saveSettingsBtn.addEventListener("click", () => {
+  localStorage.setItem("termlens.token", tokenInput.value.trim());
+  localStorage.setItem("termlens.glossary", glossaryInput.value);
+  homeError.hidden = true;
+  showHome();
+});
 
 // ---- Wake Lock ----
 async function acquireWakeLock() {
@@ -71,15 +117,10 @@ document.addEventListener("visibilitychange", () => {
 
 // ---- 開始 ----
 startBtn.addEventListener("click", async () => {
-  setupError.hidden = true;
+  homeError.hidden = true;
   startBtn.disabled = true;
-  const token = tokenInput.value.trim();
-  const glossary = glossaryInput.value
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  localStorage.setItem("termlens.token", token);
-  localStorage.setItem("termlens.glossary", glossaryInput.value);
+  const token = getToken();
+  const glossary = getGlossary();
 
   try {
     // モックSTTモードでは音声不要なのでマイク取得をスキップ
@@ -175,8 +216,8 @@ function connectWs(token, glossary) {
     sendAudio = false;
     if (e.code === 1006 && finalText.textContent === "") {
       // 認証失敗などで即切断された可能性
-      showSetup();
-      showError("接続が拒否されました。トークンを確認してください。");
+      showHome();
+      showError("接続が拒否されました。設定でトークンを確認してください。");
       startBtn.disabled = false;
     } else {
       setStatus("切断されました");
