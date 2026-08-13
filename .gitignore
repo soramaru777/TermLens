@@ -2,3 +2,6 @@ node_modules/
 dist/
 .env
 .DS_Store
+
+# ローカル専用の作業メモ。リポジトリでは管理しない
+docs/local/

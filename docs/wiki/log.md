@@ -1,0 +1,9 @@
+# TermLens Wiki — Operation Log
+
+追記のみ。新しいものを下に足す。
+
+---
+
+2026-08-13 init — LLM Wiki を導入。`docs/raw/` と `docs/wiki/` を作成し、`~/wiki/mounts/termlens` から symlink で接続。
+2026-08-13 ingest — `README.md` と `docs/local/status-2026-08-13.md` を取り込み、5ページを生成（architecture / stt-pipeline / term-extraction / deployment / open-issues）。横断知見2件を `~/wiki/knowledge/` へ昇格。
+2026-08-13 ingest — Fly.io デプロイと iPad 実機テストのセッションを `docs/raw/session-2026-08-13-fly-deploy.md` として固定し取り込み。deployment（手順を `fly launch` → `apps create` に訂正、トライアル5分制限・`.dockerignore` 必須・HA 2台を追記）、open-issues（弱点12 バッファ肥大を新規、実機テストを一部解決、優先順位を再編）、stt-pipeline（diarization のウォームアップ挙動）、term-extraction（失敗時の再バッファ挙動）の4ページを更新。Fly.io の汎用知見を `~/wiki/knowledge/fly-io-deployment.md` へ昇格。
