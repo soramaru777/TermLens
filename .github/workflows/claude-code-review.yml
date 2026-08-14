@@ -1,0 +1,185 @@
+name: Claude Code Review
+
+# PR が作られる / 更新されると Claude がレビューし、結果を PR コメントとして投稿する。
+# 構成は ActionMemo の同名ワークフローを踏襲している。
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+# push 連打時に decide-review と claude-review の両方を取り消す。
+# 途中の判定が最終コミットと食い違うのを防ぐため。
+concurrency:
+  group: claude-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  decide-review:
+    name: レビュー要否の判定
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_review: ${{ steps.decide.outputs.should_review }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - name: Decide whether to run review
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # 信頼できない入力は必ず env 経由で受ける(run: に直接展開しない)
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          SKIP_THRESHOLD: 50000
+        run: |
+          set -euo pipefail
+
+          # 1. 強制レビュー
+          if echo "$LABELS_JSON" | jq -e 'index("force-review")' > /dev/null \
+            || [[ "$PR_TITLE" == *"[force-review]"* ]]; then
+            echo "should_review=true" >> "$GITHUB_OUTPUT"
+            echo "reason=force-review override" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. 明示スキップ
+          if echo "$LABELS_JSON" | jq -e 'index("skip-review")' > /dev/null \
+            || [[ "$PR_TITLE" == *"[skip-review]"* ]]; then
+            echo "should_review=false" >> "$GITHUB_OUTPUT"
+            echo "reason=explicit skip-review label/title" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 3. 巨大 diff の自動スキップ。`gh pr diff --stat` のテキストを解析せず
+          # API の additions/deletions を使う。末尾の `|| echo 0` は API 失敗時に
+          # fail-open(0行扱い=通常レビュー)にするため。これが無いと set -e で
+          # ステップが落ち、レビューが黙ってスキップされる。
+          DIFF_TOTAL=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '.additions + .deletions' 2>/dev/null || echo 0)
+          if ! [[ "$DIFF_TOTAL" =~ ^[0-9]+$ ]]; then
+            DIFF_TOTAL=0
+          fi
+          echo "diff total lines: $DIFF_TOTAL"
+          if [[ "$DIFF_TOTAL" -gt "$SKIP_THRESHOLD" ]]; then
+            echo "should_review=false" >> "$GITHUB_OUTPUT"
+            echo "reason=auto-skip: diff $DIFF_TOTAL > $SKIP_THRESHOLD" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_review=true" >> "$GITHUB_OUTPUT"
+          echo "reason=normal review" >> "$GITHUB_OUTPUT"
+
+  log-skip:
+    name: スキップ理由の記録
+    needs: decide-review
+    if: needs.decide-review.outputs.should_review == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log skip reason
+        env:
+          REASON: ${{ needs.decide-review.outputs.reason }}
+        run: |
+          echo "Skipped claude-code-review."
+          echo "Reason: $REASON"
+
+  claude-review:
+    name: Claude によるレビュー
+    needs: decide-review
+    # main 宛の PR(develop -> main のリリース PR)はスキップする。
+    # レビュー済みの変更を束ねたもので、turn 上限に当たって無駄に失敗しやすいため。
+    if: |
+      needs.decide-review.outputs.should_review == 'true'
+      && github.actor != 'dependabot[bot]'
+      && github.event.pull_request.base.ref != 'main'
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Log review reason
+        env:
+          REASON: ${{ needs.decide-review.outputs.reason }}
+        run: |
+          echo "Running review. Reason: $REASON"
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        # ActionMemo と同じバージョンに揃えている。問題発生時の切り分けを楽にするため。
+        # タグは付け替え可能なのでコミット SHA で固定する。
+        uses: anthropics/claude-code-action@1623c36729ac1cd5895198cded705a287de7db79 # v1.0.187
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You are reviewing a pull request. Be concise and surface only high-signal findings.
+
+            ## Project context
+            TermLens is a meeting transcription PWA: browser mic -> WebSocket -> Deepgram STT
+            -> Claude term extraction -> term cards. Node.js/TypeScript/Fastify server in `src/`,
+            buildless plain HTML/JS frontend in `public/`. Conventions are in `CLAUDE.md`;
+            architecture and known issues are in `docs/wiki/` (start at `docs/wiki/index.md`).
+
+            ## Scope: review ONLY these aspects
+            - Logic errors / correctness bugs in the changed code
+            - Unhandled error paths or missed edge cases introduced by the diff
+            - Missing input validation on new entry points (WebSocket message handlers, HTTP routes)
+            - Security: authentication/authorization, injection, data exposure, secret leakage.
+              Note that the WS auth token travels in `Sec-WebSocket-Protocol`, never in the URL,
+              and API keys must never appear in code, docs, or commit messages.
+            - Resource leaks in the audio/WebSocket path: `AudioContext`, `MediaStream` tracks,
+              `WebSocket`, and `setInterval` (Deepgram KeepAlive) must be released on every exit path
+            - Retry behavior against external APIs: permanent failures (HTTP 4xx) must not be
+              retried indefinitely, and buffers must not grow without bound
+
+            ## Out of scope: DO NOT report
+            - Style preferences (formatting, quote style, line length, import order, etc.)
+            - Naming preferences
+            - Alternative implementation suggestions that produce the same behavior
+            - Refactoring suggestions for code that was not changed in this PR
+            - Documentation or comment style preferences
+            - Nit-level improvements ("could be slightly cleaner", "consider extracting", etc.)
+            - Praise or generic positive remarks
+            - Missing automated tests. This repository has no test harness at all, so a
+              "add tests" finding would fire on every PR and carries no signal.
+
+            ## Severity threshold
+            Report ONLY findings at these severities:
+            - HIGH: must-fix bug or security issue
+            - MEDIUM: likely bug, or a defensive coding gap with a realistic failure path
+
+            Skip LOW and NIT level findings entirely. If you are unsure whether a finding is
+            HIGH/MEDIUM, skip it.
+
+            ## Convergence rule (avoid review marathons)
+            - If the latest commits address all of your previous concerns, respond with a short
+              LGTM message instead of finding new issues to raise.
+            - Do NOT re-raise the same concern across iterations. If a concern was already posted
+              and the author chose not to address it, do not repeat it.
+            - Do NOT invent new HIGH/MEDIUM findings just because nothing else is left to say.
+              Silence (LGTM) is the correct answer when the diff is clean at the HIGH/MEDIUM bar.
+
+            ## Operational constraints (stay within turn limits)
+            - Fetch the diff with `gh pr diff` ONLY ONCE, and `gh pr view` for the PR description.
+              Do not re-run the same command more than once.
+            - Do NOT fetch past review comments, CI logs, commit history, or other PR/issue history.
+            - If you need to inspect a file beyond the diff, use the `Read`/`Grep`/`Glob` tools
+              directly instead of shelling out via `gh`/`cat`/`find`. Do not repeat the same lookup.
+            - Post your review with `gh pr comment <PR> --body "..."` in a single call.
+              Write the review in Japanese.
+
+          # allowed-tools に Grep/Glob が無いと、モデルがそれらを試みて permission denial が
+          # 発生し turn を浪費する(ActionMemo で実測済み)。read-only なので追加してもリスクは無い。
+          claude_args: '--max-turns 30 --allowed-tools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"'
