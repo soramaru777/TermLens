@@ -1,3 +1,9 @@
+import {
+  APIError,
+  AuthenticationError,
+  BadRequestError,
+  PermissionDeniedError,
+} from "@anthropic-ai/sdk";
 import type { TermCard, TermLink } from "../protocol.js";
 import { createExtractor } from "./extractor.js";
 import { enrichTerm } from "./enrich.js";
@@ -7,9 +13,46 @@ const MAX_WAIT_MS = 10_000;
 const CHECK_INTERVAL_MS = 5_000;
 const SHOWN_TERMS_LIMIT = 50;
 const MAX_CONSECUTIVE_FAILURES = 3;
+// 未処理バッファの上限。会議は流れ続けるので、古い未処理チャンクを保持する価値は低い。
+const MAX_BUFFER_CHARS = 2_000;
 
 function normalizeTerm(term: string): string {
   return term.normalize("NFKC").toLowerCase().replace(/\s+/g, "");
+}
+
+/**
+ * 再試行しても成功しないエラーか。
+ * 401/403 は設定ミス、400 は不正リクエストやクレジット残高切れで、いずれも時間で解決しない。
+ * 429 / 5xx / 接続エラーは一時的なものとして再試行に回す(SDK 側でも再試行される)。
+ */
+function isPermanent(err: unknown): boolean {
+  return (
+    err instanceof BadRequestError ||
+    err instanceof AuthenticationError ||
+    err instanceof PermissionDeniedError
+  );
+}
+
+/** 開発者向けの生メッセージを利用者向けの文言に変換する */
+function toUserMessage(err: unknown): string {
+  if (err instanceof AuthenticationError) {
+    return "APIキーが無効です。サーバーの設定を確認してください。";
+  }
+  if (err instanceof PermissionDeniedError) {
+    return "APIキーにこの操作の権限がありません。";
+  }
+  if (err instanceof BadRequestError) {
+    // クレジット残高切れには専用のエラー型が無く、400 invalid_request_error として来る。
+    // 判別はメッセージに頼らざるを得ないが、外れても下の汎用文言に落ちるだけ。
+    if (/credit balance/i.test(err.message)) {
+      return "Anthropicのクレジット残高が不足しています。コンソールで購入してください。";
+    }
+    return "用語抽出のリクエストが受け付けられませんでした。";
+  }
+  if (err instanceof APIError) {
+    return `用語抽出APIでエラーが発生しました (${err.status ?? "不明"})。`;
+  }
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**
@@ -21,6 +64,8 @@ export class ExtractionScheduler {
   private lastRunAt = Date.now();
   private running = false;
   private stopped = false;
+  /** 恒久エラーで抽出を打ち切った状態。文字起こしは継続するのでセッションは止めない。 */
+  private disabled = false;
   private consecutiveFailures = 0;
   private shownTerms: string[] = [];
   private shownSet = new Set<string>();
@@ -41,14 +86,14 @@ export class ExtractionScheduler {
   }
 
   addFinal(text: string): void {
-    if (this.stopped) return;
-    this.buffer += (this.buffer ? " " : "") + text;
+    if (this.stopped || this.disabled) return;
+    this.appendToBuffer(text);
     this.maybeRun();
   }
 
   /** 停止時に残りバッファを処理する */
   async flush(): Promise<void> {
-    await this.run();
+    if (!this.disabled) await this.run();
     this.stop();
   }
 
@@ -57,8 +102,27 @@ export class ExtractionScheduler {
     clearInterval(this.timer);
   }
 
+  /**
+   * バッファに追記し、上限を超えたら古い方から捨てる。
+   * 先頭が文の途中で切れることがあるが、抽出は文脈から用語を拾うだけなので許容する。
+   */
+  private appendToBuffer(text: string, prepend = false): void {
+    const joined = prepend
+      ? text + (this.buffer ? " " + this.buffer : "")
+      : this.buffer + (this.buffer ? " " : "") + text;
+    this.buffer =
+      joined.length > MAX_BUFFER_CHARS ? joined.slice(-MAX_BUFFER_CHARS) : joined;
+  }
+
+  /** 恒久エラー時に抽出だけを打ち切る。溜まった未処理分は破棄する。 */
+  private disableExtraction(): void {
+    this.disabled = true;
+    this.buffer = "";
+    clearInterval(this.timer);
+  }
+
   private maybeRun(): void {
-    if (this.running || this.stopped || this.buffer.length === 0) return;
+    if (this.running || this.stopped || this.disabled || this.buffer.length === 0) return;
     const waited = Date.now() - this.lastRunAt;
     if (this.buffer.length >= MIN_CHARS || waited >= MAX_WAIT_MS) {
       void this.run();
@@ -66,7 +130,7 @@ export class ExtractionScheduler {
   }
 
   private async run(): Promise<void> {
-    if (this.running || this.buffer.length === 0) return;
+    if (this.running || this.disabled || this.buffer.length === 0) return;
     this.running = true;
     const chunk = this.buffer;
     this.buffer = "";
@@ -108,16 +172,25 @@ export class ExtractionScheduler {
         }
       }
     } catch (err) {
-      // バッファを戻して次回に回す
-      this.buffer = chunk + (this.buffer ? " " + this.buffer : "");
-      this.consecutiveFailures += 1;
       console.error("[scheduler] extraction failed:", err);
+
+      if (isPermanent(err)) {
+        // 再試行しても成功しないため、バッファに戻さず抽出を打ち切る。
+        // 戻すと会議が続く限りバッファが肥大し、復旧時に巨大なリクエストになる。
+        this.disableExtraction();
+        this.callbacks.onError(`用語抽出を停止しました。${toUserMessage(err)}`);
+        return;
+      }
+
+      // 一時的なエラーはバッファに戻して次回に回す
+      this.appendToBuffer(chunk, true);
+      this.consecutiveFailures += 1;
       if (
         this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES &&
         this.consecutiveFailures % MAX_CONSECUTIVE_FAILURES === 0
       ) {
         this.callbacks.onError(
-          `用語抽出が${this.consecutiveFailures}回連続で失敗しました: ${(err as Error).message}`,
+          `用語抽出が${this.consecutiveFailures}回連続で失敗しました。${toUserMessage(err)}`,
         );
       }
     } finally {
