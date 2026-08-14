@@ -52,7 +52,10 @@ function toUserMessage(err: unknown): string {
   if (err instanceof APIError) {
     return `用語抽出APIでエラーが発生しました (${err.status ?? "不明"})。`;
   }
-  return err instanceof Error ? err.message : String(err);
+  // 想定外の例外(構造化出力のスキーマ検証失敗など)も汎用文言に倒す。
+  // 生のメッセージをそのまま返すとブラウザまで届いてしまう。
+  // 原因の特定は呼び出し元が console.error に出す完全なエラーで行う。
+  return "用語抽出でエラーが発生しました。";
 }
 
 /**
