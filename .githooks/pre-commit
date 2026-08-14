@@ -1,0 +1,71 @@
+#!/bin/bash
+# 秘密情報の混入をコミット前に止める。
+#
+# 有効化（クローン後に1回だけ）:
+#   git config core.hooksPath .githooks
+#
+# gitleaks があればそれを使い、無ければ内蔵のパターン検査にフォールバックする。
+# 誤検知でどうしても通したいときは git commit --no-verify。
+set -uo pipefail
+
+fail() {
+  echo ""
+  echo "  コミットを中止しました: $1"
+  echo ""
+  echo "  対処:"
+  echo "    1. 該当箇所を削除するか、値を <REDACTED> などに置き換える"
+  echo "    2. 実際に漏れた鍵は必ず再発行する（履歴からは消えない）"
+  echo "    3. 誤検知なら  git commit --no-verify"
+  echo ""
+  exit 1
+}
+
+# --- 1. .env 系ファイルそのものの混入 -----------------------------------
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+if echo "$staged" | grep -qE '(^|/)\.env($|\.)' && ! echo "$staged" | grep -qE '(^|/)\.env\.example$'; then
+  echo "  検出: .env ファイルがステージされています"
+  fail ".env は追跡しない"
+fi
+
+# --- 2. gitleaks があれば委譲 -------------------------------------------
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --redact --no-banner; then
+    fail "gitleaks が秘密情報を検出"
+  fi
+  exit 0
+fi
+
+# --- 3. フォールバック: ステージ内容のパターン検査 ----------------------
+# 追加行（+ で始まる行）だけを見る。既存行の再検出を避けるため。
+added=$(git diff --cached --unified=0 --diff-filter=ACM | grep '^+' | grep -v '^+++' || true)
+[ -n "$added" ] || exit 0
+
+# 値が実際に入っているものだけを検出する。プレースホルダ（sk-ant-...、<KEY>、
+# ${VAR}、***、xxx 等）や `KEY=` の空代入は通す。
+patterns=(
+  'sk-ant-[A-Za-z0-9_-]{20,}'                          # Anthropic
+  'sk-[A-Za-z0-9]{32,}'                                # OpenAI 系
+  '(gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}'           # GitHub
+  'AKIA[0-9A-Z]{16}'                                   # AWS
+  'FlyV1 [A-Za-z0-9_+/=-]{20,}'                        # Fly.io デプロイトークン
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----'                 # 秘密鍵
+  '(API_KEY|APIKEY|SECRET|TOKEN|PASSWORD)[A-Z_]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9_/+.=-]{16,}'
+)
+
+hits=""
+for p in "${patterns[@]}"; do
+  # -e で渡す。`-----BEGIN ...` のようにハイフンで始まるパターンを
+  # grep がオプションと誤認するのを防ぐため。
+  m=$(echo "$added" | grep -nEi -e "$p" \
+      | grep -vEi '(\.\.\.|<[A-Za-z_]+>|\$\{|\$[A-Z_]+|\*\*\*|xxx+|your[-_]|example|placeholder|redacted|secrets\.)' || true)
+  [ -n "$m" ] && hits="${hits}${m}"$'\n'
+done
+
+if [ -n "$hits" ]; then
+  echo "  検出: 秘密情報らしき文字列（値の一部のみ表示）"
+  echo "$hits" | sed 's/\(.\{100\}\).*/\1…/' | sed 's/^/    /' | head -10
+  fail "秘密情報らしき文字列"
+fi
+
+exit 0

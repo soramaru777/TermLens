@@ -4,9 +4,9 @@
 
 ## LLM Wiki
 
-このプロジェクトは LLM Wiki パターンで知識を管理している。**スキーマの定義は @~/wiki/SCHEMA.md を参照すること**（このファイルには複製しない）。
+このプロジェクトは LLM Wiki パターンで知識を管理している。**スキーマの定義は `~/wiki/SCHEMA.md`**（このファイルには複製しない）。`docs/wiki/` や `docs/raw/` に触れると `~/.claude/rules/llm-wiki.md` 経由で自動的に読み込まれる。
 
-- `docs/raw/` — 不変のソース置き場。LLM は読むだけ
+- `docs/raw/` — 不変のソース置き場。LLM は読むだけ。**git 未追跡**（README のみ追跡）
 - `docs/wiki/` — LLM が保守するページ。エントリポイントは `docs/wiki/index.md`
 - `docs/wiki/log.md` — 操作ログ（追記のみ）
 - ハブページ: `~/wiki/projects/termlens.md`、横断知識: `~/wiki/knowledge/`
@@ -17,6 +17,7 @@
 
 ## このリポジトリ固有の注意
 
-- `docs/local/` は git 未追跡。**Issue・PR・コミットメッセージで言及しない**
+- `docs/local/` と `docs/raw/` は git 未追跡。**Issue・PR・コミットメッセージで言及しない**
+- コミット前に `.githooks/pre-commit` が秘密情報を検査する。クローン直後は `git config core.hooksPath .githooks` を1回実行すること
 - API キー・トークンは `.env` にのみ置き、Wiki やコミットに書かない
 - フロント（`public/`）はビルドレス。編集すればそのまま反映される
