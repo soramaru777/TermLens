@@ -2,6 +2,7 @@ import {
   APIError,
   AuthenticationError,
   BadRequestError,
+  NotFoundError,
   PermissionDeniedError,
 } from "@anthropic-ai/sdk";
 import type { TermCard, TermLink } from "../protocol.js";
@@ -20,17 +21,24 @@ function normalizeTerm(term: string): string {
   return term.normalize("NFKC").toLowerCase().replace(/\s+/g, "");
 }
 
+/** SDK 自身が再試行するステータス。分類を SDK の方針と一致させる。 */
+const SDK_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+
 /**
  * 再試行しても成功しないエラーか。
- * 401/403 は設定ミス、400 は不正リクエストやクレジット残高切れで、いずれも時間で解決しない。
- * 429 / 5xx / 接続エラーは一時的なものとして再試行に回す(SDK 側でも再試行される)。
+ *
+ * 4xx のうち SDK が再試行しないものを恒久エラーとみなす。個別のエラークラスを列挙すると
+ * 400/401/403 のように取りこぼしが出るため、ステータスの範囲で判定する。
+ * 例: 400(不正リクエスト・クレジット残高切れ)、401/403(認証・権限)、
+ *     404(モデルIDが無効)、422(スキーマ不正)。
+ * 5xx・408/409/429・接続エラーは一時的なものとして再試行に回す。
  */
 function isPermanent(err: unknown): boolean {
-  return (
-    err instanceof BadRequestError ||
-    err instanceof AuthenticationError ||
-    err instanceof PermissionDeniedError
-  );
+  if (!(err instanceof APIError)) return false;
+  const status = err.status;
+  // APIConnectionError などは status が undefined。判別できないものは再試行に倒す。
+  if (typeof status !== "number") return false;
+  return status >= 400 && status < 500 && !SDK_RETRYABLE_STATUSES.has(status);
 }
 
 /** 開発者向けの生メッセージを利用者向けの文言に変換する */
@@ -40,6 +48,9 @@ function toUserMessage(err: unknown): string {
   }
   if (err instanceof PermissionDeniedError) {
     return "APIキーにこの操作の権限がありません。";
+  }
+  if (err instanceof NotFoundError) {
+    return "用語抽出のモデルが見つかりません。サーバーの設定を確認してください。";
   }
   if (err instanceof BadRequestError) {
     // クレジット残高切れには専用のエラー型が無く、400 invalid_request_error として来る。
