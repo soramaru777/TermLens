@@ -71,13 +71,28 @@ npm run dev            # http://localhost:8080
 - `STT_PROVIDER=mock` にすると、誤認識入りのダミー会議(3話者)が自動再生され、文字起こし→カード→web検索清書→ハイライトまで全パイプラインをキーなし・マイクなしで確認できます
 - localhostはsecure context扱いのため、マイクテストにHTTPSは不要です(スマホ実機はHTTPS必須)
 
-## デプロイ (Fly.io)
+## リリース (Fly.io)
+
+公開先: https://termlens-tatsu.fly.dev/
+
+**`develop` がリリースブランチです。** マージすると GitHub Actions が走り、自動でデプロイされます。手動操作は不要です。
+
+| イベント | 動作 |
+|---|---|
+| `develop` への push | ビルド確認 → デプロイ → ヘルスチェック |
+| `develop` 宛の PR | ビルド確認 + Claude によるコードレビュー(デプロイはしない) |
+
+環境は1つだけ(`develop` → 本番)で、ステージングは設けていません。
+
+### 手動デプロイ(初回構築時・CIが使えないとき)
 
 ```sh
-fly launch --no-deploy   # 初回のみ(fly.toml は同梱)
-fly secrets set ANTHROPIC_API_KEY=... DEEPGRAM_API_KEY=... AUTH_TOKEN=$(openssl rand -hex 24)
-fly deploy
+fly apps create <app-name>          # アプリ名は Fly 全体でユニーク
+fly secrets set ANTHROPIC_API_KEY=... DEEPGRAM_API_KEY=... AUTH_TOKEN=... --stage
+fly deploy --remote-only            # リモートビルドのためローカルDockerは不要
 ```
+
+`fly launch` は作り込んだ `fly.toml` を書き換えることがあるため使いません。
 
 スマホ/iPadのSafariで公開URLを開き、共有 → ホーム画面に追加。
 
