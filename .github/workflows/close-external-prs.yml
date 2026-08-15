@@ -1,0 +1,45 @@
+name: Close External PRs
+
+# 公開リポジトリでは fork からの PR 作成そのものを禁止する設定が存在しないため、
+# 届いた時点で自動的にクローズする。
+#
+# pull_request_target を使う理由: fork からの pull_request では GITHUB_TOKEN が
+# read-only に降格され、コメントもクローズもできない。
+#
+# このトリガーはベースリポジトリの権限で走るため一般に危険とされるが、それは
+# fork のコードをチェックアウトして実行する場合の話。このワークフローは
+# actions/checkout を一切使わず PR 番号だけを扱うので、攻撃者のコードが実行される
+# 経路が無い。checkout を足してはいけない。
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    name: 外部からの PR をクローズ
+    # 同一リポジトリのブランチから出た PR は対象外
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # 信頼できない入力は env 経由で受ける(run: に直接展開しない)
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BODY: |
+            ご関心をお寄せいただきありがとうございます。
+
+            このリポジトリは個人プロジェクトのため、**外部からのプルリクエストは受け付けていません**。
+            自動的にクローズさせていただきます。内容を否定するものではありません。
+
+            不具合の報告や質問は Issue にお寄せください。対応をお約束するものではありませんが、確認はします。
+            詳しくはリポジトリ直下の CONTRIBUTING.md をご覧ください。
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" --body "$BODY"
+          gh pr close "$PR_NUMBER"
