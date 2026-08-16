@@ -109,3 +109,13 @@ fly deploy --remote-only            # リモートビルドのためローカル
 
 - WebSocket認証トークンはURLクエリではなく `Sec-WebSocket-Protocol` ヘッダで送信(ログ・履歴への漏えい防止)
 - APIキーは `.env`(git対象外)で管理。カード描画はDOM API(`textContent`)ベースでXSS対策済み
+
+## ライセンス
+
+MIT License([LICENSE](LICENSE))。フォークして自由に使ってください。
+
+ただし**ライセンスが許諾するのはこのリポジトリのコードのみ**です。Deepgram と Anthropic は
+外部サービスであり、利用には各自でアカウントとAPIキーを取得し、それぞれの利用規約に同意する
+必要があります。
+
+外部からのプルリクエストは受け付けていません。理由は [CONTRIBUTING.md](CONTRIBUTING.md) を参照。
