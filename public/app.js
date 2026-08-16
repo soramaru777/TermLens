@@ -21,6 +21,9 @@ const glossaryCount = $("glossary-count");
 const openSettingsBtn = $("open-settings");
 const closeSettingsBtn = $("close-settings");
 const saveSettingsBtn = $("save-settings");
+const cardNav = $("card-nav");
+const cardPosition = $("card-position");
+const latestBtn = $("latest-btn");
 const exportRow = $("export-row");
 const dlTranscriptBtn = $("dl-transcript");
 const dlTermsBtn = $("dl-terms");
@@ -290,9 +293,52 @@ $("transcript").addEventListener("click", (e) => {
   if (hl) jumpToCard(hl.dataset.term);
 });
 
+// ---- 表示するカードの選択 ----
+// 縦積みレイアウト(スマホ)では .active の1枚だけを CSS で表示する。
+// 既定は「最新に追従」。会話中の用語をタップするとその語に固定し、「最新」で追従に戻す。
+// 横並びレイアウトでは全カードが見えるので、この状態は表示に影響しない。
+let activeTerm = null;
+let pinnedToTerm = false;
+// style.css の @media (max-width: 899px) と対になっている。片方だけ変えないこと
+const stackedLayout = window.matchMedia("(max-width: 899px)");
+
+function setActiveCard(term) {
+  activeTerm = term;
+  for (const card of cardsEl.children) {
+    card.classList.toggle("active", card.dataset.term === term);
+  }
+  renderCardNav();
+}
+
+function renderCardNav() {
+  const terms = [...cardData.keys()];
+  if (terms.length === 0) {
+    cardNav.hidden = true;
+    return;
+  }
+  cardNav.hidden = false;
+  const index = terms.indexOf(activeTerm);
+  const newer = index < 0 ? 0 : terms.length - 1 - index; // 表示中より後に出たカード数
+  cardPosition.textContent = `${index + 1} / ${terms.length}　${pinnedToTerm ? "固定中" : "最新に追従"}`;
+  latestBtn.textContent = newer > 0 ? `最新 +${newer}` : "最新";
+  latestBtn.disabled = !pinnedToTerm;
+}
+
+latestBtn.addEventListener("click", () => {
+  pinnedToTerm = false;
+  const terms = [...cardData.keys()];
+  setActiveCard(terms[terms.length - 1] ?? null);
+});
+
 function jumpToCard(term) {
   const card = [...cardsEl.children].find((c) => c.dataset.term === term);
   if (!card) return;
+  // 縦積みのときだけ、タップした語に固定する(以後、新しいカードが出ても表示は変わらない)。
+  // 横並びでは全カードが見えており、固定する意味がないうえ回転時に古いカードが残るため。
+  if (stackedLayout.matches) {
+    pinnedToTerm = true;
+    setActiveCard(term);
+  }
   card.scrollIntoView({ behavior: "smooth", block: "nearest" });
   card.classList.remove("flash");
   void card.offsetWidth; // reflow を挟んで連続タップでも再アニメーションさせる
@@ -348,6 +394,9 @@ function addCard(card) {
   // web検索対象(レア度上位)のカードのみ「確認中」を表示
   if (card.willEnrich) div.append(el("div", "links pending", "🔎 最新情報を確認中…"));
   cardsEl.prepend(div);
+  // 追従中なら新しいカードに切り替える。固定中は表示を動かさず件数だけ更新する
+  if (pinnedToTerm) renderCardNav();
+  else setActiveCard(card.term);
 }
 
 // web検索による清書: 解説を最新情報ベースに差し替え、関連リンクを表示

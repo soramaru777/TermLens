@@ -213,6 +213,41 @@ button.primary:disabled { opacity: 0.5; }
   0% { background: #ffe3c2; box-shadow: 0 0 0 2px #e07000; }
   100% { background: var(--card-bg); box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
 }
+/* 用語カードの表示切り替えバー(縦積みレイアウトのみ) */
+#card-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #eef3f1;
+  border-bottom: 1px solid #dfe4e2;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+#latest-btn {
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 4px 14px;
+  cursor: pointer;
+}
+#latest-btn:disabled {
+  border-color: #cfd6d4;
+  color: var(--muted);
+  background: transparent;
+  cursor: default;
+}
+/* 縦積み(スマホ)では最新または固定した1枚だけを出す。
+   横並びでは全カードが並ぶので、この制限も #card-nav も無効にする。 */
+@media (max-width: 899px) {
+  #cards .card { display: none; }
+  #cards .card.active { display: block; }
+}
 #cards {
   flex: 1;
   overflow-y: auto;
@@ -263,6 +298,7 @@ button.primary:disabled { opacity: 0.5; }
 @media (min-width: 900px) {
   #live { flex-direction: row; flex-wrap: wrap; align-content: flex-start; }
   #live header, #export-row { flex-basis: 100%; }
+  #card-nav { display: none; }
   #transcript { flex: 1 1 50%; height: calc(100dvh - var(--live-chrome, 52px)); border-bottom: none; border-right: 1px solid #e2e5e3; }
   #cards { flex: 1 1 50%; height: calc(100dvh - var(--live-chrome, 52px)); }
 }
