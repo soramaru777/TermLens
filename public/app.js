@@ -36,7 +36,9 @@ let wakeLock = null;
 let sendAudio = false;
 let sessionStartedAt = null;
 let sessionEndedAt = null;
-let savedOnce = false; // 一度でも Markdown を保存したか(「戻る」の警告に使う)
+// 「戻る」の破棄警告に使う。片方だけ保存して戻ると、もう片方が失われるため別々に持つ
+let savedTranscript = false;
+let savedTerms = false;
 let stopping = false; // 停止操作によるクローズか(意図しない切断と区別する)
 
 // ---- 保存値の読み出し ----
@@ -235,15 +237,15 @@ function connectWs(token, glossary) {
   ws.addEventListener("close", (e) => {
     sendAudio = false;
     if (e.code === 1006 && finalText.textContent === "") {
-      // 認証失敗などで即切断された可能性
+      // 認証失敗などで即切断された可能性。マイクは取得済みなので必ず解放する
+      releaseCapture();
       showHome();
       showError("接続が拒否されました。設定でトークンを確認してください。");
       startBtn.disabled = false;
     } else if (!stopping) {
-      // 停止操作によるクローズなら finish() の表示を上書きしない。
-      // 意図しない切断でも、それまでの内容は持ち出せるようにする。
-      setStatus("切断されました");
-      showExport();
+      // 意図しない切断。ここもセッションの終端なので、停止したときと同じ後始末をする。
+      // (停止操作によるクローズなら stopping が真で、finish() の表示を上書きしない)
+      finish("切断されました");
     }
   });
 }
@@ -501,15 +503,15 @@ function buildTermsMarkdown() {
 const isStandalone = () =>
   window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
 
+// 保存できたら true、ユーザーがキャンセルしたら false を返す
 async function saveMarkdown(filename, text) {
   const file = new File([text], filename, { type: "text/markdown" });
   if (isStandalone() && navigator.canShare?.({ files: [file] })) {
     try {
       await navigator.share({ files: [file], title: filename });
-      savedOnce = true;
-      return;
+      return true;
     } catch (err) {
-      if (err.name === "AbortError") return; // ユーザーがキャンセルした
+      if (err.name === "AbortError") return false; // ユーザーがキャンセルした
       // それ以外は下のダウンロードにフォールバックする
     }
   }
@@ -520,17 +522,21 @@ async function saveMarkdown(filename, text) {
   document.body.append(a);
   a.click();
   a.remove();
-  savedOnce = true;
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  return true;
 }
 
-dlTranscriptBtn.addEventListener("click", () => {
+dlTranscriptBtn.addEventListener("click", async () => {
   const stamp = fmtStamp(sessionStartedAt ?? new Date());
-  saveMarkdown(`termlens-transcript-${stamp}.md`, buildTranscriptMarkdown());
+  if (await saveMarkdown(`termlens-transcript-${stamp}.md`, buildTranscriptMarkdown())) {
+    savedTranscript = true;
+  }
 });
-dlTermsBtn.addEventListener("click", () => {
+dlTermsBtn.addEventListener("click", async () => {
   const stamp = fmtStamp(sessionStartedAt ?? new Date());
-  saveMarkdown(`termlens-terms-${stamp}.md`, buildTermsMarkdown());
+  if (await saveMarkdown(`termlens-terms-${stamp}.md`, buildTermsMarkdown())) {
+    savedTerms = true;
+  }
 });
 
 function showExport() {
@@ -541,8 +547,29 @@ function showExport() {
   measureLiveChrome();
 }
 
-// ---- 停止 ----
+// ---- 停止 / 戻る ----
+// 1つのボタンが「停止」と「戻る」を兼ねる。ハンドラも1本にする
+// (onclick を別に足すと、押すたびに停止処理まで走って警告状態がリセットされる)。
+let finished = false;
+let discardWarned = false;
+
 stopBtn.addEventListener("click", async () => {
+  if (finished) {
+    // 「戻る」。リロードで内容を破棄するため、未保存のものがあれば1回目は警告に留める
+    // (確認ダイアログは PWA で扱いが不安定なため使わない)。
+    // 片方だけ保存した場合も、保存していない側は失われるので警告する
+    const unsaved =
+      (finalLines.length > 0 && !savedTranscript) || (cardData.size > 0 && !savedTerms);
+    if (unsaved && !discardWarned) {
+      discardWarned = true;
+      setStatus("未保存です。もう一度押すと破棄");
+      return;
+    }
+    location.reload();
+    return;
+  }
+
+  if (stopping) return; // 停止処理の最中は二重に走らせない
   sendAudio = false;
   stopping = true;
   if (ws?.readyState === WebSocket.OPEN) {
@@ -558,28 +585,25 @@ stopBtn.addEventListener("click", async () => {
   }
 });
 
-async function finish() {
+// マイク・AudioContext・Wake Lock を解放する。セッションが終わる経路すべてで必ず通す。
+// 解放を怠るとページをリロードするまでマイクが掴まれたままになる。
+async function releaseCapture() {
   await cleanupAudio();
   if (wakeLock) {
     try { await wakeLock.release(); } catch {}
     wakeLock = null;
   }
   ws = null;
-  setStatus("停止しました");
+}
+
+// セッションの終端。停止操作でも意図しない切断でも必ずここを通す
+async function finish(statusText = "停止しました") {
+  if (finished) return;
+  finished = true;
+  await releaseCapture();
+  setStatus(statusText);
   showExport();
   stopBtn.textContent = "戻る";
-  // 「戻る」はリロードで内容を破棄する。一度も保存していないなら1回目で警告し、
-  // 2回目のタップで実行する(確認ダイアログはPWAで扱いが不安定なため使わない)
-  let discardWarned = false;
-  stopBtn.onclick = () => {
-    const hasContent = finalLines.length > 0 || cardData.size > 0;
-    if (hasContent && !savedOnce && !discardWarned) {
-      discardWarned = true;
-      setStatus("未保存です。もう一度押すと破棄");
-      return;
-    }
-    location.reload();
-  };
 }
 
 async function cleanupAudio() {
