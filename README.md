@@ -1,5 +1,12 @@
 # TermLens
 
+[![Deploy](https://github.com/soramaru777/TermLens/actions/workflows/deploy.yml/badge.svg?branch=develop)](https://github.com/soramaru777/TermLens/actions/workflows/deploy.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-22-5FA04E?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![PWA](https://img.shields.io/badge/PWA-5A0FC8?logo=pwa&logoColor=white)](public/manifest.webmanifest)
+[![PRs: not accepted](https://img.shields.io/badge/PRs-not%20accepted-lightgrey.svg)](CONTRIBUTING.md)
+
 会議の会話をリアルタイムに文字起こしし、専門用語・固有名詞を検出して約100文字の解説カードを自動表示するPWA。スマホ / iPad / PCのブラウザで動作します。
 
 打ち合わせ中に飛び交う知らない用語を、その場で「調べずに分かる」ようにすることが目的です。
