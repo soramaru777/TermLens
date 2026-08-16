@@ -59,6 +59,11 @@
       <span id="status-badge" class="badge">接続中…</span>
       <button id="stop-btn">停止</button>
     </header>
+    <!-- 停止するまで非表示。停止後にダウンロード手段を出す -->
+    <div id="export-row" hidden>
+      <button id="dl-transcript" class="export-btn">⬇ 文字起こし.md</button>
+      <button id="dl-terms" class="export-btn">⬇ 用語カード.md</button>
+    </div>
     <div id="transcript" aria-label="文字起こし">
       <div id="final-text"></div>
       <div id="interim-text"></div>
