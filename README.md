@@ -1,5 +1,12 @@
 # TermLens
 
+[![Deploy](https://github.com/soramaru777/TermLens/actions/workflows/deploy.yml/badge.svg?branch=develop)](https://github.com/soramaru777/TermLens/actions/workflows/deploy.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-22-5FA04E?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![PWA](https://img.shields.io/badge/PWA-5A0FC8?logo=pwa&logoColor=white)](public/manifest.webmanifest)
+[![PRs: not accepted](https://img.shields.io/badge/PRs-not%20accepted-lightgrey.svg)](CONTRIBUTING.md)
+
 会議の会話をリアルタイムに文字起こしし、専門用語・固有名詞を検出して約100文字の解説カードを自動表示するPWA。スマホ / iPad / PCのブラウザで動作します。
 
 打ち合わせ中に飛び交う知らない用語を、その場で「調べずに分かる」ようにすることが目的です。
@@ -12,8 +19,10 @@
   - 速報: 会話から専門用語を検出し、LLMの知識によるドラフト解説を即表示
   - 清書: レア度上位の約半数の用語をweb検索し、最新情報に基づく約100文字の要約+**関連リンク3件**でカードを自動更新
 - **誤認識復元** — 「クバネテス」→ Kubernetes のように、崩れた音声認識結果を文脈から正規化。確信度が低い場合は「もしかして?」バッジ付き
-- **用語ハイライト** — カード化された用語は会話ログ内でオレンジ太字になり、タップすると該当カードへスクロール
+- **用語ハイライト** — カード化された用語は会話ログ内でオレンジ太字になり、タップすると該当カードを表示
+- **スマホでは1枚表示** — 画面が狭いときはカードを最新1枚だけ表示。会話中の用語をタップするとその語に固定し、「最新」ボタンで追従に戻る。横向きの広い画面では従来どおり一覧表示
 - **用語集ブースト** — 会議前に入力した用語集(参加者名・社名・専門用語)をSTTのkeyterm promptingに渡し、認識精度を底上げ
+- **Markdownエクスポート** — 停止後に文字起こしと用語カードをそれぞれ `.md` でダウンロード。文字起こしは話者ごとの段落+会議開始からの経過時間、用語カードは解説と関連リンクを登場順に出力
 - **PWA** — ホーム画面に追加してアプリのように起動。画面ロック防止(Wake Lock)対応
 
 ## アーキテクチャ
@@ -71,13 +80,28 @@ npm run dev            # http://localhost:8080
 - `STT_PROVIDER=mock` にすると、誤認識入りのダミー会議(3話者)が自動再生され、文字起こし→カード→web検索清書→ハイライトまで全パイプラインをキーなし・マイクなしで確認できます
 - localhostはsecure context扱いのため、マイクテストにHTTPSは不要です(スマホ実機はHTTPS必須)
 
-## デプロイ (Fly.io)
+## リリース (Fly.io)
+
+公開先: https://termlens-tatsu.fly.dev/
+
+**`develop` がリリースブランチです。** マージすると GitHub Actions が走り、自動でデプロイされます。手動操作は不要です。
+
+| イベント | 動作 |
+|---|---|
+| `develop` への push | ビルド確認 → デプロイ → ヘルスチェック |
+| `develop` 宛の PR | ビルド確認 + Claude によるコードレビュー(デプロイはしない) |
+
+環境は1つだけ(`develop` → 本番)で、ステージングは設けていません。
+
+### 手動デプロイ(初回構築時・CIが使えないとき)
 
 ```sh
-fly launch --no-deploy   # 初回のみ(fly.toml は同梱)
-fly secrets set ANTHROPIC_API_KEY=... DEEPGRAM_API_KEY=... AUTH_TOKEN=$(openssl rand -hex 24)
-fly deploy
+fly apps create <app-name>          # アプリ名は Fly 全体でユニーク
+fly secrets set ANTHROPIC_API_KEY=... DEEPGRAM_API_KEY=... AUTH_TOKEN=... --stage
+fly deploy --remote-only            # リモートビルドのためローカルDockerは不要
 ```
+
+`fly launch` は作り込んだ `fly.toml` を書き換えることがあるため使いません。
 
 スマホ/iPadのSafariで公開URLを開き、共有 → ホーム画面に追加。
 
@@ -94,3 +118,13 @@ fly deploy
 
 - WebSocket認証トークンはURLクエリではなく `Sec-WebSocket-Protocol` ヘッダで送信(ログ・履歴への漏えい防止)
 - APIキーは `.env`(git対象外)で管理。カード描画はDOM API(`textContent`)ベースでXSS対策済み
+
+## ライセンス
+
+MIT License([LICENSE](LICENSE))。フォークして自由に使ってください。
+
+ただし**ライセンスが許諾するのはこのリポジトリのコードのみ**です。Deepgram と Anthropic は
+外部サービスであり、利用には各自でアカウントとAPIキーを取得し、それぞれの利用規約に同意する
+必要があります。
+
+外部からのプルリクエストは受け付けていません。理由は [CONTRIBUTING.md](CONTRIBUTING.md) を参照。
