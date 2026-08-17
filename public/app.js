@@ -431,6 +431,18 @@ function addCard(card) {
 }
 
 // web検索による清書: 解説を最新情報ベースに差し替え、関連リンクを表示
+// http/https 以外のスキームを弾く(サーバー側 src/extract/enrich.ts の isHttpUrl と同じ検証)。
+// サーバー側で既に弾いている想定だが、上流(web検索の citation)の出力形式に検証をかけず
+// a.href に渡すのは危険なため、クライアント側でも多層防御として同じチェックを行う。
+function isHttpUrl(url) {
+  try {
+    const { protocol } = new URL(url);
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function updateCard({ term, description, links }) {
   const stored = cardData.get(term);
   if (stored) Object.assign(stored, { description, links });
@@ -440,14 +452,18 @@ function updateCard({ term, description, links }) {
   const linksEl = card.querySelector(".links");
   linksEl.classList.remove("pending");
   linksEl.textContent = "";
+  let shown = 0;
   for (const link of links) {
+    // スキームが不正なリンクは要素自体を作らずスキップする(テキストとしても出さない)
+    if (!isHttpUrl(link.url)) continue;
     const a = el("a", "link", link.title);
     a.href = link.url;
     a.target = "_blank";
     a.rel = "noopener noreferrer";
     linksEl.append(a);
+    shown++;
   }
-  if (links.length === 0) linksEl.remove();
+  if (shown === 0) linksEl.remove();
 }
 
 // ---- Markdown エクスポート ----
