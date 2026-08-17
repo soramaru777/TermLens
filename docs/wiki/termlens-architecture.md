@@ -37,7 +37,7 @@ WebSocket 1本の中で、**音声はバイナリフレーム、制御メッセ�
 |---|---|
 | サーバー | Node.js 22 / TypeScript / Fastify / ws |
 | STT | Deepgram Nova-3（streaming, ja, diarization, keyterm）— アダプタ切替式 |
-| LLM | Anthropic Claude（既定 `claude-sonnet-5`）— 構造化出力 + web search tool |
+| LLM | OpenAI GPT-5.6 Luna（既定 `gpt-5.6-luna`）— 構造化出力 + web search tool |
 | フロント | フレームワークなしの素の HTML/JS/CSS（ビルド不要） |
 | デプロイ | Docker + Fly.io |
 

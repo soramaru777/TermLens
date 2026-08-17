@@ -19,7 +19,7 @@ app.get("/healthz", async () => ({ ok: true }));
 
 app.get("/api/info", async () => ({
   sttProvider: config.sttProvider,
-  model: config.anthropicModel,
+  model: config.llmModel,
   authRequired: config.authToken.length > 0,
 }));
 
@@ -69,5 +69,5 @@ app.server.on("upgrade", (req, socket, head) => {
 
 await app.listen({ port: config.port, host: "0.0.0.0" });
 console.log(
-  `[server] listening on :${config.port}  stt=${config.sttProvider}  model=${config.anthropicModel}  auth=${config.authToken ? "on" : "OFF"}`,
+  `[server] listening on :${config.port}  stt=${config.sttProvider}  model=${config.llmModel}  auth=${config.authToken ? "on" : "OFF"}`,
 );

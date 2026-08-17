@@ -21,7 +21,8 @@ export const config = {
   sttProvider: sttProvider as "mock" | "deepgram",
   deepgramApiKey: process.env.DEEPGRAM_API_KEY ?? "",
   deepgramModel: process.env.DEEPGRAM_MODEL ?? "nova-3",
-  anthropicModel: process.env.ANTHROPIC_MODEL ?? "claude-opus-4-8",
+  // 用語抽出・清書に使う LLM。OpenAI の Chat Completions / Responses API を叩く
+  llmModel: process.env.LLM_MODEL ?? "gpt-5.6-luna",
 };
 
 if (!config.authToken) {

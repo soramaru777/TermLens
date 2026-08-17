@@ -50,7 +50,7 @@
 |---|---|
 | サーバー | Node.js 22 / TypeScript / Fastify / ws |
 | STT | Deepgram Nova-3 (streaming, 日本語, diarization, keyterm) — アダプタ切替式 |
-| LLM | Anthropic Claude (既定: `claude-sonnet-5`) — 構造化出力 + web search tool |
+| LLM | OpenAI GPT-5.6 Luna (既定: `gpt-5.6-luna`) — 構造化出力 + web search tool |
 | フロント | フレームワークなしの素のHTML/JS/CSS (ビルド不要) |
 | デプロイ | Docker + Fly.io (`fly.toml` 同梱) |
 
@@ -67,10 +67,10 @@ npm run dev            # http://localhost:8080
 
 | 変数 | 必須 | 説明 |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | ✅ | 用語抽出・web検索要約に使用 |
+| `OPENAI_API_KEY` | ✅ | 用語抽出・web検索要約に使用 |
 | `DEEPGRAM_API_KEY` | `deepgram`時 | ストリーミング音声認識に使用 |
 | `STT_PROVIDER` | — | `deepgram` / `mock`(既定)。mockはキー・マイク不要のダミー会議再生 |
-| `ANTHROPIC_MODEL` | — | 既定 `claude-sonnet-5`。`claude-opus-4-8`(高精度) / `claude-haiku-4-5`(安価)に切替可 |
+| `LLM_MODEL` | — | 既定 `gpt-5.6-luna`(安価・高速)。`gpt-5.6-terra` / `gpt-5.6-sol` に切替可 |
 | `DEEPGRAM_MODEL` | — | 既定 `nova-3`(keyterm方式)。`nova-2`(keywords方式)に切替可 |
 | `AUTH_TOKEN` | 公開時 | 共有アクセストークン。未設定なら認証なし(ローカル開発用) |
 | `PORT` | — | 既定 8080 |
@@ -97,7 +97,7 @@ npm run dev            # http://localhost:8080
 
 ```sh
 fly apps create <app-name>          # アプリ名は Fly 全体でユニーク
-fly secrets set ANTHROPIC_API_KEY=... DEEPGRAM_API_KEY=... AUTH_TOKEN=... --stage
+fly secrets set OPENAI_API_KEY=... DEEPGRAM_API_KEY=... AUTH_TOKEN=... --stage
 fly deploy --remote-only            # リモートビルドのためローカルDockerは不要
 ```
 
@@ -123,7 +123,7 @@ fly deploy --remote-only            # リモートビルドのためローカル
 
 MIT License([LICENSE](LICENSE))。フォークして自由に使ってください。
 
-ただし**ライセンスが許諾するのはこのリポジトリのコードのみ**です。Deepgram と Anthropic は
+ただし**ライセンスが許諾するのはこのリポジトリのコードのみ**です。Deepgram と OpenAI は
 外部サービスであり、利用には各自でアカウントとAPIキーを取得し、それぞれの利用規約に同意する
 必要があります。
 

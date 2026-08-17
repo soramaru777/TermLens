@@ -29,10 +29,10 @@ localhost は secure context 扱いのため、**マイクテストに HTTPS は
 
 | 変数 | 必須 | 説明 |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | ✅ | 用語抽出・web 検索要約 |
+| `OPENAI_API_KEY` | ✅ | 用語抽出・web 検索要約 |
 | `DEEPGRAM_API_KEY` | `deepgram` 時 | ストリーミング音声認識 |
 | `STT_PROVIDER` | — | `deepgram` / `mock`（既定）。mock はキー・マイク不要 |
-| `ANTHROPIC_MODEL` | — | 既定 `claude-sonnet-5`。opus / haiku に切替可 |
+| `LLM_MODEL` | — | 既定 `gpt-5.6-luna`。`gpt-5.6-terra` / `gpt-5.6-sol` に切替可 |
 | `DEEPGRAM_MODEL` | — | 既定 `nova-3`（keyterm 方式）。`nova-2` は keywords 方式 |
 | `AUTH_TOKEN` | 公開時 | 共有アクセストークン。未設定なら認証なし（ローカル開発用） |
 | `PORT` | — | 既定 8080 |
@@ -70,7 +70,7 @@ build ジョブで先に `tsc` を通すのは、型エラーをリモートビ�
 
 ```sh
 flyctl apps create termlens-tatsu
-flyctl secrets set ANTHROPIC_API_KEY=... DEEPGRAM_API_KEY=... AUTH_TOKEN=... --stage
+flyctl secrets set OPENAI_API_KEY=... DEEPGRAM_API_KEY=... AUTH_TOKEN=... --stage
 flyctl deploy --remote-only
 ```
 
@@ -87,7 +87,7 @@ flyctl deploy --remote-only
 | 対象 | 内容 |
 |---|---|
 | `.dockerignore` | **必須。** 無いと `.env`（APIキー平文）と `node_modules` がリモートビルダーへ送信される |
-| `fly.toml` の `ANTHROPIC_MODEL` | `.env` と食い違うと本番だけ別モデルで動く。実際に `opus-4-8` と `sonnet-5` で不一致していた |
+| `fly.toml` の `LLM_MODEL` | `.env` と食い違うと本番だけ別モデルで動く。過去に `opus-4-8` と `sonnet-5` で不一致していた |
 | `AUTH_TOKEN` | deploy **前**に投入する。未設定だと `config.ts` が認証を自動的に無効化する（警告ログのみ） |
 | `[[http_service.checks]]` | 明示しないとヘルスチェックが設定されない（`/healthz`、interval 30s） |
 
@@ -115,7 +115,7 @@ flyctl deploy --remote-only
 | 項目 | 結果 |
 |---|---|
 | `/healthz` | 200（東京から 48ms） |
-| `/api/info` | `deepgram` / `claude-sonnet-5` / `authRequired: true` |
+| `/api/info` | `deepgram` / `gpt-5.6-luna` / `authRequired: true` |
 | WS トークンなし / 誤トークン | 401 拒否 |
 | WS 正トークン | 接続成功 |
 
