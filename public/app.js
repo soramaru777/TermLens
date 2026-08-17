@@ -36,6 +36,7 @@ let wakeLock = null;
 let sendAudio = false;
 let sessionStartedAt = null;
 let sessionEndedAt = null;
+let captureActive = false; // マイク/Wake Lock を保持している区間か
 // 「戻る」の破棄警告に使う。片方だけ保存して戻ると、もう片方が失われるため別々に持つ
 let savedTranscript = false;
 let savedTerms = false;
@@ -125,9 +126,16 @@ saveSettingsBtn.addEventListener("click", () => {
 // ---- Wake Lock ----
 async function acquireWakeLock() {
   try {
-    if ("wakeLock" in navigator) {
-      wakeLock = await navigator.wakeLock.request("screen");
+    if (!("wakeLock" in navigator)) return;
+    const lock = await navigator.wakeLock.request("screen");
+    // 要求中にセッションが終わっていたら、掴んだ直後に手放す。
+    // そうしないと releaseCapture() が「まだ未取得」と判断してすり抜け、
+    // 誰も解放しないロックが残って画面が点いたままになる
+    if (!captureActive) {
+      try { await lock.release(); } catch {}
+      return;
     }
+    wakeLock = lock;
   } catch {
     /* 非対応・拒否は無視 */
   }
@@ -137,9 +145,26 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // ---- 開始 ----
+// 認証失敗やマイク拒否ではリロードを挟まずホームに戻るため、
+// 前回のセッションの終端状態が残る。開始のたびに必ず初期化する
+// (残ると停止ボタンが「戻る」のまま新しいセッションに入り、停止できなくなる)
+function resetSessionState() {
+  stopping = false;
+  finishing = false;
+  finished = false;
+  discardWarned = false;
+  savedTranscript = false;
+  savedTerms = false;
+  sessionEndedAt = null;
+  exportRow.hidden = true;
+  stopBtn.textContent = "停止";
+}
+
 startBtn.addEventListener("click", async () => {
   homeError.hidden = true;
   startBtn.disabled = true;
+  resetSessionState();
+  captureActive = true;
   const token = getToken();
   const glossary = getGlossary();
 
@@ -175,6 +200,7 @@ startBtn.addEventListener("click", async () => {
   } catch (err) {
     console.error(err);
     showError(`開始できませんでした: ${err.message ?? err}`);
+    captureActive = false;
     await cleanupAudio();
     startBtn.disabled = false;
   }
@@ -234,11 +260,14 @@ function connectWs(token, glossary) {
     }
   });
 
-  ws.addEventListener("close", (e) => {
+  ws.addEventListener("close", async (e) => {
     sendAudio = false;
-    if (e.code === 1006 && finalText.textContent === "") {
+    // 停止処理の最中や終了後の 1006 を認証失敗と誤判定しない。
+    // 誤判定すると「トークンを確認してください」と嘘を表示したうえ、
+    // 終端状態を抱えたままホームに戻ってしまう
+    if (!stopping && !finished && e.code === 1006 && finalText.textContent === "") {
       // 認証失敗などで即切断された可能性。マイクは取得済みなので必ず解放する
-      releaseCapture();
+      await releaseCapture();
       showHome();
       showError("接続が拒否されました。設定でトークンを確認してください。");
       startBtn.disabled = false;
@@ -523,19 +552,23 @@ async function saveMarkdown(filename, text) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
-  return true;
+  // ホーム画面追加の PWA では <a download> が黙って何もしないことがあり、
+  // 成否を知る手段がない。保存できたと見なさず、未保存警告を残す側に倒す
+  return !isStandalone();
 }
 
 dlTranscriptBtn.addEventListener("click", async () => {
   const stamp = fmtStamp(sessionStartedAt ?? new Date());
   if (await saveMarkdown(`termlens-transcript-${stamp}.md`, buildTranscriptMarkdown())) {
     savedTranscript = true;
+    discardWarned = false; // 保存後は未保存のものが減るので、警告をやり直す
   }
 });
 dlTermsBtn.addEventListener("click", async () => {
   const stamp = fmtStamp(sessionStartedAt ?? new Date());
   if (await saveMarkdown(`termlens-terms-${stamp}.md`, buildTermsMarkdown())) {
     savedTerms = true;
+    discardWarned = false;
   }
 });
 
@@ -550,7 +583,8 @@ function showExport() {
 // ---- 停止 / 戻る ----
 // 1つのボタンが「停止」と「戻る」を兼ねる。ハンドラも1本にする
 // (onclick を別に足すと、押すたびに停止処理まで走って警告状態がリセットされる)。
-let finished = false;
+let finished = false;   // 終端処理が完了し、ボタンが「戻る」になっているか
+let finishing = false;  // 終端処理の実行中(多重実行を防ぐ)
 let discardWarned = false;
 
 stopBtn.addEventListener("click", async () => {
@@ -588,34 +622,47 @@ stopBtn.addEventListener("click", async () => {
 // マイク・AudioContext・Wake Lock を解放する。セッションが終わる経路すべてで必ず通す。
 // 解放を怠るとページをリロードするまでマイクが掴まれたままになる。
 async function releaseCapture() {
-  await cleanupAudio();
-  if (wakeLock) {
-    try { await wakeLock.release(); } catch {}
-    wakeLock = null;
-  }
+  // グローバルは await の前に外す。await のあとで代入すると、
+  // その間に開始し直された新しいセッションの参照を潰してしまう
+  captureActive = false;
   ws = null;
+  const lock = wakeLock;
+  wakeLock = null;
+  await cleanupAudio();
+  if (lock) {
+    try { await lock.release(); } catch {}
+  }
 }
 
 // セッションの終端。停止操作でも意図しない切断でも必ずここを通す
 async function finish(statusText = "停止しました") {
-  if (finished) return;
-  finished = true;
+  if (finishing) return;
+  finishing = true;
   await releaseCapture();
+  // 解放が済んでから「戻る」に切り替える。先に finished を立てると、
+  // ボタンの表示が「停止」のまま戻る側の分岐に入り、警告が空振りする
+  finished = true;
   setStatus(statusText);
   showExport();
   stopBtn.textContent = "戻る";
 }
 
 async function cleanupAudio() {
-  try { workletNode?.disconnect(); } catch {}
+  // 参照をローカルに移してからグローバルを外す(await のあとで null を代入すると、
+  // その間に開始し直された新しいセッションの AudioContext を消してしまう)
+  const node = workletNode;
+  const stream = mediaStream;
+  const ctx = audioContext;
   workletNode = null;
-  if (mediaStream) {
-    for (const track of mediaStream.getTracks()) track.stop();
-    mediaStream = null;
+  mediaStream = null;
+  audioContext = null;
+
+  try { node?.disconnect(); } catch {}
+  if (stream) {
+    for (const track of stream.getTracks()) track.stop();
   }
-  if (audioContext) {
-    try { await audioContext.close(); } catch {}
-    audioContext = null;
+  if (ctx) {
+    try { await ctx.close(); } catch {}
   }
 }
 
