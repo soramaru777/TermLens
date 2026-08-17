@@ -158,6 +158,9 @@ function resetSessionState() {
   sessionEndedAt = null;
   exportRow.hidden = true;
   stopBtn.textContent = "停止";
+  // 前回セッションのエラーバナーが残っていれば、新しいセッション開始時に消す
+  errorBanner?.remove();
+  errorBanner = null;
 }
 
 startBtn.addEventListener("click", async () => {
@@ -255,7 +258,10 @@ function connectWs(token, glossary) {
         else if (msg.state === "stt_closed") setStatus("STT切断");
         break;
       case "error":
+        // バッジは直後の status メッセージ(「聞き取り中」等)で上書きされて消えるため、
+        // 恒久停止のような「気づかれないと困る」エラーはカード領域に残るバナーでも伝える
         setStatus(`エラー: ${msg.message}`);
+        showErrorBanner(msg.message);
         break;
     }
   });
@@ -412,6 +418,31 @@ function el(tag, className, text) {
   return node;
 }
 
+// ---- 恒久エラーバナー ----
+// サーバーが抽出を打ち切ったとき(例: OpenAI クレジット残高切れ)に表示する。
+// ステータスバッジと違い後続の status メッセージで上書きされず、閉じるまで残り続ける。
+// class を "card" にしない: #cards .card を1枚だけ表示する縦積みレイアウトの
+// 対象から外れ、常に見えるようにするため(要件8)。
+let errorBanner = null;
+
+function showErrorBanner(message) {
+  if (!errorBanner) {
+    errorBanner = el("div", "error-banner");
+    errorBanner.append(el("span", "error-banner-text"));
+    const closeBtn = el("button", "error-banner-close", "×");
+    closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "エラー通知を閉じる");
+    closeBtn.addEventListener("click", () => {
+      errorBanner.remove();
+      errorBanner = null;
+    });
+    errorBanner.append(closeBtn);
+    cardsEl.prepend(errorBanner);
+  }
+  // 同じエラーが複数回届いても増殖させず、既存の1枚を更新するだけにする(要件4)
+  errorBanner.querySelector(".error-banner-text").textContent = message;
+}
+
 function addCard(card) {
   cardData.set(card.term, { ...card });
   const div = el("div", "card");
@@ -424,7 +455,8 @@ function addCard(card) {
   div.append(el("div", "desc", card.description));
   // web検索対象(レア度上位)のカードのみ「確認中」を表示
   if (card.willEnrich) div.append(el("div", "links pending", "🔎 最新情報を確認中…"));
-  cardsEl.prepend(div);
+  // バナーがあればその直後に挿入し、バナーを常に先頭に保つ
+  cardsEl.insertBefore(div, errorBanner ? errorBanner.nextSibling : cardsEl.firstChild);
   // 追従中なら新しいカードに切り替える。固定中は表示を動かさず件数だけ更新する
   if (pinnedToTerm) renderCardNav();
   else setActiveCard(card.term);

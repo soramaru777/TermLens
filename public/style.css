@@ -243,10 +243,40 @@ button.primary:disabled { opacity: 0.5; }
   cursor: default;
 }
 /* 縦積み(スマホ)では最新または固定した1枚だけを出す。
-   横並びでは全カードが並ぶので、この制限も #card-nav も無効にする。 */
+   横並びでは全カードが並ぶので、この制限も #card-nav も無効にする。
+   .error-banner は .card クラスを持たないため、この制限を受けずに常に表示される。 */
 @media (max-width: 899px) {
   #cards .card { display: none; }
   #cards .card.active { display: block; }
+}
+/* 恒久エラー通知(例: LLMのクレジット残高切れ)。#cards の先頭に固定し、
+   status メッセージによる上書きやスクロールで隠れないようにする(#cards 自身が
+   スクロールコンテナなので sticky の基準はここになる)。 */
+.error-banner {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  background: #fdf1e2;
+  border: 1px solid var(--warn);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: var(--warn);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+.error-banner-text { flex: 1; }
+.error-banner-close {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--warn);
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
 }
 #cards {
   flex: 1;
