@@ -4,7 +4,8 @@ import {
   BadRequestError,
   NotFoundError,
   PermissionDeniedError,
-} from "@anthropic-ai/sdk";
+  RateLimitError,
+} from "openai";
 import type { TermCard, TermLink } from "../protocol.js";
 import { createExtractor } from "./extractor.js";
 import { enrichTerm } from "./enrich.js";
@@ -25,19 +26,33 @@ function normalizeTerm(term: string): string {
 const SDK_RETRYABLE_STATUSES = new Set([408, 409, 429]);
 
 /**
+ * 残高不足・課金上限による 429 か。
+ *
+ * OpenAI はレート超過と残高切れをどちらも 429 で返すが、前者は待てば回復し、
+ * 後者は入金するまで永久に失敗する。ステータスだけで判定すると残高切れを
+ * 再試行し続け、バッファが肥大する(#3 と同じ壊れ方)。区別は code に頼る。
+ */
+function isQuotaExhausted(err: APIError): boolean {
+  const code = (err as { code?: unknown }).code;
+  if (code === "insufficient_quota" || code === "billing_hard_limit_reached") return true;
+  return /insufficient[_ ]quota|no credits remaining|billing/i.test(err.message ?? "");
+}
+
+/**
  * 再試行しても成功しないエラーか。
  *
  * 4xx のうち SDK が再試行しないものを恒久エラーとみなす。個別のエラークラスを列挙すると
  * 400/401/403 のように取りこぼしが出るため、ステータスの範囲で判定する。
- * 例: 400(不正リクエスト・クレジット残高切れ)、401/403(認証・権限)、
- *     404(モデルIDが無効)、422(スキーマ不正)。
- * 5xx・408/409/429・接続エラーは一時的なものとして再試行に回す。
+ * 例: 400(不正リクエスト)、401/403(認証・権限)、404(モデルIDが無効)、422(スキーマ不正)。
+ * 5xx・408/409・接続エラーは一時的なものとして再試行に回す。
+ * 429 は原則一時扱いだが、残高切れだけは恒久として扱う。
  */
 function isPermanent(err: unknown): boolean {
   if (!(err instanceof APIError)) return false;
   const status = err.status;
   // APIConnectionError などは status が undefined。判別できないものは再試行に倒す。
   if (typeof status !== "number") return false;
+  if (status === 429) return isQuotaExhausted(err);
   return status >= 400 && status < 500 && !SDK_RETRYABLE_STATUSES.has(status);
 }
 
@@ -52,12 +67,10 @@ function toUserMessage(err: unknown): string {
   if (err instanceof NotFoundError) {
     return "用語抽出のモデルが見つかりません。サーバーの設定を確認してください。";
   }
+  if (err instanceof RateLimitError && isQuotaExhausted(err)) {
+    return "OpenAIのクレジット残高が不足しています。コンソールで購入してください。";
+  }
   if (err instanceof BadRequestError) {
-    // クレジット残高切れには専用のエラー型が無く、400 invalid_request_error として来る。
-    // 判別はメッセージに頼らざるを得ないが、外れても下の汎用文言に落ちるだけ。
-    if (/credit balance/i.test(err.message)) {
-      return "Anthropicのクレジット残高が不足しています。コンソールで購入してください。";
-    }
     return "用語抽出のリクエストが受け付けられませんでした。";
   }
   if (err instanceof APIError) {
