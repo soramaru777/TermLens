@@ -105,10 +105,21 @@ export class ExtractionScheduler {
       onCards: (cards: TermCard[]) => void;
       onCardUpdate: (term: string, description: string, links: TermLink[]) => void;
       onExtracting: () => void;
-      onError: (message: string) => void;
+      /** permanent: 恒久エラーで抽出を打ち切ったときだけ true(#10)。一時エラーは省略/false。 */
+      onError: (message: string, permanent?: boolean) => void;
     },
+    // 再接続時にクライアントから渡される既出用語(#8)。新しい Session/Scheduler は
+    // デデュープ状態が空から始まるため、渡された分を shownSet/shownTerms の初期値にする。
+    // 既存の normalizeTerm を通すことで、通常の抽出結果と同じキー正規化に揃える。
+    shownTerms: string[] = [],
   ) {
     this.extract = createExtractor(glossary);
+    for (const term of shownTerms.slice(-SHOWN_TERMS_LIMIT)) {
+      const key = normalizeTerm(term);
+      if (this.shownSet.has(key)) continue;
+      this.shownSet.add(key);
+      this.shownTerms.push(term);
+    }
     this.timer = setInterval(() => this.maybeRun(), CHECK_INTERVAL_MS);
   }
 
@@ -205,7 +216,8 @@ export class ExtractionScheduler {
         // 再試行しても成功しないため、バッファに戻さず抽出を打ち切る。
         // 戻すと会議が続く限りバッファが肥大し、復旧時に巨大なリクエストになる。
         this.disableExtraction();
-        this.callbacks.onError(`用語抽出を停止しました。${toUserMessage(err)}`);
+        // permanent: true。恒久エラーによる打ち切りだけがバナー表示の対象(#10)
+        this.callbacks.onError(`用語抽出を停止しました。${toUserMessage(err)}`, true);
         return;
       }
 
@@ -216,6 +228,8 @@ export class ExtractionScheduler {
         this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES &&
         this.consecutiveFailures % MAX_CONSECUTIVE_FAILURES === 0
       ) {
+        // permanent は付けない(省略=false)。復旧の可能性がある一時エラーなので、
+        // クライアント側は消えないバナーではなくステータス表示だけにする(#10)
         this.callbacks.onError(
           `用語抽出が${this.consecutiveFailures}回連続で失敗しました。${toUserMessage(err)}`,
         );

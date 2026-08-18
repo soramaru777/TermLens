@@ -19,6 +19,15 @@
     </header>
 
     <div class="home-body">
+      <!-- 前回セッションが localStorage に残っている場合だけ表示する(要件3) -->
+      <div id="restore-banner" class="restore-banner" hidden>
+        <p id="restore-info"></p>
+        <p class="hint">「開始」で新しい会議を始めると、この内容は破棄されます。</p>
+        <div class="restore-actions">
+          <button id="restore-btn" class="primary">復元する</button>
+          <button id="discard-btn" class="secondary">破棄する</button>
+        </div>
+      </div>
       <p class="sub">会議の会話をリアルタイムに文字起こしし、専門用語を自動解説します。</p>
       <button id="start-btn" class="primary">開始</button>
       <p id="home-error" class="error" hidden></p>
@@ -48,6 +57,9 @@
       <label for="glossary">用語集(1行に1語)</label>
       <textarea id="glossary" rows="10" placeholder="例)&#10;田中太郎&#10;Kubernetes&#10;RAG"></textarea>
       <p class="hint">参加者名・社名・専門用語を入れると、音声認識の段階で精度が上がります。</p>
+
+      <label class="checkbox-row"><input id="persist-toggle" type="checkbox"> 会議の内容をこの端末に保存する</label>
+      <p class="hint">音声は保存されません。保存から24時間で自動的に削除されます。</p>
 
       <button id="save-settings" class="primary">保存</button>
     </div>

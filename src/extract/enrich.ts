@@ -41,6 +41,21 @@ export function stripInlineCitations(text: string): string {
 }
 
 /**
+ * http/https 以外のスキームを弾く。web検索の citation は本来 http(s) の想定だが、
+ * 上流サービスの出力形式に検証をかけず a.href に渡すと javascript: 等の混入時に
+ * ページのオリジンで任意スクリプトが実行されうるため、多層防御として存在チェックする。
+ * 不正な URL・相対 URL(new URL() が投げるもの)も同様に弾く。
+ */
+export function isHttpUrl(url: string): boolean {
+  try {
+    const { protocol } = new URL(url);
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 同一ページが計測パラメータ違いで重複するのを防ぐための正規化キー。
  * web検索の結果には utm_source が付くことがあり、素の URL 比較では重複を弾けない。
  */
@@ -66,6 +81,27 @@ export function clampDescription(text: string, max = MAX_DESCRIPTION_CHARS): str
   return lastEnd >= max / 2 ? head.slice(0, lastEnd + 1) : head;
 }
 
+/**
+ * タイトルまたは URL から「日本語ソースらしさ」を判定する。
+ * SYSTEM プロンプトで日本語ソースを優先するよう指示しても LLM が部分的にしか従わないため、
+ * 収集した候補の中からコード側で選び直す(enrichTerm 参照)ための判定に使う。
+ */
+export function isJapaneseSource(url: string, title?: string): boolean {
+  // 漢字だけでは中国語ページと区別できない(実際に qdrant.org.cn の中国語ページを
+  // 日本語と誤判定して優先していた)。かなの有無を日本語の判定材料にする。
+  // 「冗長化」のようなかな無しの日本語タイトルは取りこぼすが、その場合は
+  // 従来どおりの順序に落ちるだけで、誤って優先するより害が小さい。
+  if (title && /[぀-ヿ]/.test(title)) return true;
+  try {
+    const { hostname, pathname } = new URL(url);
+    if (/\.jp$/i.test(hostname)) return true;
+    if (/\/ja\/|\/ja[-_]jp\//i.test(pathname)) return true;
+  } catch {
+    // 不正な URL は isHttpUrl 側で候補から除外される想定
+  }
+  return false;
+}
+
 interface Annotation {
   type?: string;
   url?: string;
@@ -78,9 +114,25 @@ interface OutputItem {
   action?: { results?: Array<{ url?: string; title?: string }> };
 }
 
+interface LinkCandidate {
+  url: string;
+  title: string;
+  cited: boolean;
+}
+
+/**
+ * 引用済み(cited)を最優先、次に日本語ソースを優先する順位を返す(数値が小さいほど上位)。
+ * 同順位内は Array#sort の安定ソート(ES2019+で仕様上保証)により候補収集時の順序を保つ。
+ */
+function linkRank(candidate: LinkCandidate): number {
+  return (candidate.cited ? 0 : 2) + (isJapaneseSource(candidate.url, candidate.title) ? 0 : 1);
+}
+
 /**
  * 用語1件をweb検索付きで再調査し、最新情報ベースの要約と引用リンク(最大3件)を返す。
- * リンクはモデルが実際に引用したソース(annotations)を優先し、不足分は検索結果から補完する。
+ * リンクは「候補を全部集めてから最大3件選ぶ」の2段階で決める。
+ * 集めながら3件で打ち切る実装だと、日本語ソースが4番目以降にあるだけで
+ * 採用されずに終わってしまう(SYSTEM の指示だけでは LLM が日本語優先を徹底しないため)。
  */
 export async function enrichTerm(term: string, context: string): Promise<EnrichResult> {
   const response = await client.responses.create({
@@ -101,14 +153,15 @@ export async function enrichTerm(term: string, context: string): Promise<EnrichR
   const raw = paragraphs.length > 0 ? paragraphs[paragraphs.length - 1] : fullText;
   const description = clampDescription(stripInlineCitations(raw));
 
-  const links: TermLink[] = [];
+  const candidates: LinkCandidate[] = [];
   const seen = new Set<string>();
-  const addLink = (url?: string, title?: string) => {
-    if (!url || links.length >= MAX_LINKS) return;
+  const addCandidate = (url: string | undefined, title: string | undefined, cited: boolean) => {
+    // URL不正・スキーム不正な候補はここで弾く(件数を「候補として全部集める」対象にも入れない)
+    if (!url || !isHttpUrl(url)) return;
     const key = urlKey(url);
     if (seen.has(key)) return;
     seen.add(key);
-    links.push({ url, title: title?.trim() || url });
+    candidates.push({ url, title: title?.trim() || url, cited });
   };
 
   const output = (response.output ?? []) as unknown as OutputItem[];
@@ -116,15 +169,22 @@ export async function enrichTerm(term: string, context: string): Promise<EnrichR
   for (const item of output) {
     for (const block of item.content ?? []) {
       for (const a of block.annotations ?? []) {
-        if (a.type === "url_citation") addLink(a.url, a.title);
+        if (a.type === "url_citation") addCandidate(a.url, a.title, true);
       }
     }
   }
-  // 2) 足りない分を検索結果から補完
+  // 2) 引用されなかった検索結果も候補に加える(打ち切らずに全件集め、後段の優先順位付けで選ぶ)
   for (const item of output) {
     if (!String(item.type).includes("web_search")) continue;
-    for (const r of item.results ?? item.action?.results ?? []) addLink(r.url, r.title);
+    for (const r of item.results ?? item.action?.results ?? []) addCandidate(r.url, r.title, false);
   }
+
+  // 引用済み優先 → 日本語ソース優先の順位で並べ替え、上位 MAX_LINKS 件を採用する。
+  // 日本語ソースが無ければ従来どおり英語ソースだけで埋まる(件数は減らさない)。
+  const links: TermLink[] = candidates
+    .sort((a, b) => linkRank(a) - linkRank(b))
+    .slice(0, MAX_LINKS)
+    .map(({ url, title }) => ({ url, title }));
 
   if (!description) throw new Error(`web検索による要約が生成されませんでした: ${term}`);
   return { description, links };
