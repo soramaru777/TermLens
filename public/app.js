@@ -41,6 +41,18 @@ let captureActive = false; // マイク/Wake Lock を保持している区間か
 let savedTranscript = false;
 let savedTerms = false;
 let stopping = false; // 停止操作によるクローズか(意図しない切断と区別する)
+// 再接続: 指数バックオフ 1s, 2s, 4s, 8s, 16s の最大5回。
+// マイクは掴んだまま(releaseCapture を呼ばない)、送信だけ止めて待つ
+const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000];
+let reconnectAttempt = 0; // これまでの試行回数(0=再接続していない)
+let reconnectTimer = null; // 待機中の setTimeout。停止操作でキャンセルするため保持する
+// ready を一度でも受け取ったか。サーバーが ready を返した時点でトークンは受理済みなので、
+// 認証失敗と回線断を切り分ける材料になる(文字起こしの有無で判定すると、
+// 無音のまま回線が切れた場合に「トークンを確認してください」と誤表示していた)
+let everReady = false;
+// 接続がこの時間だけ維持できたら「復帰した」とみなして再接続の試行回数を戻す
+const STABLE_MS = 30_000;
+let stableTimer = null;
 
 // ---- 保存値の読み出し ----
 // 設定は localStorage が正。入力欄は設定画面を開いたときにそこから復元する。
@@ -161,6 +173,13 @@ function resetSessionState() {
   // 前回セッションのエラーバナーが残っていれば、新しいセッション開始時に消す
   errorBanner?.remove();
   errorBanner = null;
+  // 前回セッションの再接続待ちが万一残っていたら止める(持ち越さない)
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectAttempt = 0;
+  everReady = false;
+  clearTimeout(stableTimer);
+  stableTimer = null;
 }
 
 startBtn.addEventListener("click", async () => {
@@ -229,6 +248,19 @@ function connectWs(token, glossary) {
       case "ready":
         sendAudio = true;
         setStatus("聞き取り中");
+        // reconnectAttempt > 0 は今回の ready が再接続の成功であることの印。
+        // サーバー側は新しい STT セッションを張るため話者番号が振り直しになる。
+        // 「話者A」が別人になり得ることを区切りとして残す
+        everReady = true;
+        if (reconnectAttempt > 0) {
+          finalLines.push({ type: "reconnect", t: Date.now() });
+          renderTranscript();
+        }
+        // 試行回数は「安定して繋がり続けた」ことを確認してから戻す。
+        // ready を受けた時点で戻すと、接続直後に切れる状態(フラッピング)で
+        // カウンタが上がらず、上限に到達しないまま永久に再接続し続ける
+        clearTimeout(stableTimer);
+        stableTimer = setTimeout(() => { reconnectAttempt = 0; }, STABLE_MS);
         break;
       case "transcript":
         if (msg.isFinal) {
@@ -268,25 +300,47 @@ function connectWs(token, glossary) {
 
   ws.addEventListener("close", async (e) => {
     sendAudio = false;
+    clearTimeout(stableTimer);
     // 停止処理の最中や終了後の 1006 を認証失敗と誤判定しない。
     // 誤判定すると「トークンを確認してください」と嘘を表示したうえ、
     // 終端状態を抱えたままホームに戻ってしまう
-    if (!stopping && !finished && e.code === 1006 && finalText.textContent === "") {
+    if (!stopping && !finished && !everReady && e.code === 1006) {
       // 認証失敗などで即切断された可能性。マイクは取得済みなので必ず解放する
       await releaseCapture();
       showHome();
       showError("接続が拒否されました。設定でトークンを確認してください。");
       startBtn.disabled = false;
-    } else if (!stopping) {
-      // 意図しない切断。ここもセッションの終端なので、停止したときと同じ後始末をする。
-      // (停止操作によるクローズなら stopping が真で、finish() の表示を上書きしない)
-      finish("切断されました");
+    } else if (!stopping && !finished) {
+      // 意図しない切断。即座に終端にはせず、マイクを保持したままバックオフ再接続を試みる。
+      // (停止操作によるクローズなら stopping が真で、ここには来ない)
+      scheduleReconnect();
     }
   });
 }
 
+// 指数バックオフで再接続する。releaseCapture/cleanupAudio は呼ばない
+// (マイクを離すと再接続できても音声が送れなくなる)。
+// 送信は sendAudio=false で止めており、再接続成功時は "ready" 受信で再開する
+function scheduleReconnect() {
+  if (reconnectAttempt >= RECONNECT_DELAYS.length) {
+    // 最大回数まで試して復帰しなかった。ここで初めて終端状態にする
+    finish("接続が復帰しませんでした");
+    return;
+  }
+  const delay = RECONNECT_DELAYS[reconnectAttempt];
+  reconnectAttempt++;
+  setStatus(`再接続中… (${reconnectAttempt}/${RECONNECT_DELAYS.length})`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWs(getToken(), getGlossary());
+  }, delay);
+}
+
 // ---- 文字起こし内のカード用語ハイライト ----
 const finalLines = [];
+// 再接続の印は発言ではないので、件数を数えるときは除く
+const spokenLines = () => finalLines.filter((l) => l.type !== "reconnect");
+
 // カードの元データ。DOM は新しい順に prepend するが、こちらは挿入順(古い順)を保つ。
 // エクスポートは登場順の方が読みやすいため、この Map を正とする。
 const cardData = new Map(); // term → TermCard
@@ -387,11 +441,18 @@ function speakerLabel(speaker) {
 }
 
 // 連続する同一話者の発言を1つの段落にまとめる。描画とエクスポートで共有する。
+// finalLines には通常の発話行のほかに { type: "reconnect" } という区切り印が混じる。
+// 区切りはそれ自身で1グループとし、直後の発話が直前の話者と同じでも絶対にまとめない
+// (再接続後は話者番号が振り直しなので、同じ番号でも別人の可能性がある)。
 function groupUtterances() {
   const groups = [];
   for (const line of finalLines) {
+    if (line.type === "reconnect") {
+      groups.push({ type: "reconnect", t: line.t });
+      continue;
+    }
     const last = groups[groups.length - 1];
-    if (last && last.speaker === line.speaker) last.texts.push(line.text);
+    if (last && last.type !== "reconnect" && last.speaker === line.speaker) last.texts.push(line.text);
     else groups.push({ speaker: line.speaker, t: line.t, texts: [line.text] });
   }
   return groups;
@@ -401,13 +462,18 @@ function groupUtterances() {
 // カード追加時のハイライト反映も兼ねる。
 function renderTranscript() {
   finalText.textContent = "";
-  for (const { speaker, texts } of groupUtterances()) {
-    const group = el("div", "utterance");
-    if (speaker != null) {
-      group.append(el("span", `speaker-chip sp-${speaker % 6}`, speakerLabel(speaker)));
+  for (const group of groupUtterances()) {
+    if (group.type === "reconnect") {
+      finalText.append(el("div", "reconnect-marker", "― 再接続(以降の話者ラベルは振り直し)―"));
+      continue;
     }
-    for (const text of texts) group.append(renderLine(text));
-    finalText.append(group);
+    const { speaker, texts } = group;
+    const div = el("div", "utterance");
+    if (speaker != null) {
+      div.append(el("span", `speaker-chip sp-${speaker % 6}`, speakerLabel(speaker)));
+    }
+    for (const text of texts) div.append(renderLine(text));
+    finalText.append(div);
   }
 }
 
@@ -531,7 +597,7 @@ function buildTranscriptMarkdown() {
     "",
     `- 開始: ${fmtDateTime(started)}`,
     `- 終了: ${fmtDateTime(ended)}`,
-    `- 発言数: ${finalLines.length}`,
+    `- 発言数: ${spokenLines().length}`,
     "",
     "> TermLens による自動文字起こしです。音声認識の誤りを含む場合があります。",
     "> 時刻は会議開始からの経過時間(サーバーが確定結果を返した時点)です。",
@@ -539,7 +605,12 @@ function buildTranscriptMarkdown() {
     "---",
     "",
   ];
-  for (const { speaker, t, texts } of groupUtterances()) {
+  for (const group of groupUtterances()) {
+    if (group.type === "reconnect") {
+      out.push("---", "", "*再接続しました。以降の話者ラベルは振り直しです。*", "");
+      continue;
+    }
+    const { speaker, t, texts } = group;
     const label = speaker != null ? speakerLabel(speaker) : "発言";
     out.push(`**${label}** \`${fmtElapsed(t - started.getTime())}\``, "", texts.map(escMd).join(" "), "");
   }
@@ -622,7 +693,7 @@ dlTermsBtn.addEventListener("click", async () => {
 
 function showExport() {
   sessionEndedAt ??= new Date();
-  dlTranscriptBtn.disabled = finalLines.length === 0;
+  dlTranscriptBtn.disabled = spokenLines().length === 0;
   dlTermsBtn.disabled = cardData.size === 0;
   exportRow.hidden = false;
   measureLiveChrome();
@@ -636,12 +707,20 @@ let finishing = false;  // 終端処理の実行中(多重実行を防ぐ)
 let discardWarned = false;
 
 stopBtn.addEventListener("click", async () => {
+  // 再接続の待機中(setTimeout待ち)なら、まずそれを止める。
+  // 残したまま停止処理を進めると、片付けが終わった後にタイマーが発火して
+  // 勝手に再接続してしまう
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectAttempt = 0;
   if (finished) {
     // 「戻る」。リロードで内容を破棄するため、未保存のものがあれば1回目は警告に留める
     // (確認ダイアログは PWA で扱いが不安定なため使わない)。
     // 片方だけ保存した場合も、保存していない側は失われるので警告する
     const unsaved =
-      (finalLines.length > 0 && !savedTranscript) || (cardData.size > 0 && !savedTerms);
+      (spokenLines().length > 0 && !savedTranscript) || (cardData.size > 0 && !savedTerms);
     if (unsaved && !discardWarned) {
       discardWarned = true;
       setStatus("未保存です。もう一度押すと破棄");

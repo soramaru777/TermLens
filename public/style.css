@@ -185,6 +185,13 @@ button.primary:disabled { opacity: 0.5; }
 }
 #interim-text { color: var(--muted); }
 .utterance { margin-bottom: 10px; }
+/* 再接続の区切り。話者番号が振り直しであることを示す注記なので、通常の発言と混同しないよう控えめに */
+.reconnect-marker {
+  margin: 4px 0 10px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: center;
+}
 .speaker-chip {
   display: inline-block;
   font-size: 0.72rem;
