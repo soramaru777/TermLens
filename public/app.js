@@ -27,6 +27,11 @@ const latestBtn = $("latest-btn");
 const exportRow = $("export-row");
 const dlTranscriptBtn = $("dl-transcript");
 const dlTermsBtn = $("dl-terms");
+const persistToggle = $("persist-toggle");
+const restoreBanner = $("restore-banner");
+const restoreInfo = $("restore-info");
+const restoreBtn = $("restore-btn");
+const discardBtn = $("discard-btn");
 
 let ws = null;
 let audioContext = null;
@@ -63,6 +68,8 @@ const getGlossary = () =>
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
+// 既定 ON。明示的に "false" が保存されている場合のみ OFF(要件5)
+const getPersistEnabled = () => localStorage.getItem("termlens.persist") !== "false";
 
 function refreshGlossaryCount() {
   glossaryCount.textContent = `${getGlossary().length}語`;
@@ -109,6 +116,7 @@ function showSettings() {
   // 入力欄は開くたびに保存値から復元する(「戻る」で破棄できるようにするため)
   tokenInput.value = getToken();
   glossaryInput.value = getGlossaryText();
+  persistToggle.checked = getPersistEnabled();
   home.hidden = true;
   live.hidden = true;
   settings.hidden = false;
@@ -131,6 +139,9 @@ closeSettingsBtn.addEventListener("click", () => showHome());
 saveSettingsBtn.addEventListener("click", () => {
   localStorage.setItem("termlens.token", tokenInput.value.trim());
   localStorage.setItem("termlens.glossary", glossaryInput.value);
+  localStorage.setItem("termlens.persist", String(persistToggle.checked));
+  // OFF にした時点で保存済みのものも消す。「ONに戻すまで一切残さない」を保証するため(要件5)
+  if (!persistToggle.checked) deleteSavedSession();
   homeError.hidden = true;
   showHome();
 });
@@ -255,6 +266,7 @@ function connectWs(token, glossary) {
         if (reconnectAttempt > 0) {
           finalLines.push({ type: "reconnect", t: Date.now() });
           renderTranscript();
+          scheduleSessionSave();
         }
         // 試行回数は「安定して繋がり続けた」ことを確認してから戻す。
         // ready を受けた時点で戻すと、接続直後に切れる状態(フラッピング)で
@@ -267,6 +279,7 @@ function connectWs(token, glossary) {
           finalLines.push({ text: msg.text, speaker: msg.speaker, t: Date.now() });
           renderTranscript();
           interimText.textContent = "";
+          scheduleSessionSave();
         } else {
           interimText.textContent = msg.text;
         }
@@ -526,6 +539,7 @@ function addCard(card) {
   // 追従中なら新しいカードに切り替える。固定中は表示を動かさず件数だけ更新する
   if (pinnedToTerm) renderCardNav();
   else setActiveCard(card.term);
+  scheduleSessionSave();
 }
 
 // web検索による清書: 解説を最新情報ベースに差し替え、関連リンクを表示
@@ -543,7 +557,11 @@ function isHttpUrl(url) {
 
 function updateCard({ term, description, links }) {
   const stored = cardData.get(term);
-  if (stored) Object.assign(stored, { description, links });
+  // cardData が変化するのはここなので、DOM が見つからず早期returnする場合でも保存はする
+  if (stored) {
+    Object.assign(stored, { description, links });
+    scheduleSessionSave();
+  }
   const card = [...cardsEl.children].find((c) => c.dataset.term === term);
   if (!card) return;
   card.querySelector(".desc").textContent = description;
@@ -699,6 +717,144 @@ function showExport() {
   measureLiveChrome();
 }
 
+// ---- セッション保存・復元 ----
+// 状態はブラウザメモリにしかなく、リロード・タブ破棄・端末のスリープで全消失する。
+// エクスポート(上記)は「停止まで到達できた場合」しか使えないため、進行中の状態も
+// localStorage に書いておき、次回起動時に復元できるようにする(Issue #9 後半)。
+// 保存しない: 音声そのもの、アクセストークン(トークンは別キーで既に保存されている)
+
+const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // これを超えたら読み込み時に案内も出さず破棄する(要件4)
+const SESSION_SAVE_DEBOUNCE_MS = 1000; // 文字起こしは数秒に1回、カード更新も走るため毎回書くと重い(要件2)
+const SESSION_MAX_CHARS = 2 * 1024 * 1024; // 目安2MB。文字数で近似する(UTF-16なので実バイト数とは厳密には一致しない)
+
+function deleteSavedSession() {
+  try { localStorage.removeItem("termlens.session"); } catch {}
+}
+
+function buildSessionSnapshot() {
+  return {
+    savedAt: Date.now(),
+    sessionStartedAt: sessionStartedAt ? sessionStartedAt.getTime() : null,
+    finalLines,
+    cardData: [...cardData], // Map は JSON化できないため [term, card] の配列に落とす
+  };
+}
+
+// 実際に書き出す。呼び出し元は scheduleSessionSave() 経由が基本(デバウンス、要件2)。
+// visibilitychange(hidden) での即時書き出しだけこの関数を直接呼ぶ。
+function trySaveSession() {
+  // captureActive を「保存すべき区間か」の判定に流用している。finalLines/cardData が
+  // 変化しうるのはマイク/WS を保持している間(停止後の flush 待ちも含む)だけなので、
+  // 専用フラグを別に持つ必要がなかった
+  if (!getPersistEnabled() || !captureActive) return;
+  let snapshot = buildSessionSnapshot();
+  let json = JSON.stringify(snapshot);
+  // 大きすぎる場合は古い finalLines から捨てて収める(要件6)。cardData は用語解説の
+  // 本体なので削らない
+  while (json.length > SESSION_MAX_CHARS && snapshot.finalLines.length > 0) {
+    const drop = Math.max(1, Math.ceil(snapshot.finalLines.length / 10));
+    snapshot = { ...snapshot, finalLines: snapshot.finalLines.slice(drop) };
+    json = JSON.stringify(snapshot);
+  }
+  try {
+    localStorage.setItem("termlens.session", json);
+  } catch {
+    // 容量超過などで書き込みに失敗しても会議自体は止めない(要件6)
+  }
+}
+
+let saveSessionTimer = null;
+function scheduleSessionSave() {
+  if (!getPersistEnabled()) return;
+  clearTimeout(saveSessionTimer);
+  saveSessionTimer = setTimeout(() => {
+    saveSessionTimer = null;
+    trySaveSession();
+  }, SESSION_SAVE_DEBOUNCE_MS);
+}
+
+// ページが隠れる/閉じられる直前は取りこぼせない。beforeunload は iOS で発火が
+// 不確実なため、visibilitychange の hidden を主経路にする(要件2)
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "hidden") return;
+  clearTimeout(saveSessionTimer);
+  saveSessionTimer = null;
+  trySaveSession();
+});
+
+// ---- 復元案内(ホーム画面) ----
+let pendingRestoreSession = null;
+
+function loadPendingSession() {
+  let raw;
+  try {
+    raw = localStorage.getItem("termlens.session");
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  let session;
+  try {
+    session = JSON.parse(raw);
+  } catch {
+    return null; // 壊れたJSONは復元しようがないので無視する
+  }
+  if (!session.savedAt || Date.now() - session.savedAt > SESSION_MAX_AGE_MS) {
+    deleteSavedSession(); // 期限切れは案内を出さずに破棄する(要件4)
+    return null;
+  }
+  return session;
+}
+
+function checkPendingSession() {
+  pendingRestoreSession = loadPendingSession();
+  if (!pendingRestoreSession) return;
+  const started = pendingRestoreSession.sessionStartedAt
+    ? new Date(pendingRestoreSession.sessionStartedAt)
+    : new Date(pendingRestoreSession.savedAt);
+  // 再接続の区切り印は発言ではないので、spokenLines() と同じく数から除く
+  const spoken = (pendingRestoreSession.finalLines ?? []).filter((l) => l.type !== "reconnect").length;
+  const cardCount = (pendingRestoreSession.cardData ?? []).length;
+  restoreInfo.textContent = `${fmtDateTime(started)} の会議・発言 ${spoken} 件・カード ${cardCount} 件`;
+  restoreBanner.hidden = false;
+}
+
+// 「復元する」: 本番画面を終端状態(停止後と同じ)で開く。録音は再開せず WebSocket も張らない —
+// 復元の目的は失われた内容を持ち出せるようにすることであり、会議の続きを録るのは別の話(要件3)
+restoreBtn.addEventListener("click", () => {
+  if (!pendingRestoreSession) return;
+  const session = pendingRestoreSession;
+  pendingRestoreSession = null;
+  restoreBanner.hidden = true;
+
+  resetSessionState();
+  sessionStartedAt = session.sessionStartedAt ? new Date(session.sessionStartedAt) : new Date(session.savedAt);
+  sessionEndedAt = new Date(session.savedAt); // 会議の「終了」ではなく最後に保存できた時刻
+  finalLines.push(...(session.finalLines ?? []));
+  for (const [, card] of session.cardData ?? []) {
+    addCard(card);
+    // カードを描き直すだけでは会話中の用語がオレンジ表示にならないため、
+    // "cards" 受信時(connectWs 内)と同じくハイライトも復元する
+    addHighlightTerm(card.term, card.term);
+    addHighlightTerm(card.correctedFrom, card.term);
+    for (const form of card.surfaceForms ?? []) addHighlightTerm(form, card.term);
+  }
+  renderTranscript();
+  finished = true;
+  stopBtn.textContent = "戻る";
+  setStatus("復元しました(録音は再開していません)");
+  showLive();
+  showExport();
+});
+
+discardBtn.addEventListener("click", () => {
+  deleteSavedSession();
+  pendingRestoreSession = null;
+  restoreBanner.hidden = true;
+});
+
+checkPendingSession();
+
 // ---- 停止 / 戻る ----
 // 1つのボタンが「停止」と「戻る」を兼ねる。ハンドラも1本にする
 // (onclick を別に足すと、押すたびに停止処理まで走って警告状態がリセットされる)。
@@ -726,6 +882,8 @@ stopBtn.addEventListener("click", async () => {
       setStatus("未保存です。もう一度押すと破棄");
       return;
     }
+    // 会議を正常に終えてホームへ戻るので、持ち出しも済んだはずの保存データは残さない(要件6)
+    deleteSavedSession();
     location.reload();
     return;
   }

@@ -104,6 +104,29 @@ button.primary:disabled { opacity: 0.5; }
 }
 .row-value { color: var(--muted); }
 
+/* ---- セッション復元の案内 ---- */
+.restore-banner {
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: #eef3f1;
+}
+.restore-banner p { margin: 0 0 10px; font-size: 0.88rem; color: var(--text); }
+.restore-actions { display: flex; gap: 8px; }
+.restore-actions .primary { margin-top: 0; flex: 1; font-size: 0.95rem; padding: 12px; }
+.restore-actions .secondary {
+  flex: 1;
+  font-size: 0.95rem;
+  padding: 12px;
+  border: 1px solid #cfd6d4;
+  border-radius: 10px;
+  background: #fff;
+  color: var(--text);
+  font-family: inherit;
+  cursor: pointer;
+}
+
 /* ---- 設定画面 ---- */
 .settings-body {
   flex: 1;
@@ -123,6 +146,15 @@ button.primary:disabled { opacity: 0.5; }
 }
 .settings-body textarea { resize: vertical; }
 .settings-body .primary { margin-top: 24px; }
+/* チェックボックスは input 共通ルール(width:100%)の対象外にする */
+.settings-body .checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.settings-body .checkbox-row input { width: auto; }
 
 /* ---- 本番画面 ---- */
 #live {
