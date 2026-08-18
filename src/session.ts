@@ -6,6 +6,15 @@ import { ExtractionScheduler } from "./extract/scheduler.js";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
 import { config } from "./config.js";
 
+/**
+ * クライアントから届いた値を文字列配列に正規化する。
+ * 配列でなければ空配列、要素は文字列だけを残す(長さの上限は呼び出し先で掛ける)。
+ */
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === "string");
+}
+
 function createSttAdapter(): SttAdapter {
   return config.sttProvider === "deepgram"
     ? new DeepgramSttAdapter()
@@ -46,12 +55,18 @@ export class Session {
       return;
     }
     if (msg.type === "start") {
-      void this.start(
-        Array.isArray(msg.glossary) ? msg.glossary : [],
-        Array.isArray(msg.shownTerms) ? msg.shownTerms : [],
-      );
+      // WS 越しの入力なので実行時の型は保証されない。配列であることだけでなく
+      // 要素が文字列であることまで見る。文字列以外が混ざると normalizeTerm の
+      // term.normalize() で例外になり、プロセスごと落ちて他のセッションも巻き込む
+      void this.start(toStringArray(msg.glossary), toStringArray(msg.shownTerms)).catch((err) => {
+        // 1 セッションの失敗でサーバー全体を落とさない
+        console.error("[session] start failed:", err);
+        this.send({ type: "error", code: "bad_request", message: "セッションを開始できませんでした。" });
+      });
     } else if (msg.type === "stop") {
-      void this.stopSession();
+      void this.stopSession().catch((err) => {
+        console.error("[session] stop failed:", err);
+      });
     }
   }
 
