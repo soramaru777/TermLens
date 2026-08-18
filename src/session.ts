@@ -46,24 +46,32 @@ export class Session {
       return;
     }
     if (msg.type === "start") {
-      void this.start(Array.isArray(msg.glossary) ? msg.glossary : []);
+      void this.start(
+        Array.isArray(msg.glossary) ? msg.glossary : [],
+        Array.isArray(msg.shownTerms) ? msg.shownTerms : [],
+      );
     } else if (msg.type === "stop") {
       void this.stopSession();
     }
   }
 
-  private async start(glossary: string[]): Promise<void> {
+  private async start(glossary: string[], shownTerms: string[] = []): Promise<void> {
     if (this.stt) {
       this.send({ type: "error", code: "bad_request", message: "already started" });
       return;
     }
-    this.scheduler = new ExtractionScheduler(glossary, {
-      onCards: (cards) => this.send({ type: "cards", cards }),
-      onCardUpdate: (term, description, links) =>
-        this.send({ type: "card_update", term, description, links }),
-      onExtracting: () => this.send({ type: "status", state: "extracting" }),
-      onError: (message) => this.send({ type: "error", code: "llm_error", message }),
-    });
+    this.scheduler = new ExtractionScheduler(
+      glossary,
+      {
+        onCards: (cards) => this.send({ type: "cards", cards }),
+        onCardUpdate: (term, description, links) =>
+          this.send({ type: "card_update", term, description, links }),
+        onExtracting: () => this.send({ type: "status", state: "extracting" }),
+        // permanent: 恒久エラーで抽出を打ち切ったときだけ scheduler から真が渡ってくる(#10)
+        onError: (message, permanent) => this.send({ type: "error", code: "llm_error", message, permanent }),
+      },
+      shownTerms,
+    );
 
     const stt = createSttAdapter();
     this.stt = stt;

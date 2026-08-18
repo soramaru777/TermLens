@@ -140,8 +140,14 @@ saveSettingsBtn.addEventListener("click", () => {
   localStorage.setItem("termlens.token", tokenInput.value.trim());
   localStorage.setItem("termlens.glossary", glossaryInput.value);
   localStorage.setItem("termlens.persist", String(persistToggle.checked));
-  // OFF にした時点で保存済みのものも消す。「ONに戻すまで一切残さない」を保証するため(要件5)
-  if (!persistToggle.checked) deleteSavedSession();
+  // OFF にした時点で保存済みのものも消す。「ONに戻すまで一切残さない」を保証するため(要件5)。
+  // 復元案内(pendingRestoreSession とバナー)も一緒に戻さないと、保存をOFFにしたのに
+  // 案内からは復元できてしまう(L1)
+  if (!persistToggle.checked) {
+    deleteSavedSession();
+    pendingRestoreSession = null;
+    restoreBanner.hidden = true;
+  }
   homeError.hidden = true;
   showHome();
 });
@@ -196,6 +202,13 @@ function resetSessionState() {
 startBtn.addEventListener("click", async () => {
   homeError.hidden = true;
   startBtn.disabled = true;
+  // 復元案内が出ている状態で「開始」すると、案内に触れないまま前回の保存データが
+  // 今回の最初の保存で無警告に上書きされてしまう。事前に明示して破棄する(M4)
+  if (pendingRestoreSession) {
+    deleteSavedSession();
+    pendingRestoreSession = null;
+    restoreBanner.hidden = true;
+  }
   resetSessionState();
   captureActive = true;
   const token = getToken();
@@ -244,15 +257,25 @@ function connectWs(token, glossary) {
   // トークンは URL に載せず Sec-WebSocket-Protocol で送る(ログ・履歴への漏えい防止)
   const protocols = ["termlens.v1"];
   if (token) protocols.push("auth." + encodeURIComponent(token));
-  ws = new WebSocket(`${proto}://${location.host}/ws`, protocols);
-  ws.binaryType = "arraybuffer";
+  // sock をローカルに持ち、以後すべてのハンドラはこれを参照する(グローバル ws ではない)。
+  // 接続試行中(CONNECTING)に停止されて ws が null に差し替わった後もこのソケットの
+  // open/message/close イベントは発火しうるため、各ハンドラの先頭で
+  // 「自分がまだ現行のソケットか」を確認し、古いイベントは無視する(M1)
+  const sock = new WebSocket(`${proto}://${location.host}/ws`, protocols);
+  sock.binaryType = "arraybuffer";
+  ws = sock;
 
-  ws.addEventListener("open", () => {
+  sock.addEventListener("open", () => {
+    if (sock !== ws) return;
     setStatus("STT接続中…");
-    ws.send(JSON.stringify({ type: "start", glossary }));
+    // shownTerms: 再接続時、既に表示済みのカードの term を渡す。サーバーは WS 1本ごとに
+    // ExtractionScheduler を作り直すためデデュープ状態が空から始まり、渡さないと同じ用語の
+    // カードが再送されカードが二重化する(#8)
+    sock.send(JSON.stringify({ type: "start", glossary, shownTerms: [...cardData.keys()] }));
   });
 
-  ws.addEventListener("message", (e) => {
+  sock.addEventListener("message", (e) => {
+    if (sock !== ws) return;
     if (typeof e.data !== "string") return;
     const msg = JSON.parse(e.data);
     switch (msg.type) {
@@ -303,15 +326,17 @@ function connectWs(token, glossary) {
         else if (msg.state === "stt_closed") setStatus("STT切断");
         break;
       case "error":
-        // バッジは直後の status メッセージ(「聞き取り中」等)で上書きされて消えるため、
-        // 恒久停止のような「気づかれないと困る」エラーはカード領域に残るバナーでも伝える
         setStatus(`エラー: ${msg.message}`);
-        showErrorBanner(msg.message);
+        // permanent が真のときだけ、消えないバナーで伝える(#10)。stt_error や
+        // 連続失敗の通知(一時エラー)は復旧しうるため、ステータス表示だけに留め
+        // バナーが会議の最後まで残り続けないようにする
+        if (msg.permanent) showErrorBanner(msg.message);
         break;
     }
   });
 
-  ws.addEventListener("close", async (e) => {
+  sock.addEventListener("close", async (e) => {
+    if (sock !== ws) return;
     sendAudio = false;
     clearTimeout(stableTimer);
     // 停止処理の最中や終了後の 1006 を認証失敗と誤判定しない。
@@ -522,26 +547,6 @@ function showErrorBanner(message) {
   errorBanner.querySelector(".error-banner-text").textContent = message;
 }
 
-function addCard(card) {
-  cardData.set(card.term, { ...card });
-  const div = el("div", "card");
-  div.dataset.term = card.term;
-  const header = el("div");
-  header.append(el("span", "term", card.term), el("span", "reading", card.reading));
-  if (card.confidence === "low") header.append(el("span", "maybe", "もしかして?"));
-  div.append(header);
-  if (card.correctedFrom) div.append(el("div", "corrected", `音声: ${card.correctedFrom}`));
-  div.append(el("div", "desc", card.description));
-  // web検索対象(レア度上位)のカードのみ「確認中」を表示
-  if (card.willEnrich) div.append(el("div", "links pending", "🔎 最新情報を確認中…"));
-  // バナーがあればその直後に挿入し、バナーを常に先頭に保つ
-  cardsEl.insertBefore(div, errorBanner ? errorBanner.nextSibling : cardsEl.firstChild);
-  // 追従中なら新しいカードに切り替える。固定中は表示を動かさず件数だけ更新する
-  if (pinnedToTerm) renderCardNav();
-  else setActiveCard(card.term);
-  scheduleSessionSave();
-}
-
 // web検索による清書: 解説を最新情報ベースに差し替え、関連リンクを表示
 // http/https 以外のスキームを弾く(サーバー側 src/extract/enrich.ts の isHttpUrl と同じ検証)。
 // サーバー側で既に弾いている想定だが、上流(web検索の citation)の出力形式に検証をかけず
@@ -555,6 +560,81 @@ function isHttpUrl(url) {
   }
 }
 
+// カードのリンク一覧を linksEl に描画する共通関数。addCard(cards受信・セッション復元)と
+// updateCard(card_update)の両方から呼ぶことで、描画コードを二重に持たない(#10)。
+// 戻り値は実際に描画できた件数(スキーム不正なリンクは除く)。
+function renderCardLinks(linksEl, links) {
+  linksEl.textContent = "";
+  let shown = 0;
+  for (const link of links ?? []) {
+    // スキームが不正なリンクは要素自体を作らずスキップする(テキストとしても出さない)
+    if (!isHttpUrl(link.url)) continue;
+    const a = el("a", "link", link.title);
+    a.href = link.url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    linksEl.append(a);
+    shown++;
+  }
+  return shown;
+}
+
+function addCard(card) {
+  const existing = cardData.get(card.term);
+  if (existing) {
+    // 同じ term のカードが再送されても DOM を新規に作らない(冪等化, #8)。
+    // 再接続直後はサーバー側のデデュープ状態が空から始まるため、既出用語が再びカードとして
+    // 届きうる。清書済み(既存 links がある)ならドラフト(links: [])で
+    // description/links を上書きしない。未清書ならドラフト説明の更新は許可する。
+    if (existing.links.length === 0) {
+      existing.description = card.description;
+      existing.willEnrich = card.willEnrich;
+      const div = [...cardsEl.children].find((c) => c.dataset.term === card.term);
+      if (div) {
+        div.querySelector(".desc").textContent = card.description;
+        const linksEl = div.querySelector(".links");
+        if (card.willEnrich && !linksEl) {
+          div.append(el("div", "links pending", "🔎 最新情報を確認中…"));
+        } else if (!card.willEnrich) {
+          linksEl?.remove();
+        }
+      }
+      scheduleSessionSave();
+    }
+    return;
+  }
+
+  cardData.set(card.term, { ...card });
+  const div = el("div", "card");
+  div.dataset.term = card.term;
+  const header = el("div");
+  header.append(el("span", "term", card.term), el("span", "reading", card.reading));
+  if (card.confidence === "low") header.append(el("span", "maybe", "もしかして?"));
+  div.append(header);
+  if (card.correctedFrom) div.append(el("div", "corrected", `音声: ${card.correctedFrom}`));
+  div.append(el("div", "desc", card.description));
+  // リンクは renderCardLinks で描画する(updateCard と共通)。清書済み(links がある)なら
+  // willEnrich の真偽によらずリンクを出す。復元直後は WS が無く card_update が来ないため、
+  // ここでリンクを出さないと清書済みカードでも「確認中」のまま固まってしまう(#10)。
+  // 「確認中」は清書前(links が空)かつ willEnrich のときだけに限定する。
+  const linksEl = el("div", "links");
+  div.append(linksEl);
+  if (renderCardLinks(linksEl, card.links) === 0) {
+    if (card.willEnrich) {
+      linksEl.classList.add("pending");
+      linksEl.textContent = "🔎 最新情報を確認中…";
+    } else {
+      linksEl.remove();
+    }
+  }
+  // バナーがあればその直後に挿入し、バナーを常に先頭に保つ
+  cardsEl.insertBefore(div, errorBanner ? errorBanner.nextSibling : cardsEl.firstChild);
+  // 追従中なら新しいカードに切り替える。固定中は表示を動かさず件数だけ更新する
+  if (pinnedToTerm) renderCardNav();
+  else setActiveCard(card.term);
+  scheduleSessionSave();
+}
+
 function updateCard({ term, description, links }) {
   const stored = cardData.get(term);
   // cardData が変化するのはここなので、DOM が見つからず早期returnする場合でも保存はする
@@ -565,21 +645,13 @@ function updateCard({ term, description, links }) {
   const card = [...cardsEl.children].find((c) => c.dataset.term === term);
   if (!card) return;
   card.querySelector(".desc").textContent = description;
-  const linksEl = card.querySelector(".links");
-  linksEl.classList.remove("pending");
-  linksEl.textContent = "";
-  let shown = 0;
-  for (const link of links) {
-    // スキームが不正なリンクは要素自体を作らずスキップする(テキストとしても出さない)
-    if (!isHttpUrl(link.url)) continue;
-    const a = el("a", "link", link.title);
-    a.href = link.url;
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-    linksEl.append(a);
-    shown++;
+  let linksEl = card.querySelector(".links");
+  if (!linksEl) {
+    linksEl = el("div", "links");
+    card.append(linksEl);
   }
-  if (shown === 0) linksEl.remove();
+  linksEl.classList.remove("pending");
+  if (renderCardLinks(linksEl, links) === 0) linksEl.remove();
 }
 
 // ---- Markdown エクスポート ----
@@ -655,9 +727,12 @@ function buildTermsMarkdown() {
     out.push(`## ${escMd(card.term)}${reading}${maybe}`, "");
     if (card.correctedFrom) out.push(`> 音声認識では「${escMd(card.correctedFrom)}」と聞き取られた語です。`, "");
     if (card.description) out.push(escMd(card.description), "");
-    if (card.links?.length) {
+    // 復元経路では links が localStorage 由来になり信頼境界が一段緩いため、
+    // addCard/updateCard の描画と同じ isHttpUrl 検証をここでも通す(M5)
+    const validLinks = (card.links ?? []).filter((link) => isHttpUrl(link.url));
+    if (validLinks.length) {
       out.push("**関連リンク**", "");
-      for (const link of card.links) out.push(`- [${escMd(link.title)}](${mdUrl(link.url)})`);
+      for (const link of validLinks) out.push(`- [${escMd(link.title)}](${mdUrl(link.url)})`);
       out.push("");
     }
   }
@@ -725,7 +800,9 @@ function showExport() {
 
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // これを超えたら読み込み時に案内も出さず破棄する(要件4)
 const SESSION_SAVE_DEBOUNCE_MS = 1000; // 文字起こしは数秒に1回、カード更新も走るため毎回書くと重い(要件2)
-const SESSION_MAX_CHARS = 2 * 1024 * 1024; // 目安2MB。文字数で近似する(UTF-16なので実バイト数とは厳密には一致しない)
+// 目安1MB。文字数で近似する(UTF-16なので実バイト数とは厳密には一致しない)。
+// 多くのブラウザの localStorage 上限(5MB前後)に対して余裕を持たせる(L5)
+const SESSION_MAX_CHARS = 1 * 1024 * 1024;
 
 function deleteSavedSession() {
   try { localStorage.removeItem("termlens.session"); } catch {}
@@ -747,6 +824,8 @@ function trySaveSession() {
   // 変化しうるのはマイク/WS を保持している間(停止後の flush 待ちも含む)だけなので、
   // 専用フラグを別に持つ必要がなかった
   if (!getPersistEnabled() || !captureActive) return;
+  // 発言もカードもない空のセッションは保存しない。無意味な復元案内を出さないため(L2)
+  if (finalLines.length === 0 && cardData.size === 0) return;
   let snapshot = buildSessionSnapshot();
   let json = JSON.stringify(snapshot);
   // 大きすぎる場合は古い finalLines から捨てて収める(要件6)。cardData は用語解説の
@@ -759,7 +838,14 @@ function trySaveSession() {
   try {
     localStorage.setItem("termlens.session", json);
   } catch {
-    // 容量超過などで書き込みに失敗しても会議自体は止めない(要件6)
+    // 容量超過(QuotaExceededError 等)は finalLines を大きく削って1回だけ再試行する(L5)。
+    // それでも失敗したら諦める。会議自体は止めない(要件6)
+    try {
+      const shrunk = { ...snapshot, finalLines: snapshot.finalLines.slice(-50) };
+      localStorage.setItem("termlens.session", JSON.stringify(shrunk));
+    } catch {
+      /* 諦める */
+    }
   }
 }
 
@@ -799,22 +885,38 @@ function loadPendingSession() {
   } catch {
     return null; // 壊れたJSONは復元しようがないので無視する
   }
+  if (!session || typeof session !== "object") return null;
   if (!session.savedAt || Date.now() - session.savedAt > SESSION_MAX_AGE_MS) {
     deleteSavedSession(); // 期限切れは案内を出さずに破棄する(要件4)
+    return null;
+  }
+  // finalLines/cardData が配列でない壊れたデータは復元しようがないので破棄する(L3)。
+  // ここで弾いておけば、復元処理側で catch する例外は「配列の中身」に起因するものに絞れる
+  if (!Array.isArray(session.finalLines) || !Array.isArray(session.cardData)) {
+    deleteSavedSession();
     return null;
   }
   return session;
 }
 
 function checkPendingSession() {
+  // 保存 OFF なら復元案内を出さない。OFF 時点で保存データ自体も消しているが、
+  // 手動で termlens.persist だけ触られた場合の防御として読み込み側でも見る(L1)
+  if (!getPersistEnabled()) return;
   pendingRestoreSession = loadPendingSession();
   if (!pendingRestoreSession) return;
   const started = pendingRestoreSession.sessionStartedAt
     ? new Date(pendingRestoreSession.sessionStartedAt)
     : new Date(pendingRestoreSession.savedAt);
   // 再接続の区切り印は発言ではないので、spokenLines() と同じく数から除く
-  const spoken = (pendingRestoreSession.finalLines ?? []).filter((l) => l.type !== "reconnect").length;
-  const cardCount = (pendingRestoreSession.cardData ?? []).length;
+  const spoken = pendingRestoreSession.finalLines.filter((l) => l.type !== "reconnect").length;
+  const cardCount = pendingRestoreSession.cardData.length;
+  // 発言もカードもない空のセッションは、案内を出さず破棄する(L2)
+  if (spoken === 0 && cardCount === 0) {
+    deleteSavedSession();
+    pendingRestoreSession = null;
+    return;
+  }
   restoreInfo.textContent = `${fmtDateTime(started)} の会議・発言 ${spoken} 件・カード ${cardCount} 件`;
   restoreBanner.hidden = false;
 }
@@ -827,24 +929,39 @@ restoreBtn.addEventListener("click", () => {
   pendingRestoreSession = null;
   restoreBanner.hidden = true;
 
-  resetSessionState();
-  sessionStartedAt = session.sessionStartedAt ? new Date(session.sessionStartedAt) : new Date(session.savedAt);
-  sessionEndedAt = new Date(session.savedAt); // 会議の「終了」ではなく最後に保存できた時刻
-  finalLines.push(...(session.finalLines ?? []));
-  for (const [, card] of session.cardData ?? []) {
-    addCard(card);
-    // カードを描き直すだけでは会話中の用語がオレンジ表示にならないため、
-    // "cards" 受信時(connectWs 内)と同じくハイライトも復元する
-    addHighlightTerm(card.term, card.term);
-    addHighlightTerm(card.correctedFrom, card.term);
-    for (const form of card.surfaceForms ?? []) addHighlightTerm(form, card.term);
+  // loadPendingSession() で形の壊れたデータはある程度弾いているが、中身(card の形など)
+  // までは検証していない。復元中の例外で案内だけ消えて操作不能にならないよう、
+  // 保存データを丸ごと信頼せず try/catch で囲む(L3)
+  try {
+    resetSessionState();
+    sessionStartedAt = session.sessionStartedAt ? new Date(session.sessionStartedAt) : new Date(session.savedAt);
+    sessionEndedAt = new Date(session.savedAt); // 会議の「終了」ではなく最後に保存できた時刻
+    finalLines.push(...session.finalLines);
+    for (const [, card] of session.cardData) {
+      addCard(card);
+      // カードを描き直すだけでは会話中の用語がオレンジ表示にならないため、
+      // "cards" 受信時(connectWs 内)と同じくハイライトも復元する
+      addHighlightTerm(card.term, card.term);
+      addHighlightTerm(card.correctedFrom, card.term);
+      for (const form of card.surfaceForms ?? []) addHighlightTerm(form, card.term);
+    }
+    renderTranscript();
+    finished = true;
+    // 停止経由は finish() が finishing=true を立てるが、復元経由はここまで finish() を
+    // 通らない。将来 finish() を呼ぶ経路が増えたときの多重実行ガードを効かせるため、
+    // 復元完了時点でも立てておく(L6)
+    finishing = true;
+    stopBtn.textContent = "戻る";
+    setStatus("復元しました(録音は再開していません)");
+    showLive();
+    showExport();
+  } catch (err) {
+    console.error("[restore] failed:", err);
+    // 壊れた保存データを残しても次回また同じ例外になるだけなので破棄し、ホームに留まる
+    deleteSavedSession();
+    showHome();
+    showError("保存されていたデータが壊れていたため、復元できませんでした。");
   }
-  renderTranscript();
-  finished = true;
-  stopBtn.textContent = "戻る";
-  setStatus("復元しました(録音は再開していません)");
-  showLive();
-  showExport();
 });
 
 discardBtn.addEventListener("click", () => {
@@ -907,6 +1024,11 @@ stopBtn.addEventListener("click", async () => {
 // マイク・AudioContext・Wake Lock を解放する。セッションが終わる経路すべてで必ず通す。
 // 解放を怠るとページをリロードするまでマイクが掴まれたままになる。
 async function releaseCapture() {
+  // ws.close() は同期呼び出しなので ws を null で外す前に呼ぶ。CONNECTING 中でも
+  // 閉じられる。ここで閉じないまま ws=null にすると、接続試行中に停止した場合に
+  // ソケットが開いたまま残り、後から届く open ハンドラがステータス表示を上書きしたり
+  // 閉じたはずのソケットへの send が TypeError になったりする(M1)
+  ws?.close();
   // グローバルは await の前に外す。await のあとで代入すると、
   // その間に開始し直された新しいセッションの参照を潰してしまう
   captureActive = false;
@@ -923,6 +1045,12 @@ async function releaseCapture() {
 async function finish(statusText = "停止しました") {
   if (finishing) return;
   finishing = true;
+  // releaseCapture() が captureActive を false にすると、保留中の1秒デバウンス保存が
+  // trySaveSession() の captureActive チェックに落ちて無言で捨てられる。
+  // それより前に強制フラッシュしておく(M2)
+  clearTimeout(saveSessionTimer);
+  saveSessionTimer = null;
+  trySaveSession();
   await releaseCapture();
   // 解放が済んでから「戻る」に切り替える。先に finished を立てると、
   // ボタンの表示が「停止」のまま戻る側の分岐に入り、警告が空振りする
