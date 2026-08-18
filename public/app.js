@@ -177,7 +177,26 @@ document.addEventListener("visibilitychange", () => {
 // 認証失敗やマイク拒否ではリロードを挟まずホームに戻るため、
 // 前回のセッションの終端状態が残る。開始のたびに必ず初期化する
 // (残ると停止ボタンが「戻る」のまま新しいセッションに入り、停止できなくなる)
+// セッションの内容(文字起こし・カード・ハイライト)を空に戻す。
+// 画面遷移だけでは残るため、新しいセッションを始める前に必ず通す。
+// 残ると次の start で shownTerms に前回の用語が混ざり、新しい会議の用語が
+// デデュープで弾かれてカード化されない。DOM にも前回の残骸が並ぶ。
+function clearSessionContent() {
+  finalLines.length = 0;
+  cardData.clear();
+  highlightOwner.clear();
+  highlightRe = null;
+  activeTerm = null;
+  pinnedToTerm = false;
+  finalText.textContent = "";
+  interimText.textContent = "";
+  cardsEl.textContent = ""; // エラーバナーもここで消えるので参照を落とす
+  errorBanner = null;
+  renderCardNav();
+}
+
 function resetSessionState() {
+  clearSessionContent();
   stopping = false;
   finishing = false;
   finished = false;
@@ -187,9 +206,6 @@ function resetSessionState() {
   sessionEndedAt = null;
   exportRow.hidden = true;
   stopBtn.textContent = "停止";
-  // 前回セッションのエラーバナーが残っていれば、新しいセッション開始時に消す
-  errorBanner?.remove();
-  errorBanner = null;
   // 前回セッションの再接続待ちが万一残っていたら止める(持ち越さない)
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
@@ -957,6 +973,9 @@ restoreBtn.addEventListener("click", () => {
     showExport();
   } catch (err) {
     console.error("[restore] failed:", err);
+    // 途中まで書き込まれた内容を残すと、次のセッションの shownTerms に混ざって
+    // 新しい会議の用語がデデュープで弾かれる。必ず空に戻してからホームへ返す
+    clearSessionContent();
     // 壊れた保存データを残しても次回また同じ例外になるだけなので破棄し、ホームに留まる
     deleteSavedSession();
     showHome();
