@@ -10,7 +10,10 @@ primary_region = "nrt"
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  # "stop" だとアイドル後の初回アクセスでマシンの起動を待たされる(実測7.2秒)。
+  # "suspend" はメモリを保存して再開するため実測0.39秒。停止中の課金は
+  # stop と同じ(rootfs のみ。CPU・RAM は課金されない)ので、速度だけが変わる。
+  auto_stop_machines = "suspend"
   auto_start_machines = true
   min_machines_running = 0
 
