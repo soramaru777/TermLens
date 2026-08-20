@@ -11,3 +11,6 @@ docs/local/
 # 置き場のルール(README)だけ共有し、中身はローカルに留める。
 docs/raw/*
 !docs/raw/README.md
+
+# Claude Code の作業用 worktree。リポジトリ内に作られるが管理対象ではない
+.claude/worktrees/
