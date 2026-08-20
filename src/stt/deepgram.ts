@@ -48,6 +48,10 @@ export class DeepgramSttAdapter implements SttAdapter {
       punctuate: "true",
       smart_format: "true",
       diarize: "true",
+      // 既定値は 10ms で、わずかな間でも確定してしまい文の途中で切れる。
+      // 300ms にすると自然な文単位でまとまり、smart_format の句読点も付きやすくなる。
+      // 長くしすぎると 1 セグメントに複数話者が入り、話者判定(多数決)が鈍るため上げすぎない。
+      endpointing: "300",
     });
     // nova-3 系は keyterm(日本語対応・最大約100語)、nova-2 以前は keywords でブースト
     const useKeyterm = config.deepgramModel.startsWith("nova-3");

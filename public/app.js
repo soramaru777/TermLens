@@ -234,8 +234,17 @@ startBtn.addEventListener("click", async () => {
     // モックSTTモードでは音声不要なのでマイク取得をスキップ
     if (serverInfo?.sttProvider !== "mock") {
       // iOS Safari: getUserMedia と AudioContext 生成はユーザージェスチャ内で行う必要がある
+      // 対面の会議で、離れた席の声まで拾うための設定。
+      // エコーキャンセルとノイズ抑制はブラウザ側で「近くの1人の声」を残す方向に働き、
+      // 会議室の遠い話者を環境音として削ってしまう。文字起こしでは欠落の原因になるため切る。
+      // 自動ゲインは距離差による音量差を均すので残す。
       mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: true,
+          channelCount: 1,
+        },
       });
       // sampleRate は指定しない(iOSでは無視/失敗するため)。実測値からWorkletでダウンサンプルする
       audioContext = new AudioContext();

@@ -21,3 +21,4 @@
 2026-08-19 update — PR #15 のレビュー指摘に対応。start.shownTerms の要素型を検証しないとサーバーが落ちる問題を修正し、WS 入力の検証方針を open-issues に追記。
 2026-08-19 update — PR #15 の2巡目レビューに対応。復元失敗時にセッションの内容が残り、次の会議の shownTerms に混ざって汚染する問題を修正（clearSessionContent を resetSessionState と復元の catch から通す）。
 2026-08-19 update — TOPページの初回表示が遅い件を実測（起動中0.03秒 / stop からの起動7.2秒 / suspend からの復帰0.39秒）。auto_stop_machines を "suspend" に変更し、比較表と注意点を deployment に記録。
+2026-08-20 update — 文字起こし精度の改善。ダウンサンプリングにアンチエイリアスFIRが無く8kHz超が0dBで折り返していた件を修正（実測 -65dB以下）、endpointing=300 で文の途中の分断を抑制、対面会議向けにエコーキャンセル/ノイズ抑制を無効化。stt-pipeline に記録。
