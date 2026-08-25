@@ -1,0 +1,8 @@
+[
+  { "id": "single-speaker",       "words": [{"speaker":0},{"speaker":0},{"speaker":0}], "expect": 0 },
+  { "id": "majority-1-over-0",    "words": [{"speaker":0},{"speaker":1},{"speaker":1}], "expect": 1 },
+  { "id": "tie-keeps-first-seen", "words": [{"speaker":0},{"speaker":1}],               "expect": 0 },
+  { "id": "sparse-speaker-field", "words": [{},{"speaker":2},{}],                       "expect": 2 },
+  { "id": "no-speaker-field",     "words": [{},{}],                                     "expect": null },
+  { "id": "empty",                "words": [],                                          "expect": null }
+]

@@ -1,0 +1,112 @@
+[
+  {
+    "id": "k8s-katakana",
+    "transcript": "先週からクバネテスのポッドが頻繁に再起動していて、原因を調査しています。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["Kubernetes"],
+    "expectCorrection": { "クバネテス": "Kubernetes" },
+    "forbidTerms": ["キャバネット", "クーベルタン", "クバネテス"],
+    "allowLowConfidence": ["Pod", "ポッド", "メモリリーク", "再起動"]
+  },
+  {
+    "id": "grafana-dedup",
+    "transcript": "メモリリークの可能性が高いので、グラファナのダッシュボードでメトリクスを監視しています。",
+    "glossary": [],
+    "shownTerms": ["Kubernetes", "Pod"],
+    "expectTerms": ["Grafana"],
+    "expectCorrection": { "グラファナ": "Grafana" },
+    "forbidTerms": ["グラハム", "グラフ", "Kubernetes", "Pod"],
+    "allowLowConfidence": ["メモリリーク", "メトリクス", "ダッシュボード", "オブザーバビリティ"]
+  },
+  {
+    "id": "rag-acronym",
+    "transcript": "新機能のラグの検索精度がまだ課題で、エンベディングのモデルを変えるか検討しています。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["RAG"],
+    "expectCorrection": { "ラグ": "RAG" },
+    "forbidTerms": ["ラグ", "Lag", "遅延"],
+    "allowLowConfidence": ["エンベディング", "Embedding", "埋め込み", "ベクトル検索"]
+  },
+  {
+    "id": "vector-db-vendors",
+    "transcript": "ベクトルデータベースはピネコーネの想定でしたが、コスト面でクドラントも比較しています。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["Pinecone", "Qdrant"],
+    "expectCorrection": { "ピネコーネ": "Pinecone", "クドラント": "Qdrant" },
+    "forbidTerms": ["ピネコーン", "クアドラント", "Quadrant", "象限"],
+    "allowLowConfidence": ["ベクトルデータベース", "ベクトルDB"]
+  },
+  {
+    "id": "oauth-pkce",
+    "transcript": "認証まわりはオーオースの認可コードフローにピーケーシーイーを組み合わせる方針です。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["OAuth", "PKCE"],
+    "expectCorrection": { "オーオース": "OAuth", "ピーケーシーイー": "PKCE" },
+    "forbidTerms": ["オース", "オーオーエス", "ピーケーシー"],
+    "allowLowConfidence": ["認可コードフロー", "OAuth 2.0", "認可コード"]
+  },
+  {
+    "id": "nda-business",
+    "transcript": "契約面では、先方とエヌディーエーを締結してから詳細仕様を共有する流れになります。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["NDA"],
+    "expectCorrection": { "エヌディーエー": "NDA" },
+    "forbidTerms": ["エヌディーエー", "NBA", "エヌディー"],
+    "allowLowConfidence": ["秘密保持契約", "詳細仕様"]
+  },
+  {
+    "id": "jira-tool",
+    "transcript": "では次回までに、それぞれのタスクをジラに起票しておいてください。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["Jira"],
+    "expectCorrection": { "ジラ": "Jira" },
+    "forbidTerms": ["ジラフ", "Zilla", "ジラ"],
+    "allowLowConfidence": ["起票", "チケット"]
+  },
+  {
+    "id": "sre-glossary-boost",
+    "transcript": "エスアールイーチームの当番表を更新しました。オンコールの担当は来週から交代です。",
+    "glossary": ["SRE", "オンコール"],
+    "shownTerms": [],
+    "expectTerms": ["SRE"],
+    "expectCorrection": { "エスアールイー": "SRE" },
+    "forbidTerms": ["エスアールイー", "エスエルアイ", "SLI"],
+    "allowLowConfidence": ["オンコール", "当番表", "サイトリライアビリティエンジニアリング"]
+  },
+  {
+    "id": "ci-pipeline-mixed",
+    "transcript": "シーアイのパイプラインが不安定で、ビルドが時々こけます。あと来週の全社会議の資料もお願いします。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["CI"],
+    "expectCorrection": { "シーアイ": "CI" },
+    "forbidTerms": ["全社会議", "資料", "来週", "シーアイ"],
+    "allowLowConfidence": ["CI/CD", "パイプライン", "ビルド", "継続的インテグレーション"]
+  },
+  {
+    "id": "throttling-oncall",
+    "transcript": "監視のアラートはスロットリングを入れて、オンコール担当の負荷を下げたいですね。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["スロットリング"],
+    "expectCorrection": {},
+    "forbidTerms": ["スロットル", "負荷", "担当"],
+    "allowLowConfidence": ["オンコール", "アラート", "Throttling"]
+  },
+  {
+    "id": "plain-japanese-only",
+    "transcript": "では次回の打ち合わせは来週の水曜日の午後三時から、同じ会議室で行います。よろしくお願いします。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": [],
+    "expectCorrection": {},
+    "forbidTerms": ["会議室", "打ち合わせ", "水曜日", "午後三時", "次回"],
+    "allowLowConfidence": []
+  }
+]

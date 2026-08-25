@@ -11,5 +11,10 @@
     "forceConsistentCasingInFileNames": true,
     "sourceMap": true
   },
+  // 本番ビルドから評価ハーネスを外す。src/eval/ は開発時に tsx で直接実行するもので、
+  // 含めると dist/eval/*.js が出力され、Dockerfile の `COPY --from=build /app/dist ./dist`
+  // でそのまま本番イメージに入ってしまう。rootDir は src のままなので dist/server.js の
+  // 出力構造は変わらない。型チェックは tsconfig.test.json 側（exclude を空に戻す）で行う。
+  "exclude": ["src/eval"],
   "include": ["src/**/*"]
 }

@@ -14,3 +14,7 @@ docs/raw/*
 
 # Claude Code の作業用 worktree。リポジトリ内に作られるが管理対象ではない
 .claude/worktrees/
+
+# LLM 評価レポート。実行のたびに内容が変わる生成物なので追跡しない
+# (`npm run eval:llm > eval-report.json` をリポジトリ直下で回したとき用)
+/eval-report*.json

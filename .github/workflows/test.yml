@@ -1,0 +1,43 @@
+name: Test
+
+# 決定的テスト（案A）だけを常時回す。
+# LLM を呼ぶ評価（案B / tests/llm-eval.test.ts）は RUN_LLM_EVAL=1 のときだけ走るオプトインで、
+# このワークフローでは **意図的に設定しない**。CI に実 API 課金と非決定性を持ち込まないため。
+on:
+  # push は develop / main だけに絞る。feature ブランチは pull_request 側で回るので、
+  # 両方を無条件にすると同じコミットを2回テストすることになる。
+  push:
+    branches: [develop, main]
+  pull_request:
+  workflow_dispatch:
+
+# 既定を最小権限にする。テストはチェックアウトしか必要としない。
+permissions:
+  contents: read
+
+# 同じ ref への push 連打では最後のものだけ残す。
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: テストと型チェック
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # Dockerfile の実行環境(node:22-slim)に合わせる
+          node-version: "22"
+          cache: npm
+
+      - name: 依存関係のインストール
+        run: npm ci
+
+      - name: テスト
+        run: npm test
+
+      - name: 型チェック
+        run: npm run typecheck

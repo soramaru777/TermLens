@@ -7,7 +7,7 @@ sources:
   - README.md
   - docs/local/status-2026-08-13.md
   - docs/raw/session-2026-08-13-fly-deploy.md
-related: [[termlens-architecture]], [[termlens-stt-pipeline]], [[termlens-open-issues]]
+related: [[termlens-architecture]], [[termlens-stt-pipeline]], [[termlens-open-issues]], [[termlens-testing]]
 confidence: high
 updated: 2026-08-13
 ---
