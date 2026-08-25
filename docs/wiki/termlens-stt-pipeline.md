@@ -7,9 +7,9 @@ sources:
   - README.md
   - docs/local/status-2026-08-13.md
   - docs/raw/session-2026-08-13-fly-deploy.md
-related: [[termlens-architecture]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-deployment]]
+related: [[termlens-architecture]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-deployment]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-13
+updated: 2026-08-25
 ---
 
 # TermLens STT パイプライン
@@ -32,6 +32,27 @@ updated: 2026-08-13
 > 4kHz まで 0.0dB・6kHz で -0.8dB、折り返しは 9kHz で -65dB、12kHz 以上は検出限界以下。
 > 係数は端末ごとに入力レートが違うため実行時に設計する。ブロック境界で FIR が途切れると
 > 周期ノイズになるので、直前ブロックの末尾を持ち越している。
+
+> 2026-08-25 訂正・追記: 係数設計（`designLowpass`）を `public/lowpass.js` に切り出し、
+> `tests/lowpass.test.ts` が DFT で振幅応答を毎回検証するようにした（[[termlens-testing]]）。
+> **その実測で、阻止域の最悪値は 48kHz 入力で -64.6dB（帯域端の 9kHz）** と分かった。
+> 上の「9kHz で -65dB」はわずかに楽観的だったので訂正する。44.1kHz 入力は入力ナイキストが
+> 低いぶん阻止域が 9.8kHz 付近まで押し下がり **-75.3dB** と 10dB 以上の余裕がある。
+> 実用上の差は無いが、テストの閾値は -64.0dB を採用している。上の記述と
+> `audio-processor.js` のコメントは実測値に書き換え済み（コメントは定数と一緒に
+> `lowpass.js` へ移動した）。
+>
+> **96kHz 入力ではローパスの阻止域が -21.9dB まで劣化する（実測、2026-08-25）。**
+> 通過域も -2.46dB まで落ちる。63タップ固定で遮断周波数だけ実行時に決める設計のため、
+> 入力レートが上がるほど遷移域が相対的に広がるのが原因。48kHz / 44.1kHz では問題ないが、
+> 96kHz でマイクが開く端末では折り返し抑圧が実質2桁ぶん弱い。既存挙動として記録するに留め、
+> テストは追加していない（Issue #18 の範囲外）。
+>
+> `lowpass.js` は AudioWorklet から static import されるため、**副作用（`registerProcessor` など
+> worklet 固有の API）を置いてはいけない**。Node のテストから読めなくなる。
+> 設計パラメータ（`FIR_TAPS` / `CUTOFF_MARGIN` / `TARGET_SAMPLE_RATE`）も `lowpass.js` が
+> 唯一の定義箇所で、`audio-processor.js` / `app.js` / テストはすべてそこから import する。
+> **未検証: AudioWorklet 内の static import はブラウザ差があり、iPad Safari での実機確認は未実施。**
 
 ## Deepgram の設定
 

@@ -6,31 +6,11 @@
 // 8〜16kHz に強いエネルギーを持つため、それが母音や有声音にノイズとして重なり、
 // 音声認識が最も頼る手がかりを壊してしまう。
 
-const CHUNK_SAMPLES = 4000;
-// タップ数と遮断周波数。63タップで阻止域は約 -65dB 以下、通過域は 6kHz でも -0.7dB に収まる。
-// (31タップだと 9kHz で -21dB しか取れず、95タップに増やしても実用上の差は小さい)
-const FIR_TAPS = 63;
-const CUTOFF_MARGIN = 0.875; // 目標ナイキスト(8kHz)の 87.5% = 7kHz を遮断周波数にする
+// 設計パラメータと designLowpass は、Node のテストからも同じ値を検証できるよう
+// lowpass.js に集約している(ここで別定義すると drift してもテストが気づけない)。
+import { CUTOFF_MARGIN, FIR_TAPS, designLowpass } from "./lowpass.js";
 
-/** sinc + Blackman 窓でローパス FIR の係数を作る(端末ごとに入力レートが違うため実行時に設計する) */
-function designLowpass(numTaps, cutoffHz, sampleRate) {
-  const fc = cutoffHz / sampleRate;
-  const mid = (numTaps - 1) / 2;
-  const h = new Float32Array(numTaps);
-  let sum = 0;
-  for (let i = 0; i < numTaps; i++) {
-    const n = i - mid;
-    const sinc = n === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * n) / (Math.PI * n);
-    const window =
-      0.42 -
-      0.5 * Math.cos((2 * Math.PI * i) / (numTaps - 1)) +
-      0.08 * Math.cos((4 * Math.PI * i) / (numTaps - 1));
-    h[i] = sinc * window;
-    sum += h[i];
-  }
-  for (let i = 0; i < numTaps; i++) h[i] /= sum; // 直流ゲインを1に正規化(音量を変えない)
-  return h;
-}
+const CHUNK_SAMPLES = 4000;
 
 class Pcm16Downsampler extends AudioWorkletProcessor {
   constructor(options) {

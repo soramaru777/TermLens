@@ -4,8 +4,12 @@ import { config } from "../config.js";
 
 const KEEPALIVE_INTERVAL_MS = 5000;
 
-/** セグメント内の単語の多数決で話者番号を決める */
-function dominantSpeaker(words?: Array<{ speaker?: number }>): number | undefined {
+/**
+ * セグメント内の単語の多数決で話者番号を決める。
+ * 同数の場合は先に出現した話者が残る（`count > bestCount` のため）。
+ * export しているのは tests/dominant-speaker.test.ts から検証するため。
+ */
+export function dominantSpeaker(words?: Array<{ speaker?: number }>): number | undefined {
   if (!words?.length) return undefined;
   const counts = new Map<number, number>();
   for (const w of words) {

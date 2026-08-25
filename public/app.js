@@ -1,6 +1,10 @@
 // TermLens クライアント。
 // サーバーとのWSプロトコル: バイナリ = 16kHz mono PCM16 音声、テキスト = JSON (src/protocol.ts 参照)
 
+// 目標サンプルレートは Worklet 側のローパス設計と揃っている必要があるため、
+// 定義元(lowpass.js)から取る。ここで数値をベタ書きすると片方だけ変わりうる。
+import { TARGET_SAMPLE_RATE } from "./lowpass.js";
+
 const $ = (id) => document.getElementById(id);
 
 const home = $("home");
@@ -252,7 +256,10 @@ startBtn.addEventListener("click", async () => {
       await audioContext.audioWorklet.addModule("/audio-processor.js");
 
       workletNode = new AudioWorkletNode(audioContext, "pcm16-downsampler", {
-        processorOptions: { inputSampleRate: audioContext.sampleRate, targetSampleRate: 16000 },
+        processorOptions: {
+          inputSampleRate: audioContext.sampleRate,
+          targetSampleRate: TARGET_SAMPLE_RATE,
+        },
       });
       workletNode.port.onmessage = (e) => {
         if (sendAudio && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount < 1_000_000) {

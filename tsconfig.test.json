@@ -1,0 +1,22 @@
+{
+  // 型チェック専用の設定。tsconfig.json は本番ビルド(dist/server.js)のためのもので、
+  // include に tests/ を足すと rootDir がリポジトリ直下に繰り上がり、出力が
+  // dist/src/server.js にずれて `npm start` が壊れる。だから別ファイルに分ける。
+  //
+  // テストの実行自体は tsx --test（型チェックを伴わない）で行い、型は `npm run typecheck`
+  // でまとめて見る。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // 出力しないので rootDir に意味はないが、tests/ と public/ を含む以上
+    // src 固定のままだと "is not under rootDir" エラーになる。
+    "rootDir": ".",
+    // tests/lowpass.test.ts が public/lowpass.js（ビルドレスな素の JS）を import するため。
+    // checkJs は付けない（public/ の JS を型チェックの対象にはしない）。
+    "allowJs": true
+  },
+  // tsconfig.json は本番イメージに評価ハーネスを入れないよう src/eval を exclude している。
+  // exclude はマージされず継承されるので、型チェック側では空に戻して src/eval も見る。
+  "exclude": [],
+  "include": ["src/**/*", "tests/**/*"]
+}

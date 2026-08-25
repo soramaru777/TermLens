@@ -77,6 +77,25 @@ npm run dev            # http://localhost:8080
 | `AUTH_TOKEN` | 公開時 | 共有アクセストークン。未設定なら認証なし(ローカル開発用) |
 | `PORT` | — | 既定 8080 |
 
+### テスト
+
+```sh
+npm test          # 決定的テストのみ。LLM は呼ばず数百msで終わる(CIが常時回す)
+npm run typecheck # tsc --noEmit -p tsconfig.test.json
+npm run eval:llm  # 用語抽出の精度をLLMで評価する(実API課金あり・オプトイン)
+```
+
+用語抽出の精度評価は既定では実行されません。`npm test` の中で回すには `RUN_LLM_EVAL=1` を
+指定します。指標と評価ケースの詳細は `docs/wiki/termlens-testing.md` を参照してください。
+
+> `tsconfig.json` に `tests/` を足さないでください。`rootDir` が繰り上がって出力が
+> `dist/src/server.js` にずれ、`npm start` と Dockerfile が壊れます。型チェックは
+> 専用の `tsconfig.test.json` で行います。
+>
+> `tsconfig.json` の `exclude` にある `src/eval` も外さないでください。外すと
+> `dist/eval/` が生成され、評価ハーネスが本番イメージに同梱されます。`src/eval` の
+> 型チェックは `tsconfig.test.json`（`"exclude": []`）が担当します。
+
 ### 開発のヒント
 
 - `STT_PROVIDER=mock` にすると、誤認識入りのダミー会議(3話者)が自動再生され、文字起こし→カード→web検索清書→ハイライトまで全パイプラインをキーなし・マイクなしで確認できます

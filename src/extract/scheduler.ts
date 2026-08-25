@@ -9,6 +9,7 @@ import {
 import type { TermCard, TermLink } from "../protocol.js";
 import { createExtractor } from "./extractor.js";
 import { enrichTerm } from "./enrich.js";
+import { normalizeTerm } from "./normalize.js";
 
 const MIN_CHARS = 120;
 const MAX_WAIT_MS = 10_000;
@@ -17,10 +18,6 @@ const SHOWN_TERMS_LIMIT = 50;
 const MAX_CONSECUTIVE_FAILURES = 3;
 // 未処理バッファの上限。会議は流れ続けるので、古い未処理チャンクを保持する価値は低い。
 const MAX_BUFFER_CHARS = 2_000;
-
-function normalizeTerm(term: string): string {
-  return term.normalize("NFKC").toLowerCase().replace(/\s+/g, "");
-}
 
 /** SDK 自身が再試行するステータス。分類を SDK の方針と一致させる。 */
 const SDK_RETRYABLE_STATUSES = new Set([408, 409, 429]);
@@ -32,7 +29,7 @@ const SDK_RETRYABLE_STATUSES = new Set([408, 409, 429]);
  * 後者は入金するまで永久に失敗する。ステータスだけで判定すると残高切れを
  * 再試行し続け、バッファが肥大する(#3 と同じ壊れ方)。区別は code に頼る。
  */
-function isQuotaExhausted(err: APIError): boolean {
+export function isQuotaExhausted(err: APIError): boolean {
   const code = (err as { code?: unknown }).code;
   if (code === "insufficient_quota" || code === "billing_hard_limit_reached") return true;
   return /insufficient[_ ]quota|no credits remaining|billing/i.test(err.message ?? "");
@@ -47,7 +44,7 @@ function isQuotaExhausted(err: APIError): boolean {
  * 5xx・408/409・接続エラーは一時的なものとして再試行に回す。
  * 429 は原則一時扱いだが、残高切れだけは恒久として扱う。
  */
-function isPermanent(err: unknown): boolean {
+export function isPermanent(err: unknown): boolean {
   if (!(err instanceof APIError)) return false;
   const status = err.status;
   // APIConnectionError などは status が undefined。判別できないものは再試行に倒す。
@@ -57,7 +54,7 @@ function isPermanent(err: unknown): boolean {
 }
 
 /** 開発者向けの生メッセージを利用者向けの文言に変換する */
-function toUserMessage(err: unknown): string {
+export function toUserMessage(err: unknown): string {
   if (err instanceof AuthenticationError) {
     return "APIキーが無効です。サーバーの設定を確認してください。";
   }

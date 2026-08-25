@@ -8,6 +8,9 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
+    "test": "tsx --test --import ./tests/helpers/openai-env.ts \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "eval:llm": "tsx src/eval/run.ts",
     "gen-icons": "node scripts/gen-icons.mjs"
   },
   "dependencies": {

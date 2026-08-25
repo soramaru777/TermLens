@@ -6,9 +6,9 @@ scope: shared
 sources:
   - docs/local/status-2026-08-13.md
   - docs/raw/session-2026-08-13-fly-deploy.md
-related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]]
+related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-19
+updated: 2026-08-25
 ---
 
 # TermLens の課題と次の優先順位
@@ -35,6 +35,24 @@ updated: 2026-08-19
 1. **話者分離の実効精度（複数話者）** — iPad 実機で話者チップ（話者A）の表示までは確認したが、
    **話者は 1 人のみで分離精度は未検証**。合成音声では全発言が話者0に落ちるため実声が必要
    （[[termlens-stt-pipeline]]）
+
+> 2026-08-25 追記: **テスト基盤（Issue #18）を入れたが、上記1は解決していない。**
+> 何が測れるようになり、何が依然として測れないかを [[termlens-testing]] に整理した。要約:
+>
+> - **測れるようになった** — `dominantSpeaker()` の多数決ロジック（同数なら先に出現した話者が
+>   勝つ、`speaker` 欠落は `undefined`）、`normalizeTerm()` の表記ゆれ吸収、エラー分類
+>   （恒久／一時）と利用者向け文言、`stripInlineCitations()` の除去範囲、ローパス FIR の
+>   振幅応答（通過域・阻止域・直流ゲイン・線形位相）。ここは CI が毎回回す
+> - **測れるようになった（オプトイン）** — 用語抽出そのものの精度。合成11ケースで
+>   Recall / 正しい補正率 / 誤補正率 / unresolved 率 / カード Precision を出す。
+>   `RUN_LLM_EVAL=1` のときだけ動く（実 API 課金と非決定性を CI に持ち込まないため）
+> - **依然として測れない① CER / WER** — 文字誤り率・単語誤り率を出すには正解トランスクリプト
+>   付きの実音声が要る。そういう資産が無いので、文字起こしの品質は今も定量化できていない
+> - **依然として測れない② Deepgram 自身の話者クラスタリング精度** — テストが押さえているのは
+>   「単語配列 → 話者番号」の多数決だけで、各単語に `speaker` を付けているのは Deepgram。
+>   複数話者の実声でしか検証できない。**未検証1はここに残る**
+> - **依然として測れない③ AudioWorklet の実機挙動** — FIR の係数は検証できるが、
+>   worklet が実際に動くか、`lowpass.js` の static import が iPad Safari で通るかは実機のみ
 
 > 2026-08-13 解決: **Docker ビルド**。Fly のリモートビルド（`fly deploy --remote-only`）で成功し、colima 不要になった。デプロイ完了。
 
