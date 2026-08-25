@@ -63,6 +63,8 @@ import するために要る。
 | ファイル | 対象 | 固定していること |
 |---|---|---|
 | `dominant-speaker.test.ts` | `dominantSpeaker()` | 多数決、**同数なら先に出現した話者が勝つ**、`speaker` 欠落・空配列は `undefined` |
+| `transcript-words.test.ts` | `toTranscriptWords()`（`src/stt/deepgram.ts`） | `punctuated_word` → `punctuatedWord` の変換、欠落フィールドが `undefined` のまま通ること、空配列・undefined は `undefined`、**words を保持しても `dominantSpeaker()` の結果が変わらないこと** |
+| `mock-words.test.ts` | `MOCK_SCRIPT` / `buildMockWords()` / `sliceMockWords()` / `MockSttAdapter` | 手書き word 分割の不変条件 `words.map(w => w.punctuated ?? w.word).join("") === text`、句読点を独立 word にしないこと、`start` が**スクリプト一周を通して**単調増加すること、誤認識語だけ低 confidence（`term-cases.json` の `expectCorrection` と**集合一致**）、interim で境界に跨る word を出さず空 transcript も送らないこと、スクリプトを一周すること（所要時間は `MOCK_SCRIPT.length` から算出） |
 | `normalize-term.test.ts` | `normalizeTerm()`（`src/extract/normalize.ts`） | NFKC・小文字化・空白除去で表記ゆれが同一キーに畳まれる／別語は衝突しない |
 | `error-classify.test.ts` | `isPermanent()` / `isQuotaExhausted()` / `toUserMessage()` | 400/401/403/404/422/429(quota) は恒久、408/409/429(rate)/5xx/接続エラーは一時。利用者向け文言 |
 | `strip-citations.test.ts` | `stripInlineCitations()` | 除去する記法と、触ってはいけない日本語の記号 |
@@ -75,6 +77,13 @@ import するために要る。
 `tests/fixtures/diarize-words.json` は **`speaker` フィールドしか持たない**。話者判定の検証に
 語句は不要なので、実会議の断片が混ざる経路をそもそも作らない。テスト自身がこの制約を
 検証している（`speaker` 以外のキーがあれば失敗する）。
+
+`tests/fixtures/deepgram-words.json`（Issue #19 で追加）は word の全フィールドを持つが、
+**`word` も `punctuated_word` もすべて `w1` / `w2.` … のダミー文字列**で、これもテストが
+形式を検証している。加えて**許可キーのホワイトリスト**（`word` / `punctuated_word` / `start` /
+`end` / `confidence` / `speaker`）を検査し、`transcript` のような余計なキーが混ざれば失敗する。
+`diarize-words.json` にフィールドを足さず別ファイルにしたのは、上の「`speaker` 以外のキーが
+無い」という検査を緩めないため。期待値のキー名は両方とも `expect` に揃えてある。
 
 ### OpenAI クライアントの読み込み対策
 

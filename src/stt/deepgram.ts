@@ -1,8 +1,24 @@
 import WebSocket from "ws";
-import type { SttAdapter, TranscriptEvent } from "./types.js";
+import type { SttAdapter, TranscriptEvent, TranscriptWord } from "./types.js";
 import { config } from "../config.js";
 
 const KEEPALIVE_INTERVAL_MS = 5000;
+
+/**
+ * Deepgram の `channel.alternatives[0].words[]` の要素。
+ * JSON がスネークケースなので、ここだけ Deepgram の表記に合わせる
+ * （キャメルケースへの変換は `toTranscriptWords()` で行う）。
+ * `punctuated_word` は smart_format 依存、`speaker` は diarize 依存で、
+ * どちらも無効時は来ないため optional。
+ */
+export interface DeepgramWord {
+  word: string;
+  punctuated_word?: string;
+  start: number;
+  end: number;
+  confidence: number;
+  speaker?: number;
+}
 
 /**
  * セグメント内の単語の多数決で話者番号を決める。
@@ -26,6 +42,28 @@ export function dominantSpeaker(words?: Array<{ speaker?: number }>): number | u
     }
   }
   return best;
+}
+
+/**
+ * Deepgram の words を `TranscriptWord[]` に変換する。
+ * `punctuated_word` → `punctuatedWord` のキャメルケース化以外は素通し。
+ * `punctuated_word` / `speaker` は無効時に来ないので undefined のまま通す。
+ *
+ * **空配列ではなく undefined を返す。** 「words が来なかった」と「word が0個だった」を
+ * 型の上で区別する必要はなく、undefined に寄せたほうが後続の `if (!e.words)` が素直に書ける。
+ *
+ * export しているのは tests/transcript-words.test.ts から検証するため。
+ */
+export function toTranscriptWords(words?: DeepgramWord[]): TranscriptWord[] | undefined {
+  if (!words?.length) return undefined;
+  return words.map((w) => ({
+    word: w.word,
+    punctuatedWord: w.punctuated_word,
+    start: w.start,
+    end: w.end,
+    confidence: w.confidence,
+    speaker: w.speaker,
+  }));
 }
 
 /**
@@ -93,6 +131,7 @@ export class DeepgramSttAdapter implements SttAdapter {
                 text,
                 isFinal: msg.is_final === true,
                 speaker: dominantSpeaker(alt?.words),
+                words: toTranscriptWords(alt?.words),
               });
             }
           }
