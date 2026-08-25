@@ -8,7 +8,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-25
+updated: 2026-08-26
 ---
 
 # TermLens の課題と次の優先順位
@@ -39,8 +39,8 @@ updated: 2026-08-25
 > 2026-08-25 追記: **テスト基盤（Issue #18）を入れたが、上記1は解決していない。**
 > 何が測れるようになり、何が依然として測れないかを [[termlens-testing]] に整理した。要約:
 >
-> - **測れるようになった** — `dominantSpeaker()` の多数決ロジック（同数なら先に出現した話者が
->   勝つ、`speaker` 欠落は `undefined`）、`normalizeTerm()` の表記ゆれ吸収、エラー分類
+> - **測れるようになった** — 話者分割ロジック（Issue #20 以降は `splitBySpeaker()`。
+>   それまでは `dominantSpeaker()` の多数決）、`normalizeTerm()` の表記ゆれ吸収、エラー分類
 >   （恒久／一時）と利用者向け文言、`stripInlineCitations()` の除去範囲、ローパス FIR の
 >   振幅応答（通過域・阻止域・直流ゲイン・線形位相）。ここは CI が毎回回す
 > - **測れるようになった（オプトイン）** — 用語抽出そのものの精度。合成11ケースで
@@ -49,10 +49,17 @@ updated: 2026-08-25
 > - **依然として測れない① CER / WER** — 文字誤り率・単語誤り率を出すには正解トランスクリプト
 >   付きの実音声が要る。そういう資産が無いので、文字起こしの品質は今も定量化できていない
 > - **依然として測れない② Deepgram 自身の話者クラスタリング精度** — テストが押さえているのは
->   「単語配列 → 話者番号」の多数決だけで、各単語に `speaker` を付けているのは Deepgram。
+>   「単語配列 → 話者番号」の変換だけで、各単語に `speaker` を付けているのは Deepgram。
 >   複数話者の実声でしか検証できない。**未検証1はここに残る**
 > - **依然として測れない③ AudioWorklet の実機挙動** — FIR の係数は検証できるが、
 >   worklet が実際に動くか、`lowpass.js` の static import が iPad Safari で通るかは実機のみ
+
+> 2026-08-26 追記: **Issue #20 で話者分割を多数決から word 単位に変えたが、未検証1はさらに
+> 重くなった。** 多数決は Deepgram の `speaker` の揺れを吸収していて、それが精度の低さを
+> 見えにくくしていた。閾値を入れずに素直に分割した今、**揺れは細切れの発話としてそのまま
+> 画面に出る**（`[0,1,0,1]` なら 4 発話）。どの程度細切れになるかは複数話者の実声でしか
+> 測れないため、実機確認（Pixel 9a）と評価基盤での話者誤分類率の比較が必要な状態のまま。
+> 閾値を入れるかどうかはその測定結果を見てから判断する（[[termlens-stt-pipeline]]）。
 
 > 2026-08-13 解決: **Docker ビルド**。Fly のリモートビルド（`fly deploy --remote-only`）で成功し、colima 不要になった。デプロイ完了。
 

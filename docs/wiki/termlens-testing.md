@@ -11,7 +11,7 @@ sources:
   - .github/workflows/test.yml
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-architecture]]
 confidence: high
-updated: 2026-08-25
+updated: 2026-08-26
 ---
 
 # TermLens のテストと評価
@@ -21,7 +21,7 @@ updated: 2026-08-25
 
 | 層 | 対象 | 実行 | 決定的か |
 |---|---|---|---|
-| 決定的テスト | 純関数（正規化・エラー分類・引用除去・話者多数決・FIR 設計） | `npm test` / CI 常時 | はい |
+| 決定的テスト | 純関数（正規化・エラー分類・引用除去・話者分割・FIR 設計） | `npm test` / CI 常時 | はい |
 | LLM 評価 | 用語抽出そのものの精度 | `RUN_LLM_EVAL=1 npm test` / `npm run eval:llm` | いいえ（3回平均） |
 
 ## コマンド
@@ -62,8 +62,9 @@ import するために要る。
 
 | ファイル | 対象 | 固定していること |
 |---|---|---|
-| `dominant-speaker.test.ts` | `dominantSpeaker()` | 多数決、**同数なら先に出現した話者が勝つ**、`speaker` 欠落・空配列は `undefined` |
-| `transcript-words.test.ts` | `toTranscriptWords()`（`src/stt/deepgram.ts`） | `punctuated_word` → `punctuatedWord` の変換、欠落フィールドが `undefined` のまま通ること、空配列・undefined は `undefined`、**words を保持しても `dominantSpeaker()` の結果が変わらないこと** |
+| `split-by-speaker.test.ts` | `splitBySpeaker()` / `buildFinalEvents()`（`src/stt/split.ts`） | 話者の切り替わりで分割されること、**1語の相槌も独立して残ること**（閾値を入れていない担保）、`speaker` 不明の word が境界を作らず吸収されること、word を落とさず順序も変えないこと、**単一話者では `transcript` が1文字も変わらず素通しされること**、分割時の text が `transcript` からの**切り出し**であること（語間の空白が落ちないこと）、各イベントに自分のセグメントの `words` だけが載ること、空の text を送らないこと |
+| `transcript-events.test.ts` | `buildTranscriptEvents()`（`src/stt/deepgram.ts`） | **interim は分割せず `speaker` が `undefined`** であること、`text` が空なら何も返さないこと、全語 speaker 不明でも1件のままであること |
+| `transcript-words.test.ts` | `toTranscriptWords()`（`src/stt/deepgram.ts`） | `punctuated_word` → `punctuatedWord` の変換、欠落フィールドが `undefined` のまま通ること、空配列・undefined は `undefined` |
 | `mock-words.test.ts` | `MOCK_SCRIPT` / `buildMockWords()` / `sliceMockWords()` / `MockSttAdapter` | 手書き word 分割の不変条件 `words.map(w => w.punctuated ?? w.word).join("") === text`、句読点を独立 word にしないこと、`start` が**スクリプト一周を通して**単調増加すること、誤認識語だけ低 confidence（`term-cases.json` の `expectCorrection` と**集合一致**）、interim で境界に跨る word を出さず空 transcript も送らないこと、スクリプトを一周すること（所要時間は `MOCK_SCRIPT.length` から算出） |
 | `normalize-term.test.ts` | `normalizeTerm()`（`src/extract/normalize.ts`） | NFKC・小文字化・空白除去で表記ゆれが同一キーに畳まれる／別語は衝突しない |
 | `error-classify.test.ts` | `isPermanent()` / `isQuotaExhausted()` / `toUserMessage()` | 400/401/403/404/422/429(quota) は恒久、408/409/429(rate)/5xx/接続エラーは一時。利用者向け文言 |
@@ -74,16 +75,28 @@ import するために要る。
 
 ### fixture に会話内容を入れない
 
-`tests/fixtures/diarize-words.json` は **`speaker` フィールドしか持たない**。話者判定の検証に
-語句は不要なので、実会議の断片が混ざる経路をそもそも作らない。テスト自身がこの制約を
-検証している（`speaker` 以外のキーがあれば失敗する）。
-
 `tests/fixtures/deepgram-words.json`（Issue #19 で追加）は word の全フィールドを持つが、
-**`word` も `punctuated_word` もすべて `w1` / `w2.` … のダミー文字列**で、これもテストが
-形式を検証している。加えて**許可キーのホワイトリスト**（`word` / `punctuated_word` / `start` /
+**`word` も `punctuated_word` もすべて `w1` / `w2.` … のダミー文字列**で、テストが形式を
+検証している。加えて**許可キーのホワイトリスト**（`word` / `punctuated_word` / `start` /
 `end` / `confidence` / `speaker`）を検査し、`transcript` のような余計なキーが混ざれば失敗する。
-`diarize-words.json` にフィールドを足さず別ファイルにしたのは、上の「`speaker` 以外のキーが
-無い」という検査を緩めないため。期待値のキー名は両方とも `expect` に揃えてある。
+
+`tests/fixtures/speaker-segments.json`（Issue #20 で追加）は **speaker 番号と id しか持たない**。
+話者分割の検証に語句は不要なので、実会議の断片が混ざる経路をそもそも作らない。
+
+- `id` は**ケバブケース ASCII に限定**する。ケースの意図（日本語の説明）は fixture ではなく
+  テストファイル側の定数に置く。**fixture に自由記述の欄を作らない** — 匿名化検査を当てられない
+  穴になり、実会議の語をそこに書けてしまうため
+- ホワイトリストは**入れ子にも当てる**。`expect` の要素は `speaker` / `count` だけを許す
+- `speakers` / `expect` の数値は整数か `null` であることを検査する（文字列が入り得ない）
+
+> **fixture のケースは集合一致で固定する。** `for (const c of cases) test(...)` だけだと、
+> fixture からケースを消してもテストが静かに減るだけで通る。`speaker-segments.json` は
+> テスト側に期待 id の一覧を持ち、集合が一致しなければ失敗する。
+> `MOCK_MISHEARD_WORDS`（[[termlens-stt-pipeline]]）で同じ片方向 drift を踏んだ教訓。
+
+> 2026-08-26: Issue #20 で `diarize-words.json` を削除した（`dominantSpeaker()` の廃止に伴い、
+> それを検証していた `dominant-speaker.test.ts` ごと不要になったため）。**期待値のキー名を
+> `expect` に揃える**という規約は残っている fixture でも継続している。
 
 ### OpenAI クライアントの読み込み対策
 
@@ -215,7 +228,8 @@ push は develop / main に絞り、feature ブランチは `pull_request` 側�
 - **CER / WER**（文字誤り率・単語誤り率）— 正解トランスクリプトと実音声のペアが要る。
   現状は正解ラベル付きの音声資産が無い
 - **Deepgram 自身の話者クラスタリング精度** — テストできるのは
-  「単語配列 → 話者番号」の多数決ロジックだけで、`speaker` を付けているのは Deepgram。
-  複数話者の実声が要る
+  「単語配列 → セグメント列」の分割ロジックだけで、各単語に `speaker` を付けているのは Deepgram。
+  複数話者の実声が要る。Issue #20 で多数決をやめて以降、**Deepgram 側の `speaker` の揺れが
+  そのまま細切れの発話として出る**ようになったため、ここが測れないことの重みは増している
 - **AudioWorklet の実機挙動** — FIR の係数は検証できるが、worklet が実際に動くか、
   static import が iPad Safari で通るかは実機でしか分からない

@@ -10,7 +10,7 @@ sources:
   - src/stt/
 related: [[termlens-architecture]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-deployment]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-25
+updated: 2026-08-26
 ---
 
 # TermLens STT パイプライン
@@ -69,7 +69,79 @@ Nova-3 の keyterm は**日本語を含む多言語に対応済み**（2026-08 �
 ## 話者分離
 
 話者が変わると段落を分け、色付きの話者チップ（話者A/B/…）を表示する。
-`dominantSpeaker()` がセグメント内の単語の多数決で話者番号を決める（`src/stt/deepgram.ts`）。
+
+> 2026-08-26 更新（Issue #20）: **多数決（`dominantSpeaker()`）をやめ、word の `speaker` が
+> 切り替わる位置で発話を分割するようにした。** それまでは 1 セグメント全体を 1 話者に潰していたため、
+> 1 セグメント内に入った短い相槌や話者交代が多数派話者に吸収されて消えていた。
+> `dominantSpeaker()` は削除済み。
+
+`splitBySpeaker()`（`src/stt/split.ts`）の規則は2つだけ。
+
+1. セグメントの `speaker` は、そのセグメント内で**最初に現れた**定義済み speaker
+2. 定義済みの speaker が現セグメントの speaker と異なったら、そこで新セグメントを開始する
+
+`speaker` が `undefined` の word は**境界を作らず直前のセグメントに吸収**する。diarize 有効時に
+speaker が欠けるのは例外的で、独立させると 1 語だけの発話が量産されるため。先頭が `undefined` 続きの
+場合は、そのセグメントで最初に現れた定義済み speaker を後から採用する。全語で不明ならセグメントの
+`speaker` も `undefined` になる（`app.js` は `speaker != null` でチップ表示を分岐しており対応済み）。
+
+分割された発話は `transcriptCb` を複数回呼ぶことで流す。**`SttAdapter` / `TranscriptEvent` /
+`protocol.ts` / `session.ts` / `public/app.js` はいずれも無変更**。`onTranscript` は 1 メッセージに
+つき何回でも呼べる契約であり、`app.js` の `groupUtterances()` が連続する同一話者をまとめ直すため、
+分割された発話が届いても表示は自然にまとまる。
+
+分割ロジックは **`src/stt/split.ts` に依存ゼロで置いてある**（import は `types.ts` の型のみ）。
+`deepgram.ts` に置くと、使いたいだけの `mock.ts` とそのテストが `ws` と `config.ts` を連れ込み、
+`STT_PROVIDER=deepgram` でキー未設定の環境では **mock のテストが import 時に throw する**
+（実際に踏んだ）。`src/extract/normalize.ts` を切り出したのと同じ理由（[[termlens-testing]]）。
+
+### 最小語数の閾値は入れていない
+
+**「短い相槌を別話者として残す」ことと「1 語だけの話者番号の揺れを無視する」ことは同じ現象の裏表**。
+相槌は 1〜2 語なので、閾値（例: 2 語未満は前後に吸収）を入れると相槌そのものが消える。
+
+その代償として、Deepgram の speaker がノイズで揺れた `[0,1,0,1]` のような列は**そのまま 4 分割として
+露出する**。多数決はこの揺れを吸収していたので、ここは退行しうる点。どの程度細切れになるかは
+実機データがないと測れないため、[[termlens-testing]] の評価基盤で話者誤分類率を測ってから
+閾値の要否を判断する（それまで根拠のない定数は入れない）。
+
+### interim は分割しない
+
+`public/app.js` の interim 表示ハンドラは `interimText.textContent = msg.text` の**上書き**なので、
+interim を 2 件に分けて送ると前半の話者ぶんが後半に消される。したがって interim は
+`alt.transcript` を丸ごと 1 件で送る。**interim の `speaker` はクライアントで読まれていない**ため
+`undefined` にしてよく、これで多数決を interim のために残す必要もなくなった。
+
+### text は組み立て直さず transcript から切り出す
+
+話者が変わらないセグメントでは **Deepgram の `transcript` にまったく手を触れない**。組み直すと
+句読点・数値表記などで元と 1 文字でも違ったときに、既存の表示と用語抽出が静かに変わるため。
+
+分割が必要なときも、**word の表記を `transcript` 上で順に探して境界の位置で `slice` する**。
+`punctuatedWord ?? word` の単純な連結にしないのは、**日本語の transcript でもラテン文字列の語間には
+空白が入る**（`AWS Lambda`）ため。空白なしで連結すると `AWSLambda` になり、表示だけでなく
+`normalizeTerm()` のキーやハイライトの照合まで巻き込んで壊れる。切り出しなら分割後の text も
+Deepgram が組み立てた文字列の実体そのままになる。1 語でも `transcript` 上に見つからないときだけ
+連結にフォールバックし、text が空になるイベントは送らない。
+
+同じ規則は `buildFinalEvents()`（`src/stt/split.ts`）にあり、mock も final ではこの経路を通る
+（mock は 1 行 1 話者なので常に 1 セグメント＝素通し。単一話者ケースの退行を mock 経由でも検出するため）。
+
+### 分割の代償は表示の外にも及ぶ
+
+`session.ts` は無変更で動くが、**発行されるイベント数が増えること自体に副作用がある**。
+いずれもクラッシュではなく静かな品質劣化なので、実機で測る前に閾値で塞がないこと。
+
+- **用語抽出バッファに空白が入る。** `scheduler.appendToBuffer()` は final を `" "` 区切りで
+  連結するので、1 つの Deepgram セグメントが N 分割されると日本語の文中に N-1 個の空白が入る
+- **LLM 抽出が断片に対して走りうる。** `maybeRun()` は「120 文字以上」または
+  「前回から 20 秒経過」で発火する。後者の経路では、分割された 1 件目（相槌なら 1〜2 語）だけで
+  `run()` が走り、同じセグメントの残りは次のチャンクに回る。**「LLM 呼び出し回数は変わらない」
+  という Issue #20 の設計時の見立ては、この経路について正しくない**
+- **`localStorage` の履歴が早く痩せる。** `public/app.js` は final 1 件につき 1 エントリを
+  `finalLines` に積み、`SESSION_MAX_CHARS` 超過時に古い順で捨てる。件数が増えるぶん本文以外の
+  オーバーヘッドが増え、同じ会話時間で復元できる履歴が短くなる（Issue #19 で words を
+  クライアントに送らないと決めたのと同じ性質の劣化）
 
 **開始直後は分離が効かない。** Deepgram のストリーミング diarization は音声を蓄積して声を
 クラスタリングするため、判別材料が溜まるまで全員を話者0に寄せる。仕様上の挙動であり実装のバグではない。
@@ -111,7 +183,7 @@ Nova-3 の keyterm は**日本語を含む多言語に対応済み**（2026-08 �
 **interim の words は確定前**。`is_final` 前の word 境界・confidence・speaker は後から変わるため、
 interim の words を信頼して処理を書くと確定時に矛盾する。
 
-なお `dominantSpeaker()` の呼び出しは**変更していない**。words で置き換えるのは後続 Issue。
+words を実際に使うのは Issue #20 の話者分割（上の「話者分離」節）。
 
 2026-08-13 に iPad 実機で話者チップの表示までは確認したが、**話者が 1 人だったため分離精度は未検証**。
 加えて当時は Fly のトライアル制限でセッションが 5 分で切れており、分離が効き始める時間帯に
@@ -125,9 +197,10 @@ interim（未確定）を薄く表示し、final（確定）で置き換える2�
 > 指定した。既定値は 10ms で、わずかな間でも確定してしまう。300ms にすると自然な文単位で
 > まとまり、`smart_format` の句読点も付きやすくなる。
 >
-> ただし長くしすぎると 1 セグメントに複数話者が入り、**話者判定（`dominantSpeaker` の
-> 多数決）が鈍る**。話者の切り替わりの間は通常 300ms より長いので実用上は問題ない想定だが、
-> さらに上げるときはこのトレードオフを意識すること。
+> 長くすると 1 セグメントに複数話者が入りやすくなる。Issue #20 以降は word の `speaker` で
+> 分割するので**多数派に潰されることはなくなった**が、代わりに話者番号の揺れが細切れとして
+> 出るため、壊れ方が変わっただけで**トレードオフは残っている**（上の「最小語数の閾値は
+> 入れていない」節）。セグメントが長いほど 1 件の final 到着が遅れる点も変わらない。
 
 ## mock モード
 
@@ -151,7 +224,7 @@ word 数の数え方や時刻の基準がズレていると、mock で調整し�
 - **句読点は独立 word にしない。** `MockWord` は `{ word, punctuated? }` の組で、
   `word` が素の表記、`punctuated` が句読点つき表記（`{ word: "います", punctuated: "います。" }`）。
   実 Deepgram も句読点を独立 word にせず `punctuated_word` に付随させる。
-  独立 word にすると 1 行あたりの word 数が1割ほど水増しされ、「word の多数決」
+  独立 word にすると 1 行あたりの word 数が1割ほど水増しされ、「話者分割の粒度」
   「低 confidence word の割合」のような word 数ベースの処理が mock と実機で系統的にズレる
   （`。` が 0.125 秒の発話長を持つのも物理的に無意味だった）
 - 不変条件: **`words.map(w => w.punctuated ?? w.word).join("") === text`**。
