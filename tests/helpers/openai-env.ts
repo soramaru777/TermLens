@@ -34,3 +34,8 @@ export const DUMMY_OPENAI_KEY = "test-dummy-key-not-used";
 if (process.env.RUN_LLM_EVAL !== "1" || !process.env.OPENAI_API_KEY) {
   process.env.OPENAI_API_KEY = DUMMY_OPENAI_KEY;
 }
+
+// STT も同じ理由で固定する。ローカルの `.env` に `STT_PROVIDER=deepgram` があると
+// `Session` を組み立てるテストが実 Deepgram へ WS 接続しに行き、キーの有無で結果が変わる。
+// **決定的テストは外部に繋がない**ので mock に倒す（`src/config.ts` が読む前に入れる）。
+process.env.STT_PROVIDER = "mock";

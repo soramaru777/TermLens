@@ -11,6 +11,19 @@ export const MOCK_CHARS_PER_SECOND = 8;
 /** 1行につき発行する interim の回数。 */
 export const MOCK_INTERIM_STEPS = 3;
 
+/**
+ * 1つの final に含める word 数。
+ *
+ * mock は元々 1 行をまるごと 1 つの final として出していたため、
+ * 「**複数の final を1発話に統合する**」という UtteranceBuilder の中身が
+ * mock 上で一度も発生せず、通しても素通しになっていた。
+ * 実 Deepgram が 1 発話を複数の final に割って返すのに合わせて、機械的に分割する。
+ *
+ * `mock-script.ts` は変更しない。行単位の手書きデータに final の区切りまで持たせると
+ * 型が複雑になるうえ、実物の区切り位置を再現できるわけでもないため。
+ */
+export const MOCK_WORDS_PER_FINAL = 4;
+
 /** interim / final を刻む間隔（ミリ秒）。 */
 export const MOCK_STEP_MS = 600;
 
@@ -129,6 +142,21 @@ export function sliceMockWords(words: TranscriptWord[], charLen: number): Transc
 }
 
 /**
+ * words を `size` 語ずつに分ける。実 Deepgram が1発話を複数の final に割るのを模す。
+ * 端数は最後のチャンクに入る。空配列なら空配列を返す。
+ *
+ * `size` が 1 未満だと進まず無限ループになるので 1 に丸める。
+ *
+ * export しているのは tests/mock-words.test.ts から検証するため。
+ */
+export function chunkMockWords(words: TranscriptWord[], size: number): TranscriptWord[][] {
+  const step = Math.max(1, Math.floor(size));
+  const out: TranscriptWord[][] = [];
+  for (let i = 0; i < words.length; i += step) out.push(words.slice(i, i + step));
+  return out;
+}
+
+/**
  * スクリプトを再生するモックSTT。マイクもAPIキーも不要で
  * transcript → 抽出 → カード表示のパイプライン全体を検証できる。
  * 1行につき interim を数回発行してから final を発行し、スクリプト末尾でループする。
@@ -182,10 +210,21 @@ export class MockSttAdapter implements SttAdapter {
         }
         this.timer = setTimeout(tick, MOCK_STEP_MS);
       } else {
-        // final は実アダプタと同じ分割規則を通す。mock は1行1話者なので常に1セグメントで、
-        // `text` は素通しされる（＝分割導入前と完全に同じイベントが出る）。
-        // それでもここを通すのは、単一話者ケースの退行を mock 経由でも検出するため。
-        for (const e of buildFinalEvents(text, words)) this.transcriptCb?.(e);
+        // 1行を MOCK_WORDS_PER_FINAL 語ごとの final に割り、最後の1件にだけ speechFinal を立てる。
+        // 実アダプタと同じ話者分割規則（buildFinalEvents）も通す。mock は1行1話者なので
+        // 常に1セグメントで text は素通しされ、単一話者ケースの退行をここでも検出できる。
+        const chunks = chunkMockWords(words, MOCK_WORDS_PER_FINAL);
+        for (const [i, chunk] of chunks.entries()) {
+          const isLast = i === chunks.length - 1;
+          const evs = buildFinalEvents(chunk.map(mockSurface).join(""), chunk);
+          for (const [j, e] of evs.entries()) {
+            // speechFinal を立てるのは行の最後のチャンクの、さらに最後の1件だけ。
+            // deepgram.ts と同じ規則（全件に立てると話者分割ごとに発話が閉じる）。
+            // 非最終には false を立てず undefined のままにする
+            const last = isLast && j === evs.length - 1;
+            this.transcriptCb?.(last ? { ...e, speechFinal: true } : e);
+          }
+        }
         // 行の発話ぶん＋行間の無音を経過時間に足してから次の行へ
         this.streamOffsetSec = roundSec(
           this.streamOffsetSec + text.length / MOCK_CHARS_PER_SECOND + MOCK_LINE_GAP_SEC,
@@ -209,6 +248,14 @@ export class MockSttAdapter implements SttAdapter {
 
   onTranscript(cb: (e: TranscriptEvent) => void): void {
     this.transcriptCb = cb;
+  }
+  /**
+   * mock は UtteranceEnd 相当のシグナルを持たないので**登録するだけで呼ばない**。
+   * speech_final だけで発話が閉じる経路を mock で通しておき、
+   * UtteranceEnd 経路とタイムアウト経路は tests/utterance.test.ts の純関数テストで見る。
+   */
+  onUtteranceEnd(_cb: () => void): void {
+    // 何もしない
   }
   onError(cb: (err: Error) => void): void {
     this.errorCb = cb;

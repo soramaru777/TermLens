@@ -63,9 +63,11 @@ import するために要る。
 | ファイル | 対象 | 固定していること |
 |---|---|---|
 | `split-by-speaker.test.ts` | `splitBySpeaker()` / `buildFinalEvents()`（`src/stt/split.ts`） | 話者の切り替わりで分割されること、**1語の相槌も独立して残ること**（閾値を入れていない担保）、`speaker` 不明の word が境界を作らず吸収されること、word を落とさず順序も変えないこと、**単一話者では `transcript` が1文字も変わらず素通しされること**、分割時の text が `transcript` からの**切り出し**であること（語間の空白が落ちないこと）、各イベントに自分のセグメントの `words` だけが載ること、空の text を送らないこと |
-| `transcript-events.test.ts` | `buildTranscriptEvents()`（`src/stt/deepgram.ts`） | **interim は分割せず `speaker` が `undefined`** であること、`text` が空なら何も返さないこと、全語 speaker 不明でも1件のままであること |
+| `session-wiring.test.ts` | `Session` の配線（`src/session.ts`） | **表示は即時・抽出は発話単位**の分岐、`UtteranceEnd` の配線、**stop 時に未確定の発話が抽出まで届くこと**（回帰テスト）。mock の再生には頼らず、アダプタが登録したコールバックを掴んで直接叩く |
+| `utterance.test.ts` | `UtteranceBuilder`（`src/stt/utterance.ts`） | 4つの確定契機（`speechFinal` / `UtteranceEnd` / **タイムアウト** / 文字数上限）、**定義済み話者**の交代で結合しないこと、`undefined` は境界を作らず吸収されること（`splitBySpeaker` と同じ規則）、1語の相槌が独立して残ること、空バッファで何も発行しないこと、`flush()` / `stop()`。タイムアウトは偽タイマーで検証 |
+| `transcript-events.test.ts` | `buildTranscriptEvents()`（`src/stt/deepgram.ts`） | **interim は分割せず `speaker` が `undefined`** であること、`text` が空なら何も返さないこと、全語 speaker 不明でも1件のままであること、**`speechFinal` が分割後の最後の1件にだけ立つこと** |
 | `transcript-words.test.ts` | `toTranscriptWords()`（`src/stt/deepgram.ts`） | `punctuated_word` → `punctuatedWord` の変換、欠落フィールドが `undefined` のまま通ること、空配列・undefined は `undefined` |
-| `mock-words.test.ts` | `MOCK_SCRIPT` / `buildMockWords()` / `sliceMockWords()` / `MockSttAdapter` | 手書き word 分割の不変条件 `words.map(w => w.punctuated ?? w.word).join("") === text`、句読点を独立 word にしないこと、`start` が**スクリプト一周を通して**単調増加すること、誤認識語だけ低 confidence（`term-cases.json` の `expectCorrection` と**集合一致**）、interim で境界に跨る word を出さず空 transcript も送らないこと、スクリプトを一周すること（所要時間は `MOCK_SCRIPT.length` から算出） |
+| `mock-words.test.ts` | `MOCK_SCRIPT` / `buildMockWords()` / `sliceMockWords()` / `MockSttAdapter` | 手書き word 分割の不変条件 `words.map(w => w.punctuated ?? w.word).join("") === text`、句読点を独立 word にしないこと、`start` が**スクリプト一周を通して**単調増加すること、誤認識語だけ低 confidence（`term-cases.json` の `expectCorrection` と**集合一致**）、interim で境界に跨る word を出さず空 transcript も送らないこと、スクリプトを一周すること（所要時間は `MOCK_SCRIPT.length` から算出）、**1 行が複数 final に割れること**と**`UtteranceBuilder` で組み直すと元の行に1文字も違わず戻ること**（この2つはセット。割れていなければ統合を何も検証しないテストになる） |
 | `normalize-term.test.ts` | `normalizeTerm()`（`src/extract/normalize.ts`） | NFKC・小文字化・空白除去で表記ゆれが同一キーに畳まれる／別語は衝突しない |
 | `error-classify.test.ts` | `isPermanent()` / `isQuotaExhausted()` / `toUserMessage()` | 400/401/403/404/422/429(quota) は恒久、408/409/429(rate)/5xx/接続エラーは一時。利用者向け文言 |
 | `strip-citations.test.ts` | `stripInlineCitations()` | 除去する記法と、触ってはいけない日本語の記号 |

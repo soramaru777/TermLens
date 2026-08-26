@@ -41,11 +41,17 @@ export interface DeepgramAlternative {
  *
  * `text` が空なら何も返さない（従来の `if (text.length > 0)` と同じ扱い）。
  *
+ * `speechFinal` は**返す配列の最後の1件にだけ**立てる。全件に立てると、
+ * 話者で分割した各セグメントごとに `UtteranceBuilder` が発話を閉じてしまい、
+ * 「分割してから同一話者を結合する」という組み合わせが噛み合わない。
+ * 発話終端は「その Results の終わり」であって「各セグメントの終わり」ではない。
+ *
  * export しているのは tests/transcript-events.test.ts から検証するため。
  */
 export function buildTranscriptEvents(
   alt: DeepgramAlternative | undefined,
   isFinal: boolean,
+  speechFinal = false,
 ): TranscriptEvent[] {
   const text = alt?.transcript ?? "";
   if (text.length === 0) return [];
@@ -53,7 +59,11 @@ export function buildTranscriptEvents(
   if (!isFinal) {
     return [{ text, isFinal: false, speaker: undefined, words }];
   }
-  return buildFinalEvents(text, words);
+  const events = buildFinalEvents(text, words);
+  if (speechFinal && events.length > 0) {
+    events[events.length - 1].speechFinal = true;
+  }
+  return events;
 }
 
 /**
@@ -87,6 +97,7 @@ export class DeepgramSttAdapter implements SttAdapter {
   private ws: WebSocket | null = null;
   private keepAlive: NodeJS.Timeout | null = null;
   private transcriptCb: ((e: TranscriptEvent) => void) | null = null;
+  private utteranceEndCb: (() => void) | null = null;
   private errorCb: ((err: Error) => void) | null = null;
   private closeCb: (() => void) | null = null;
   private stopping = false;
@@ -108,6 +119,11 @@ export class DeepgramSttAdapter implements SttAdapter {
       // 多数派に潰されることはなくなったが、代わりに話者番号の揺れが細切れとして出る。
       // 上げるほどその機会が増える点は変わらない。
       endpointing: "300",
+      // speech_final は無音（VAD）で判定するため、背景ノイズが続くと立たないことが
+      // 公式に明記されている。UtteranceEnd は word の時間ギャップで判定し音声を見ないので、
+      // 騒がしい会議室ではこちらが発話終端の頼りになる。1000ms は公式の最小推奨値。
+      // interim_results=true が前提だが上で有効にしてある。
+      utterance_end_ms: "1000",
     });
     // nova-3 系は keyterm(日本語対応・最大約100語)、nova-2 以前は keywords でブースト
     const useKeyterm = config.deepgramModel.startsWith("nova-3");
@@ -141,9 +157,20 @@ export class DeepgramSttAdapter implements SttAdapter {
             const events = buildTranscriptEvents(
               msg.channel?.alternatives?.[0],
               msg.is_final === true,
+              msg.speech_final === true,
             );
             // 1セグメント内で話者が変われば複数件になる。コールバックはその回数ぶん呼ぶ
             for (const e of events) this.transcriptCb?.(e);
+            // transcript が空の Results に speech_final が立つことがある。イベントは
+            // 発行できないが（空 transcript は送らない）、終端シグナルまで捨てると
+            // 確定契機が1つ黙って消えるので、境界としてだけ伝える
+            if (msg.speech_final === true && events.length === 0) this.utteranceEndCb?.();
+          } else if (msg.type === "UtteranceEnd") {
+            // テキストを持たない境界シグナル。`last_word_end` は今は使わない。
+            // Deepgram は UtteranceEnd が対応する final より先に届きうるとしており、
+            // その場合は発話が一足早く閉じて直後の final が短い発話になる。
+            // 実機で頻度を測るまでは last_word_end による並べ替えは入れない
+            this.utteranceEndCb?.();
           }
         } catch {
           // JSON以外のフレームは無視
@@ -194,6 +221,9 @@ export class DeepgramSttAdapter implements SttAdapter {
 
   onTranscript(cb: (e: TranscriptEvent) => void): void {
     this.transcriptCb = cb;
+  }
+  onUtteranceEnd(cb: () => void): void {
+    this.utteranceEndCb = cb;
   }
   onError(cb: (err: Error) => void): void {
     this.errorCb = cb;

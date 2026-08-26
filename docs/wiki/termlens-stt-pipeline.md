@@ -189,6 +189,77 @@ words を実際に使うのは Issue #20 の話者分割（上の「話者分離
 加えて当時は Fly のトライアル制限でセッションが 5 分で切れており、分離が効き始める時間帯に
 ほぼ到達できていなかった（[[termlens-deployment]]、[[termlens-open-issues]] の未検証1）。
 
+## 発話単位の構築
+
+> 2026-08-26 追加（Issue #21）: **`is_final` をそのまま用語抽出へ渡すのをやめ、
+> `UtteranceBuilder`（`src/stt/utterance.ts`）で発話にまとめてから渡すようにした。**
+> `is_final` は認識区間の確定であって人の意味的な発話完了ではないため、
+> 文の途中で抽出が走り、文脈不足のまま LLM に渡っていた。
+
+`split.ts` と同じく**依存ゼロ**で置いてある（import は `types.ts` の型のみ）。
+
+### 表示と抽出で単位を分ける
+
+```
+STT の final ──┬─→ 表示用: そのまま send   ← 遅延ゼロ（従来と同じ）
+               └─→ 抽出用: UtteranceBuilder → 発話が完成したら scheduler へ
+```
+
+**表示まで発話単位にすると確定テキストが数秒遅れる**ので分岐させている。
+`protocol.ts` と `public/app.js` は無変更。
+
+### 確定の契機は4つ
+
+優先順位ではなく、どれか1つでも成立したら発話を閉じる。
+
+| # | 契機 | 由来 |
+|---|---|---|
+| 1 | `speechFinal` が立った final を足した直後 | Deepgram の**無音**検出（`endpointing=300`） |
+| 2 | `UtteranceEnd` を受信（バッファが空なら何もしない） | Deepgram の **word ギャップ**検出（`utterance_end_ms=1000`） |
+| 3 | 最後の final から `UTTERANCE_TIMEOUT_MS`（3秒）経過 | どのシグナルも来ない場合の保険 |
+| 4 | バッファが `MAX_UTTERANCE_CHARS`（500字）超過 | 病的ケースの保険 |
+
+加えて、**話者が変わったら足す前に閉じる**（相槌や話者交代をまたいで結合しない）。
+
+**`speech_final` と `UtteranceEnd` の両方を使うのは省略できない。** 公式ドキュメントは
+「**背景ノイズがあると VAD が反応し続け、無音と判定されず `speech_final` が来ない**」ことを
+明記しており、会議室のエアコン音・キーボード音がある本アプリの用途はまさにこれに当たる。
+`UtteranceEnd` は音声を見ず word の時間ギャップだけで判定するのでこの失敗モードを迂回できる。
+
+> **未検証**: 実機の Deepgram が日本語で `speech_final` / `UtteranceEnd` をどれだけ出すかは
+> 確かめていない。どちらも来なければ発話は 3 秒のタイムアウト頼りで閉じることになり、
+> 切れ目が会話の内容と無関係に決まる（[[termlens-open-issues]] の未検証1）。
+>
+> **`UtteranceEnd` は対応する final より先に届きうる**（そのために Deepgram は
+> `last_word_end` を提供している）。先に届いた場合は発話が一足早く閉じ、直後の final が
+> 短い発話になる。頻度が測れるまで `last_word_end` による並べ替えは入れていない。
+
+`speech_final` が **transcript 空の Results に立つ**ことがある。イベントは発行できない
+（空 transcript は送らない）が、終端シグナルまで捨てると確定契機が1つ黙って消えるので、
+`UtteranceEnd` と同じ「境界だけ」の通知として `UtteranceBuilder` に伝えている。
+
+### 話者不明の扱いは splitBySpeaker と同じ
+
+`speaker` が `undefined` のイベントは**境界を作らず現在の発話に吸収**し、発話の speaker は
+「その中で最初に現れた定義済み speaker」とする。`split.ts` とまったく同じ規則。
+同じ「話者不明」に対して隣接する2層が逆の規則を持つと、diarize が一時的に speaker を
+返さない final が1件挟まるだけで同一話者の発話が3つに割れる。
+
+### speechFinal は分割後の最後の1件にだけ立てる
+
+1つの Results が話者で N 分割された場合、`speechFinal` を立てるのは**最後のセグメントだけ**。
+発話終端は「その Results の終わり」であって「各セグメントの終わり」ではないため、
+全件に立てるとセグメントごとに発話が閉じ、分割（#20）と結合（#21）が噛み合わなくなる。
+
+### 発話内の連結は区切り文字なし
+
+`UtteranceBuilder` が担うのは「1つの発話を組み立てる」ことなので間に何も挟まない。
+別々の発話をつなぐ `ExtractionScheduler` 側が `" "` 区切りなのとは役割が違う
+（[[termlens-term-extraction]]）。副作用として、語の途中で final が割れると
+`AWS` と `Lambda` が `AWSLambda` になりうる。#20 の切り出しと違い、ここには照合すべき
+元の完全な文字列が存在しない（別々の Results なので）ため対処できない。
+final は無音 300ms で切れるので語の途中で割れるのは稀、という前提に乗っている。
+
 ## interim / final
 
 interim（未確定）を薄く表示し、final（確定）で置き換える2段階表示。final のテキストが用語抽出の入力になる。
@@ -203,6 +274,17 @@ interim（未確定）を薄く表示し、final（確定）で置き換える2�
 > 入れていない」節）。セグメントが長いほど 1 件の final 到着が遅れる点も変わらない。
 
 ## mock モード
+
+> 2026-08-26 変更（Issue #21）: mock は 1 行を `MOCK_WORDS_PER_FINAL`（4）語ごとの
+> **複数の final に割って**出すようになった。1 行 = 1 final のままだと、
+> 「複数 final を1発話に統合する」という `UtteranceBuilder` の中身が mock 上で
+> **一度も発生せず**、通しても素通しになってテストが何も守らなかったため。
+> 最後の final にだけ `speechFinal` を立てる。`UtteranceEnd` 相当は mock では発火させない
+> （`onUtteranceEnd` は登録するだけ）。`mock-script.ts` は変更していない。
+>
+> 副作用として、mock では `public/app.js` の `finalLines` が行あたり数倍に増え、
+> `SESSION_MAX_CHARS` の `localStorage` トリムが早く効く。**mock だけの話**で、
+> 実 Deepgram の final の数は変わらない。
 
 `STT_PROVIDER=mock` で、誤認識入りのダミー会議（3話者）が自動再生される。**API キーもマイクも不要**で、文字起こし → カード生成 → web 検索清書 → ハイライトまで全パイプラインを通せる。
 
