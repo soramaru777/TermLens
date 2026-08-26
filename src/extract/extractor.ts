@@ -3,7 +3,10 @@ import { zodResponseFormat } from "openai/helpers/zod";
 import { ExtractionResultSchema, type ExtractionResult } from "./schema.js";
 import { config } from "../config.js";
 
-const client = new OpenAI();
+// テストから `chat.completions.parse` を差し替えられるよう export する。
+// そうしないと「extract() が buildUserTurn と filterSurfaceForms を実際に使っているか」を
+// 実 API を叩かずに検証できない(どちらも単体では正しいのに配線だけ抜ける事故を防ぐ)。
+export const client = new OpenAI();
 
 // モデル比較の実験でも同じ文面を使えるよう export する(コピーして drift させないため)
 export const ROLE_PROMPT = `あなたは会議のリアルタイム文字起こしを監視し、聞き手が知らない可能性のある専門用語・固有名詞・重要語を抽出して、日本語で約100文字(最大120文字)の解説カードを作るアシスタントです。
@@ -21,11 +24,64 @@ export const ROLE_PROMPT = `あなたは会議のリアルタイム文字起こ�
    - それ以外で、日本語でカタカナ表記が定着している語はカタカナで書く(例: フェイルオーバー、マイグレーション、レイテンシ)。英語に戻さないこと。
    - 日本語の語として定着しているものは日本語で書く(例: 冗長化、二要素認証)。
    - この規則は表記の決め方だけを定めるものであり、どの語をカード化するかの判断(規則3)には影響しない。ここに挙げた例は表記の見本であって、「平易だから出力しない語」の例ではない。
-   - 判断に迷う場合は、その会議で実際に話された表記に寄せること。`;
+   - 判断に迷う場合は、その会議で実際に話された表記に寄せること。
+9. 「直前の会話」は語義や固有名詞を判断するための参考情報であり、カード化の対象ではない。直前の会話にしか登場しない用語は出力しないこと。カードにするのは「新しい文字起こし」に登場した用語だけとする。`;
 
 export interface ExtractorInput {
+  /** 今回カード化・surfaceForms 抽出の対象 */
   newTranscript: string;
+  /**
+   * 語義判定にだけ使う直前の会話（#22）。カード化の対象ではない。
+   * 呼び出し側が省略できるよう optional にしてある(評価ハーネスは文脈なしでも回す)。
+   */
+  contextTranscript?: string;
   shownTerms: string[];
+}
+
+/**
+ * `surfaceForms` を「新しい文字起こしに実在する表記」だけに絞る。
+ *
+ * プロンプト規則7で指示しているが**サーバー側の検証が無かった**ため、文脈を渡し始めると
+ * 直前の会話に出てきただけの表記が混ざりうる。クライアントは surfaceForms で
+ * 文字起こし本文をハイライトする(`public/app.js`)ので、本文に無い表記は害にしかならない。
+ *
+ * **カード自体は落とさない。** surfaceForms が空になってもカードは残す(ハイライトが効かない
+ * だけで、`public/app.js` は `?? []` で受けている)。LLM が surfaceForms を出し渋っただけで
+ * 正しい新規用語を捨てるほうが害が大きい。
+ *
+ * 置き場所が `scheduler.ts` ではなく抽出器側なのは、評価ハーネス(`src/eval/run.ts`)が
+ * `createExtractor()` を直接呼ぶため。スケジューラに置くと**評価が本番と違う挙動を測る**。
+ */
+export function filterSurfaceForms<T extends { surfaceForms: string[] }>(
+  cards: T[],
+  newTranscript: string,
+): T[] {
+  return cards.map((card) => ({
+    ...card,
+    surfaceForms: card.surfaceForms.filter((f) => f !== "" && newTranscript.includes(f)),
+  }));
+}
+
+/**
+ * user ターンを組み立てる。
+ *
+ * **判断対象(新しい文字起こし)を末尾＝直近に置く。** 参考情報が先、対象が後。
+ * 純関数として切り出してあるのは、`extract()` の中に埋めたままだと
+ * 「`contextTranscript` が実際に LLM へ届いているか」を LLM を呼ばずに検証できないため。
+ * `filterSurfaceForms()` を切り出したのと同じ理由。
+ */
+export function buildUserTurn(input: ExtractorInput): string {
+  const context = input.contextTranscript ?? "";
+  return [
+    "# 直前の会話(文脈。カード化の対象外)",
+    context.trim().length > 0 ? context : "(なし)",
+    "",
+    "# 表示済み用語リスト",
+    input.shownTerms.length > 0 ? input.shownTerms.join("、") : "(なし)",
+    "",
+    "# 新しい文字起こし",
+    input.newTranscript,
+  ].join("\n");
 }
 
 export function createExtractor(glossary: string[]) {
@@ -35,13 +91,7 @@ export function createExtractor(glossary: string[]) {
   const systemPrompt = `${ROLE_PROMPT}\n\n# 会議の用語集(参加者名・社名・専門用語)\n${glossaryText}`;
 
   return async function extract(input: ExtractorInput): Promise<ExtractionResult["cards"]> {
-    const userTurn = [
-      "# 表示済み用語リスト",
-      input.shownTerms.length > 0 ? input.shownTerms.join("、") : "(なし)",
-      "",
-      "# 新しい文字起こし",
-      input.newTranscript,
-    ].join("\n");
+    const userTurn = buildUserTurn(input);
 
     const response = await client.chat.completions.parse({
       model: config.llmModel,
@@ -55,6 +105,7 @@ export function createExtractor(glossary: string[]) {
       response_format: zodResponseFormat(ExtractionResultSchema, "extraction_result"),
     });
 
-    return response.choices[0]?.message.parsed?.cards ?? [];
+    const cards = response.choices[0]?.message.parsed?.cards ?? [];
+    return filterSurfaceForms(cards, input.newTranscript);
   };
 }

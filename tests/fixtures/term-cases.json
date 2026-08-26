@@ -108,5 +108,27 @@
     "expectCorrection": {},
     "forbidTerms": ["会議室", "打ち合わせ", "水曜日", "午後三時", "次回"],
     "allowLowConfidence": []
+  },
+  {
+    "id": "context-disambiguation",
+    "transcript": "イェーガーの画面で確認したところ、その区間だけ極端に時間がかかっていました。",
+    "context": "今のシステムはサービスが十数個に分かれていて、どこで時間がかかっているのか追いかけられていません。まずは呼び出しの流れを見える化するツールを入れようという話をしていました。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["Jaeger"],
+    "expectCorrection": { "イェーガー": "Jaeger" },
+    "forbidTerms": ["イェーガー", "イエーガー", "Yeager"],
+    "allowLowConfidence": ["分散トレーシング", "トレーシング", "マイクロサービス"]
+  },
+  {
+    "id": "context-no-recard",
+    "transcript": "では次にインフラの話です。テラフォームのコードを整理して、環境ごとの差分を減らしたいと考えています。",
+    "context": "デプロイの手順ですが、新しいバージョンはまず5パーセントの利用者にだけ出して様子を見ます。このカナリアリリースの段取りは前回の会議で決めたとおりです。ロールバックの判断は当番が行います。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["Terraform"],
+    "expectCorrection": { "テラフォーム": "Terraform" },
+    "forbidTerms": ["カナリアリリース", "ロールバック", "テラフォーム"],
+    "allowLowConfidence": ["IaC", "Infrastructure as Code", "インフラ"]
   }
 ]

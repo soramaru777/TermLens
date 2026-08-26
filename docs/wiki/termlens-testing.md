@@ -11,7 +11,7 @@ sources:
   - .github/workflows/test.yml
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-architecture]]
 confidence: high
-updated: 2026-08-26
+updated: 2026-08-27
 ---
 
 # TermLens のテストと評価
@@ -68,6 +68,9 @@ import するために要る。
 | `transcript-events.test.ts` | `buildTranscriptEvents()`（`src/stt/deepgram.ts`） | **interim は分割せず `speaker` が `undefined`** であること、`text` が空なら何も返さないこと、全語 speaker 不明でも1件のままであること、**`speechFinal` が分割後の最後の1件にだけ立つこと** |
 | `transcript-words.test.ts` | `toTranscriptWords()`（`src/stt/deepgram.ts`） | `punctuated_word` → `punctuatedWord` の変換、欠落フィールドが `undefined` のまま通ること、空配列・undefined は `undefined` |
 | `mock-words.test.ts` | `MOCK_SCRIPT` / `buildMockWords()` / `sliceMockWords()` / `MockSttAdapter` | 手書き word 分割の不変条件 `words.map(w => w.punctuated ?? w.word).join("") === text`、句読点を独立 word にしないこと、`start` が**スクリプト一周を通して**単調増加すること、誤認識語だけ低 confidence（`term-cases.json` の `expectCorrection` と**集合一致**）、interim で境界に跨る word を出さず空 transcript も送らないこと、スクリプトを一周すること（所要時間は `MOCK_SCRIPT.length` から算出）、**1 行が複数 final に割れること**と**`UtteranceBuilder` で組み直すと元の行に1文字も違わず戻ること**（この2つはセット。割れていなければ統合を何も検証しないテストになる） |
+| `context-window.test.ts` | `ContextWindow`（`src/extract/context.ts`） | 上限で**古いチャンクから丸ごと捨てる**こと（`" "` の区切りも長さに数える）、1チャンク単独で超えるときだけ `slice(-maxChars)` で頭を削ること、空文字を無視すること、`clear()` |
+| `surface-forms.test.ts` | `filterSurfaceForms()`（`src/extract/extractor.ts`） | `newTranscript` に**実在する表記だけ**が残ること、**空になってもカードは落とさない**こと、他フィールドと入力配列を変えないこと、空文字列（`includes("")` が常に true になる穴） |
+| `scheduler-context.test.ts` | `ExtractionScheduler` の文脈保持（`src/extract/scheduler.ts`） | 成功したチャンクだけが次回の `contextTranscript` になること、**一時エラーのチャンクは積まれない**こと（回帰テストの本体。戻ってきたチャンクが文脈と新規の両方に出ない）、恒久エラーで文脈も捨てること、**既出用語のデデュープが壊れていない**こと。private の `extract` を差し替えて LLM を呼ばずに回す |
 | `normalize-term.test.ts` | `normalizeTerm()`（`src/extract/normalize.ts`） | NFKC・小文字化・空白除去で表記ゆれが同一キーに畳まれる／別語は衝突しない |
 | `error-classify.test.ts` | `isPermanent()` / `isQuotaExhausted()` / `toUserMessage()` | 400/401/403/404/422/429(quota) は恒久、408/409/429(rate)/5xx/接続エラーは一時。利用者向け文言 |
 | `strip-citations.test.ts` | `stripInlineCitations()` | 除去する記法と、触ってはいけない日本語の記号 |
@@ -174,11 +177,19 @@ npm run eval:llm > /tmp/eval.json          # stdout のリダイレクトでも�
 
 ### ケース（`tests/fixtures/term-cases.json`）
 
-11件。**すべて合成**で、実会議の録音・文字起こしからの抜粋は使っていない
+13件。**すべて合成**で、実会議の録音・文字起こしからの抜粋は使っていない
 （`src/stt/mock-script.ts` と同じ方針）。実会議の情報が混ざる経路を原理的に断つため。
 誤認識カタカナ（クバネテス／グラファナ／ピネコーネ）、略語の読み上げ（オーオース／
 ピーケーシーイー／エヌディーエー）、用語集ブースト、既出用語のデデュープ、
 「カードが出ないのが正解」の一般語のみのケースを混ぜてある。
+
+`context`（#22）は「直前の会話」として抽出器に渡すフィールドで、既定は空文字。
+これを使う2ケースを足してある。
+
+- `context-disambiguation` — 文脈がドメインを確立し、`transcript` 単体では曖昧な誤認識語を
+  `expectCorrection` に置く。**文脈あり/なしで正しい補正率が動くか**を見る
+- `context-no-recard` — `context` にしか登場しない用語を `forbidTerms` に置く。
+  AC「過去文脈の用語を再カード化しない」を誤補正率として測る
 
 ### 指標
 
@@ -200,6 +211,20 @@ npm run eval:llm > /tmp/eval.json          # stdout のリダイレクトでも�
 閾値と試行回数は `src/eval/run.ts` の `EVAL_DEFAULTS` に1か所でまとめてあり、
 `EVAL_RUNS` / `EVAL_CONCURRENCY` / `EVAL_MIN_RECALL` / `EVAL_MAX_MISCORRECTION` /
 `EVAL_MIN_PRECISION` で上書きできる。既定は3回試行・並列4。
+
+### 文脈あり/なしの比較
+
+`EVAL_NO_CONTEXT=1` を付けるとケースの `context` を空にして流す（`EvalConfig.useContext`）。
+**同じ fixture で2回回して差分を見る**ための切り替えで、`EvalReport` は `config` を丸ごと
+持つので**どちらのモードで測ったかがレポートに残る**（表の見出しにも出る）。
+
+```sh
+npm run eval:llm -- --out /tmp/with-context.json
+EVAL_NO_CONTEXT=1 npm run eval:llm -- --out /tmp/without-context.json
+```
+
+`0` / `1` 以外の値は例外にする。`EVAL_NO_CONTEXT=true` を黙って無視すると
+「文脈なしで測ったつもりが文脈ありだった」レポートができ、比較そのものが無意味になる。
 
 ### 「何も測らなかった」を PASS にしない
 

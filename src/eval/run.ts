@@ -46,12 +46,28 @@ function positiveIntEnv(name: string, fallback: number): number {
   return value;
 }
 
+/**
+ * 0/1 のフラグ用。
+ *
+ * `EVAL_NO_CONTEXT=true` のような書き方を黙って無視すると、「文脈なしで測ったつもりが
+ * 文脈ありだった」レポートができ、比較そのものが無意味になる。入口で弾く。
+ */
+function flagEnv(name: string): boolean {
+  const raw = process.env[name]?.trim();
+  if (raw === undefined || raw === "") return false;
+  if (raw === "1") return true;
+  if (raw === "0") return false;
+  throw new Error(`${name} は 0 か 1 で指定してください: ${raw}`);
+}
+
 /** 閾値と試行回数の既定値。すべて環境変数で上書きできる。ここが唯一の定義箇所。 */
 export const EVAL_DEFAULTS = {
   /** 1ケースあたりの試行回数。LLM の出力が揺れるため複数回の平均で見る */
   runs: 3,
   /** 同時に投げる (ケース × 試行) の数 */
   concurrency: 4,
+  /** ケースの `context` を抽出器に渡すか。`EVAL_NO_CONTEXT=1` で false にして比較する */
+  useContext: true,
   minRecall: 0.8,
   maxMiscorrection: 0.05,
   minPrecision: 0.6,
@@ -60,6 +76,7 @@ export const EVAL_DEFAULTS = {
 export interface EvalConfig {
   runs: number;
   concurrency: number;
+  useContext: boolean;
   minRecall: number;
   maxMiscorrection: number;
   minPrecision: number;
@@ -69,6 +86,7 @@ export function resolveConfig(overrides: Partial<EvalConfig> = {}): EvalConfig {
   return {
     runs: positiveIntEnv("EVAL_RUNS", EVAL_DEFAULTS.runs),
     concurrency: positiveIntEnv("EVAL_CONCURRENCY", EVAL_DEFAULTS.concurrency),
+    useContext: EVAL_DEFAULTS.useContext && !flagEnv("EVAL_NO_CONTEXT"),
     minRecall: numEnv("EVAL_MIN_RECALL", EVAL_DEFAULTS.minRecall),
     maxMiscorrection: numEnv("EVAL_MAX_MISCORRECTION", EVAL_DEFAULTS.maxMiscorrection),
     minPrecision: numEnv("EVAL_MIN_PRECISION", EVAL_DEFAULTS.minPrecision),
@@ -157,6 +175,8 @@ export async function runEval(
       const extract = extractors.get(job.case.id)!;
       const cards = (await extract({
         newTranscript: job.case.transcript,
+        // 同じ fixture で文脈あり/なしを比較するため、無効化は空文字で表現する（#22）
+        contextTranscript: config.useContext ? job.case.context : "",
         shownTerms: job.case.shownTerms,
       })) as EvaluatedCard[];
       return scoreCase(job.case, cards, job.run);
@@ -253,7 +273,8 @@ export function formatTable(report: EvalReport): string {
     cells.map((c, i) => c + " ".repeat(cols[i]! - width(c))).join("  ").trimEnd();
 
   const out = [
-    `モデル: ${report.model}  試行: ${report.config.runs}回/ケース  開始: ${report.startedAt}`,
+    `モデル: ${report.model}  試行: ${report.config.runs}回/ケース  ` +
+      `文脈: ${report.config.useContext ? "あり" : "なし"}  開始: ${report.startedAt}`,
     `ジョブ: ${report.scores.length}/${report.totalJobs} 成功` +
       (report.jobErrors.length > 0
         ? `  ⚠ ${report.jobErrors.length}件が失敗しています（下の数字は成功したぶんだけの集計です）`
