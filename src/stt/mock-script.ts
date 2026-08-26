@@ -8,7 +8,7 @@
  * 実 Deepgram は句読点を独立した word として出さず、`punctuated_word` に付随させる
  * （`word: "います"` / `punctuated_word: "います。"`）。mock もそれに合わせる。
  * 句読点を独立 word にすると 1 行あたりの word 数が1割ほど水増しされ、
- * 「word の多数決」「低 confidence word の割合」のような word 数ベースの処理が
+ * 「話者分割の粒度」「低 confidence word の割合」のような word 数ベースの処理が
  * mock と実機で系統的にズレる。
  */
 export interface MockWord {

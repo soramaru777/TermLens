@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 import type { SttAdapter, TranscriptEvent, TranscriptWord } from "./types.js";
+import { buildFinalEvents } from "./split.js";
 import { config } from "../config.js";
 
 const KEEPALIVE_INTERVAL_MS = 5000;
@@ -21,27 +22,38 @@ export interface DeepgramWord {
 }
 
 /**
- * セグメント内の単語の多数決で話者番号を決める。
- * 同数の場合は先に出現した話者が残る（`count > bestCount` のため）。
- * export しているのは tests/dominant-speaker.test.ts から検証するため。
+ * Deepgram の `channel.alternatives[0]` のうち、ここで使うぶんだけ。
+ * テストから組み立てられるよう最小限の形にしてある。
  */
-export function dominantSpeaker(words?: Array<{ speaker?: number }>): number | undefined {
-  if (!words?.length) return undefined;
-  const counts = new Map<number, number>();
-  for (const w of words) {
-    if (typeof w.speaker === "number") {
-      counts.set(w.speaker, (counts.get(w.speaker) ?? 0) + 1);
-    }
+export interface DeepgramAlternative {
+  transcript?: string;
+  words?: DeepgramWord[];
+}
+
+/**
+ * 1つの Results メッセージから発行すべき `TranscriptEvent` を組み立てる。
+ * `SttAdapter.onTranscript` は1メッセージにつき何回でも呼べるので、
+ * 話者が変われば複数返す。型もプロトコルも変わらない。
+ *
+ * **interim は分割しない。** `public/app.js` の interim 表示ハンドラは受け取った text で
+ * 上書きするので、2件送ると前半の話者ぶんが後半に消される。interim の `speaker` は
+ * クライアントで読まれていないため `undefined` でよい。
+ *
+ * `text` が空なら何も返さない（従来の `if (text.length > 0)` と同じ扱い）。
+ *
+ * export しているのは tests/transcript-events.test.ts から検証するため。
+ */
+export function buildTranscriptEvents(
+  alt: DeepgramAlternative | undefined,
+  isFinal: boolean,
+): TranscriptEvent[] {
+  const text = alt?.transcript ?? "";
+  if (text.length === 0) return [];
+  const words = toTranscriptWords(alt?.words);
+  if (!isFinal) {
+    return [{ text, isFinal: false, speaker: undefined, words }];
   }
-  let best: number | undefined;
-  let bestCount = 0;
-  for (const [speaker, count] of counts) {
-    if (count > bestCount) {
-      best = speaker;
-      bestCount = count;
-    }
-  }
-  return best;
+  return buildFinalEvents(text, words);
 }
 
 /**
@@ -92,7 +104,9 @@ export class DeepgramSttAdapter implements SttAdapter {
       diarize: "true",
       // 既定値は 10ms で、わずかな間でも確定してしまい文の途中で切れる。
       // 300ms にすると自然な文単位でまとまり、smart_format の句読点も付きやすくなる。
-      // 長くしすぎると 1 セグメントに複数話者が入り、話者判定(多数決)が鈍るため上げすぎない。
+      // 長くしすぎると 1 セグメントに複数話者が入る。word の speaker で分割するので
+      // 多数派に潰されることはなくなったが、代わりに話者番号の揺れが細切れとして出る。
+      // 上げるほどその機会が増える点は変わらない。
       endpointing: "300",
     });
     // nova-3 系は keyterm(日本語対応・最大約100語)、nova-2 以前は keywords でブースト
@@ -124,16 +138,12 @@ export class DeepgramSttAdapter implements SttAdapter {
         try {
           const msg = JSON.parse(data.toString());
           if (msg.type === "Results") {
-            const alt = msg.channel?.alternatives?.[0];
-            const text: string = alt?.transcript ?? "";
-            if (text.length > 0) {
-              this.transcriptCb?.({
-                text,
-                isFinal: msg.is_final === true,
-                speaker: dominantSpeaker(alt?.words),
-                words: toTranscriptWords(alt?.words),
-              });
-            }
+            const events = buildTranscriptEvents(
+              msg.channel?.alternatives?.[0],
+              msg.is_final === true,
+            );
+            // 1セグメント内で話者が変われば複数件になる。コールバックはその回数ぶん呼ぶ
+            for (const e of events) this.transcriptCb?.(e);
           }
         } catch {
           // JSON以外のフレームは無視

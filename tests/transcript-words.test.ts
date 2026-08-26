@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { dominantSpeaker, toTranscriptWords, type DeepgramWord } from "../src/stt/deepgram.js";
+import { toTranscriptWords, type DeepgramWord } from "../src/stt/deepgram.js";
 
 interface WordsCase {
   id: string;
@@ -89,16 +89,3 @@ test("toTranscriptWords: 入力を書き換えない", () => {
   toTranscriptWords(input);
   assert.deepEqual(input, snapshot);
 });
-
-/**
- * AC「既存のinterim/final表示を壊さない」の担保。
- * words を保持するようになっても、話者番号の決め方（多数決）は一切変わっていないこと。
- * 全フィールドを持つ words と、speaker だけを抜き出した words で結果が一致することを見る。
- */
-for (const c of cases) {
-  test(`dominantSpeaker: words を保持しても結果が変わらない — ${c.id}`, () => {
-    const speakerOnly = c.words.map((w) => ({ speaker: w.speaker }));
-    assert.equal(dominantSpeaker(c.words), c.expect ?? undefined);
-    assert.equal(dominantSpeaker(speakerOnly), c.expect ?? undefined);
-  });
-}

@@ -1,0 +1,64 @@
+[
+  {
+    "id": "single-speaker",
+    "speakers": [0, 0, 0, 0],
+    "expect": [{ "speaker": 0, "count": 4 }]
+  },
+  {
+    "id": "backchannel-at-end",
+    "speakers": [0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
+    "expect": [
+      { "speaker": 0, "count": 8 },
+      { "speaker": 1, "count": 2 }
+    ]
+  },
+  {
+    "id": "unknown-in-middle",
+    "speakers": [0, 0, null, 0, 1],
+    "expect": [
+      { "speaker": 0, "count": 4 },
+      { "speaker": 1, "count": 1 }
+    ]
+  },
+  {
+    "id": "unknown-before-boundary",
+    "speakers": [0, null, 1],
+    "expect": [
+      { "speaker": 0, "count": 2 },
+      { "speaker": 1, "count": 1 }
+    ]
+  },
+  {
+    "id": "unknown-at-head",
+    "speakers": [null, null, 0, 0],
+    "expect": [{ "speaker": 0, "count": 4 }]
+  },
+  {
+    "id": "unknown-at-head-then-boundary",
+    "speakers": [null, 0, null, 1],
+    "expect": [
+      { "speaker": 0, "count": 3 },
+      { "speaker": 1, "count": 1 }
+    ]
+  },
+  {
+    "id": "all-unknown",
+    "speakers": [null, null],
+    "expect": [{ "speaker": null, "count": 2 }]
+  },
+  {
+    "id": "empty",
+    "speakers": [],
+    "expect": []
+  },
+  {
+    "id": "alternating",
+    "speakers": [0, 1, 0, 1],
+    "expect": [
+      { "speaker": 0, "count": 1 },
+      { "speaker": 1, "count": 1 },
+      { "speaker": 0, "count": 1 },
+      { "speaker": 1, "count": 1 }
+    ]
+  }
+]

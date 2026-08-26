@@ -1,5 +1,6 @@
 import type { SttAdapter, TranscriptEvent, TranscriptWord } from "./types.js";
 import { MOCK_SCRIPT, type MockLine } from "./mock-script.js";
+import { buildFinalEvents } from "./split.js";
 
 /**
  * 発話速度（文字/秒）。日本語の自然な会話速度。
@@ -181,7 +182,10 @@ export class MockSttAdapter implements SttAdapter {
         }
         this.timer = setTimeout(tick, MOCK_STEP_MS);
       } else {
-        this.transcriptCb?.({ text, isFinal: true, speaker, words });
+        // final は実アダプタと同じ分割規則を通す。mock は1行1話者なので常に1セグメントで、
+        // `text` は素通しされる（＝分割導入前と完全に同じイベントが出る）。
+        // それでもここを通すのは、単一話者ケースの退行を mock 経由でも検出するため。
+        for (const e of buildFinalEvents(text, words)) this.transcriptCb?.(e);
         // 行の発話ぶん＋行間の無音を経過時間に足してから次の行へ
         this.streamOffsetSec = roundSec(
           this.streamOffsetSec + text.length / MOCK_CHARS_PER_SECOND + MOCK_LINE_GAP_SEC,
