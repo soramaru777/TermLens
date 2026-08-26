@@ -8,7 +8,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-26
+updated: 2026-08-27
 ---
 
 # TermLens の課題と次の優先順位
@@ -43,7 +43,7 @@ updated: 2026-08-26
 >   それまでは `dominantSpeaker()` の多数決）、`normalizeTerm()` の表記ゆれ吸収、エラー分類
 >   （恒久／一時）と利用者向け文言、`stripInlineCitations()` の除去範囲、ローパス FIR の
 >   振幅応答（通過域・阻止域・直流ゲイン・線形位相）。ここは CI が毎回回す
-> - **測れるようになった（オプトイン）** — 用語抽出そのものの精度。合成11ケースで
+> - **測れるようになった（オプトイン）** — 用語抽出そのものの精度。合成13ケースで
 >   Recall / 正しい補正率 / 誤補正率 / unresolved 率 / カード Precision を出す。
 >   `RUN_LLM_EVAL=1` のときだけ動く（実 API 課金と非決定性を CI に持ち込まないため）
 > - **依然として測れない① CER / WER** — 文字誤り率・単語誤り率を出すには正解トランスクリプト
@@ -67,6 +67,19 @@ updated: 2026-08-26
 > 発話は 3 秒のタイムアウトで閉じられ、**切れ目が会話の内容と無関係に決まる**。
 > 公式ドキュメントは背景ノイズで `speech_final` が来なくなる失敗モードを明記しており、
 > 会議室の用途では例外ではなく想定内。まずログに出して届くかを確かめる必要がある。
+
+> 2026-08-27 追記: **Issue #22 で直前の会話を抽出の文脈に渡したが、効果も副作用も未実測。**
+> 狙いは語義判定の材料を増やすことだが、**文脈に引きずられた誤補正が増える**方向にも効きうる。
+> 同じ fixture を `EVAL_NO_CONTEXT=1` の有無で2回回せば Recall・正しい補正率・誤補正率・
+> Precision を比較できる仕組みまでは入れた（[[termlens-testing]]）が、実 API 課金が伴うため
+> **まだ回していない**。あわせて入力トークンが1回あたり最大 1,100 トークンほど増えるので、
+> カード表示のレイテンシが #21 の実測（最悪13秒）から悪化していないかも実機確認が要る。
+>
+> **AC「過去文脈の用語を再カード化しない」は CI では検出できない。** `surfaceForms` の出所は
+> `filterSurfaceForms()` で決定的に担保したが、こちらを支えているのはプロンプト規則9と既存の
+> `shownTerms` だけで、検出手段は課金を伴う `context-no-recard` ケースしかない。
+> サーバー側で機械的に落とす案（`surfaceForms` が空のカードを捨てる等）は、
+> 「クバネテス」→ `Kubernetes` のような正当な補正カードを巻き添えにするので採らなかった。
 
 > 2026-08-13 解決: **Docker ビルド**。Fly のリモートビルド（`fly deploy --remote-only`）で成功し、colima 不要になった。デプロイ完了。
 

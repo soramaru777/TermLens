@@ -9,7 +9,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-architecture]], [[termlens-stt-pipeline]], [[termlens-open-issues]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-26
+updated: 2026-08-27
 ---
 
 # TermLens 用語抽出と解説カード生成
@@ -59,6 +59,74 @@ updated: 2026-08-26
 1発話が最大 500 字まとまってから渡るので、**LLM 呼び出しは従来より粗く・回数は少なくなる**
 （1回あたりのトークンは増える）。実際にどう振れるかは #18 の評価基盤で測る。
 
+## 直前の会話を文脈として渡す
+
+> 2026-08-27 追加（Issue #22、案A）。
+
+`run()` はバッファを**丸ごと**持っていって空にするため、**チャンク間に文脈の持ち越しが
+一切なかった**。短いチャンクだけでは語義や固有名詞の候補を絞れず、前後関係が無いまま
+誤補正する原因になる。
+
+抽出器の入力を役割で2つに分けた（`ExtractorInput`）。
+
+| フィールド | 役割 |
+|---|---|
+| `newTranscript` | 今回**カード化・`surfaceForms` 抽出の対象** |
+| `contextTranscript` | 語義判定にだけ使う直前の会話。**カード化の対象ではない** |
+
+user ターンは「**直前の会話 → 表示済み用語リスト → 新しい文字起こし**」の順に組む
+（判断対象を末尾＝直近に置く。空なら「(なし)」）。`ROLE_PROMPT` の**規則9**が
+「直前の会話にしか登場しない用語は出力しない」を担当する。
+
+**system プロンプトはセッション中バイト不変のまま**。可変部分は従来どおり user 側にしか
+無いので、OpenAI のプレフィックスキャッシュへの影響はない。
+
+### 上限は「秒」ではなく文字数
+
+`ContextWindow`（`src/extract/context.ts`。**依存ゼロで保つ** — `normalize.ts` `split.ts`
+`utterance.ts` と同じ理由）が抽出済みチャンクを `MAX_CONTEXT_CHARS` = **1,500字**まで保持する。
+
+Issue は「直前30〜60秒 または 1000〜2000文字」としていたが、**抽出側にタイムスタンプが無い**。
+`Utterance` は `{ text, speaker }` だけで、時刻を通すには `UtteranceBuilder` → `Session` →
+`Scheduler` の3層に手を入れることになる。既存の `MAX_BUFFER_CHARS`（2,000字）と同じ考え方の
+文字数上限で始め、必要になってから時間軸を足す。
+
+- **古いチャンクから丸ごと捨てる**。チャンクの切れ目は発話の終わり（#21）なので境界を保てる
+- 1チャンク単独で上限を超えるときだけ `slice(-1500)` で頭を削る（`MAX_BUFFER_CHARS` と同じ割り切り）
+- 連結は `" "` 区切り。`appendToBuffer()` と揃えてある
+
+増えるのは**入力トークンだけ**（1,500字の日本語 ≒ 1,100トークン）。新しい API 呼び出しは無い。
+
+### 積むのは抽出に**成功した後**だけ
+
+一時エラーではチャンクを `appendToBuffer(chunk, true)` でバッファ先頭に戻す。先に積むと、
+**戻ってきたチャンクが次回 `contextTranscript` と `newTranscript` の両方に現れる**。
+`tests/scheduler-context.test.ts` はこの回帰が本題。
+
+恒久エラーの `disableExtraction()` では `context.clear()` も呼ぶ（バッファを捨てるのと同じ理由。
+抽出が止まった後に古い文脈を抱え続ける意味がない）。
+
+デデュープ（`shownSet` / `shownTerms`）には手を入れていない。
+
+### `surfaceForms` は抽出器側で絞る
+
+`filterSurfaceForms()` が、返ってきた `surfaceForms` を **`newTranscript` に実在する表記だけ**に
+絞る（`newTranscript.includes(form)`）。規則7で指示はしていたが**サーバー側の検証が無く**、
+文脈を渡し始めると「直前の会話に出てきただけの表記」が混ざりうる。
+
+- 置き場所は `extractor.ts` の `extract()` 内で、**`scheduler.ts` ではない**。評価ハーネス
+  （`src/eval/run.ts`）は `createExtractor()` を直接呼ぶので、スケジューラに置くと
+  **評価が本番と違う挙動を測る**ことになる
+- **カード自体は落とさない。** `surfaceForms` が空になってもカードは残す（ハイライトが効かない
+  だけで `public/app.js` は `?? []` で受けている）。LLM が表記を出し渋っただけで正しい新規用語を
+  捨てるほうが害が大きい
+- 純関数として export してあるので、**LLM を呼ばずに決定的テストで固定できる**
+
+### 今回やらなかったこと
+
+- `enrichCard(term, chunk)`（清書時の文脈）への `contextTranscript` 追加 — AC に無く、効果が読めない
+- 時間軸での上限 — 上記のとおり3層改修になる
+
 ## 清書対象の絞り込み
 
 コスト制御のため、**LLM が判定したレア度の上位およそ半数だけ**を清書対象にし、1用語あたりの検索は最大1回（`max_uses: 1`）に制限している。
@@ -92,4 +160,4 @@ STT 段階の keyterm ブーストと役割分担しており、**事前に用�
 
 ## UI 連携
 
-抽出結果には `surfaceForms`（会話中に現れうる表記ゆれ）が含まれ、`public/app.js` が文字起こし本文中の該当箇所をオレンジ太字にする。タップすると該当カードへスクロールする。
+抽出結果には `surfaceForms`（会話中に現れうる表記ゆれ）が含まれ、`public/app.js` が文字起こし本文中の該当箇所をオレンジ太字にする。タップすると該当カードへスクロールする。本文に無い表記は当たらないか誤爆するだけなので、サーバー側で `filterSurfaceForms()` が絞ってから送る（上記）。

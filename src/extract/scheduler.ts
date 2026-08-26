@@ -7,6 +7,7 @@ import {
   RateLimitError,
 } from "openai";
 import type { TermCard, TermLink } from "../protocol.js";
+import { ContextWindow } from "./context.js";
 import { createExtractor } from "./extractor.js";
 import { enrichTerm } from "./enrich.js";
 import { normalizeTerm } from "./normalize.js";
@@ -80,11 +81,16 @@ export function toUserMessage(err: unknown): string {
 }
 
 /**
- * final transcript を蓄積し、「120文字以上」または「前回呼び出しから20秒経過かつ非空」で
+ * 発話を蓄積し、「120文字以上」または「前回呼び出しから10秒経過かつ非空」で
  * LLM抽出を発火する。呼び出しは直列化し、既出用語はサーバー側でもデデュープする。
+ *
+ * 抽出済みのチャンクは `ContextWindow` に直近1,500字ぶんだけ残し、次回の
+ * `contextTranscript` として渡す(#22)。語義の判断材料であって、カード化の対象ではない。
  */
 export class ExtractionScheduler {
   private buffer = "";
+  /** 抽出に成功したチャンクの直近ぶん。次回の LLM 呼び出しに文脈として渡す */
+  private context = new ContextWindow();
   private lastRunAt = Date.now();
   private running = false;
   private stopped = false;
@@ -166,6 +172,8 @@ export class ExtractionScheduler {
   private disableExtraction(): void {
     this.disabled = true;
     this.buffer = "";
+    // 抽出が止まった後に古い文脈を抱え続ける意味がない(バッファを捨てるのと同じ理由)
+    this.context.clear();
     clearInterval(this.timer);
   }
 
@@ -188,9 +196,14 @@ export class ExtractionScheduler {
     try {
       const cards = await this.extract({
         newTranscript: chunk,
+        // chunk 自身は含まない。「直前まで」の会話だけを語義の参考にさせる
+        contextTranscript: this.context.text(),
         shownTerms: this.shownTerms.slice(-SHOWN_TERMS_LIMIT),
       });
       this.consecutiveFailures = 0;
+      // **成功後にだけ積む。** 一時エラーでは chunk をバッファ先頭に戻すので、
+      // 先に積むと戻ったチャンクが次回 contextTranscript と newTranscript の両方に現れる。
+      this.context.push(chunk);
 
       const fresh = cards.filter((c) => {
         const key = normalizeTerm(c.term);

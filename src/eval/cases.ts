@@ -13,6 +13,11 @@ export const TermCaseSchema = z.object({
   id: z.string().min(1),
   /** 抽出器に渡す「新しい文字起こし」 */
   transcript: z.string().min(1),
+  /**
+   * 抽出器に渡す「直前の会話」（#22）。語義の判断材料であって、カード化の対象ではない。
+   * `EVAL_NO_CONTEXT=1` で空にして流せば、同じケースで文脈あり/なしを比較できる。
+   */
+  context: z.string().default(""),
   /** 会議の用語集（Deepgram のブーストと LLM の system プロンプトに入る想定） */
   glossary: z.array(z.string()).default([]),
   /** 既に表示済みとして抽出器に渡す用語。デデュープ（規則2）の検証に使う */
