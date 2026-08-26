@@ -120,7 +120,20 @@ export class ExtractionScheduler {
     this.timer = setInterval(() => this.maybeRun(), CHECK_INTERVAL_MS);
   }
 
-  addFinal(text: string): void {
+  /**
+   * 発話1つぶんのテキストを受け取る。
+   *
+   * **呼び出し側は「完成した発話」の単位で渡すこと**（`UtteranceBuilder` が組み立てる）。
+   *
+   * `run()` はバッファ全部を持っていくので、**チャンクの切れ目は常に「最後に append した
+   * テキストの末尾」**になる（120 文字は切断位置ではなく発火の閾値）。
+   * ここが STT の `is_final` をそのまま受けていた頃は、その末尾が認識区間の区切り＝
+   * 発話の途中でありえた。渡す単位を発話にすると末尾が必ず発話の終わりになる。
+   * `maybeRun()` の発火条件そのものは変えていない。
+   *
+   * 例外は `MAX_BUFFER_CHARS` の切り捨て（`slice`）で、ここだけは発話の途中で切る。
+   */
+  addUtterance(text: string): void {
     if (this.stopped || this.disabled) return;
     this.appendToBuffer(text);
     this.maybeRun();

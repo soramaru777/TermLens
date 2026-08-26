@@ -29,6 +29,16 @@ export interface TranscriptEvent {
    * 詳細は docs/wiki/termlens-stt-pipeline.md）。
    */
   words?: TranscriptWord[];
+  /**
+   * Deepgram の `speech_final`。無音検出（`endpointing`）による発話終端。
+   *
+   * interim では立たない。1つの Results を話者で複数に分割した場合、
+   * **立つのは最後のセグメントだけ**（発話終端は「その Results の終わり」であって
+   * 「各セグメントの終わり」ではないため）。
+   *
+   * `words` と同じくサーバー内部で使うもので、`ServerMessage.transcript` には載せない。
+   */
+  speechFinal?: boolean;
 }
 
 export interface SttAdapter {
@@ -37,6 +47,16 @@ export interface SttAdapter {
   sendAudio(chunk: Buffer): void;
   stop(): Promise<void>;
   onTranscript(cb: (e: TranscriptEvent) => void): void;
+  /**
+   * 発話終端の補助シグナル（Deepgram の `UtteranceEnd`）。
+   *
+   * **テキストを持たない**ため `onTranscript` とは別経路にしてある。
+   * `TranscriptEvent` で表そうとすると `text: ""` を流すことになり、
+   * 「空の transcript は送らない」という既存の不変条件と衝突する。
+   *
+   * 相当する仕組みを持たないアダプタは空実装でよい（mock がそうしている）。
+   */
+  onUtteranceEnd(cb: () => void): void;
   onError(cb: (err: Error) => void): void;
   onClose(cb: () => void): void;
 }

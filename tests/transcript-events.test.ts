@@ -84,3 +84,34 @@ test("buildTranscriptEvents: interim は分割せず speaker は undefined", () 
   // words は従来どおり載せる（サーバー内部で使う）
   assert.equal(events[0].words?.length, 4);
 });
+
+/**
+ * `speechFinal` を全件に立てると、話者分割した各セグメントごとに UtteranceBuilder が
+ * 発話を閉じてしまい、分割と結合が噛み合わない。立つのは最後の1件だけ。
+ */
+test("buildTranscriptEvents: speechFinal は最後の1件にだけ立つ", () => {
+  const events = buildTranscriptEvents(altFrom("w0w1w2", [0, 0, 1]), true, true);
+  assert.deepEqual(
+    events.map((e) => e.speechFinal),
+    [undefined, true],
+  );
+});
+
+test("buildTranscriptEvents: 単一話者なら speechFinal はその1件に立つ", () => {
+  const events = buildTranscriptEvents(altFrom("そのまま", [0, 0]), true, true);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].speechFinal, true);
+});
+
+test("buildTranscriptEvents: speechFinal を渡さなければ立たない", () => {
+  const events = buildTranscriptEvents(altFrom("w0w1", [0, 1]), true);
+  assert.deepEqual(
+    events.map((e) => e.speechFinal),
+    [undefined, undefined],
+  );
+});
+
+test("buildTranscriptEvents: interim には speechFinal を立てない", () => {
+  const events = buildTranscriptEvents(altFrom("途中", [0]), false, true);
+  assert.equal(events[0].speechFinal, undefined);
+});
