@@ -6,6 +6,7 @@ import { APIError } from "openai";
 import { UNRESOLVED_DESCRIPTION } from "../src/extract/extractor.js";
 import type { ExtractedCard } from "../src/extract/schema.js";
 import { card, candidate, settle, utterance } from "./helpers/cards.js";
+import { verifyOutput } from "./helpers/verify.js";
 import { ExtractionScheduler, selectVerifyTargets } from "../src/extract/scheduler.js";
 import type { TermCard, TermLink, TermStatus } from "../src/protocol.js";
 
@@ -99,6 +100,8 @@ interface Harness {
   emitted: TermCard[][];
   updates: Array<{ term: string; status: TermStatus; description: string; links: TermLink[] }>;
   warnings: string[];
+  /** `onError` で利用者へ届いた通知（メッセージと permanent の対） */
+  errors: Array<{ message: string; permanent: boolean | undefined }>;
   /** `responses.create` に渡った入力（清書1回につき1件） */
   verifyInputs: string[];
   /** 次回以降の検証を失敗させる（null で解除） */
@@ -113,12 +116,22 @@ function apiError(status: number): APIError {
   return APIError.generate(status, { error: { message: "test" } }, undefined, new Headers());
 }
 
-/** `chosen` を決めるモック。入力に含まれる用語で分岐させ、並列でも取り違えない。 */
-function harness(t: TestContext, decide: (input: string) => string | null): Harness {
+/**
+ * `chosen` を決めるモック。入力に含まれる用語で分岐させ、並列でも取り違えない。
+ *
+ * `glossary` はスケジューラのコンストラクタへ渡す用語集（#25）。既定は空で、
+ * 「関連語だけが検証側へ渡る」ことを見るテストだけ指定する。
+ */
+function harness(
+  t: TestContext,
+  decide: (input: string) => string | null,
+  glossary: string[] = [],
+): Harness {
   const emitted: TermCard[][] = [];
   const updates: Array<{ term: string; status: TermStatus; description: string; links: TermLink[] }> =
     [];
   const warnings: string[] = [];
+  const errors: Array<{ message: string; permanent: boolean | undefined }> = [];
   const verifyInputs: string[] = [];
   const extractInputs: ExtractorInput[] = [];
   let impl: ExtractFn = async () => [];
@@ -129,9 +142,13 @@ function harness(t: TestContext, decide: (input: string) => string | null): Harn
     const input = String((body as unknown as { input: string }).input);
     verifyInputs.push(input);
     if (verifyError) throw verifyError;
+    const chosen = decide(input);
     return {
-      output_text: JSON.stringify({
-        chosen: decide(input),
+      // 棄却は「実在するが文脈に合わない」側で返す（#25）。`chosen` と矛盾しない組に
+      // しておかないと `normalizeVerification()` が倒すので、テストの意図が濁る
+      output_text: verifyOutput({
+        verification: { exists: true, fitsContext: chosen !== null, evidence: "テストの根拠" },
+        chosen,
         reason: "テストの判定",
         description: "検証後の解説。",
       }),
@@ -146,12 +163,12 @@ function harness(t: TestContext, decide: (input: string) => string | null): Harn
     warnSpy.mock.restore();
   });
 
-  const scheduler = new ExtractionScheduler([], {
+  const scheduler = new ExtractionScheduler(glossary, {
     onCards: (c) => emitted.push(c),
     onCardUpdate: (term, status, description, links) =>
       updates.push({ term, status, description, links }),
     onExtracting: () => {},
-    onError: () => {},
+    onError: (message, permanent) => errors.push({ message, permanent }),
   });
   t.after(() => scheduler.stop());
   (scheduler as unknown as { extract: ExtractFn }).extract = (input) => {
@@ -161,6 +178,7 @@ function harness(t: TestContext, decide: (input: string) => string | null): Harn
 
   return {
     emitted,
+    errors,
     updates,
     warnings,
     verifyInputs,
@@ -226,6 +244,29 @@ test("裏付けが取れたら card_update で差し替え、status は confirme
   );
 });
 
+/**
+ * 用語集が検証段まで届く配線（#25、AC2）。
+ *
+ * **届かないと関連語は常に空になり、絞り込みのテストが「何も渡していない」ことを
+ * 確かめるだけの空回りになる**（#22 で踏んだ「単体では正しい部品が、配線だけ抜けても
+ * 誰も気づかない」の再来）。同時に、**参加者名が web 検索へ乗らない**ことも本番の経路で見る。
+ *
+ * 関連語は「候補と語として一致したもの」なので候補の表記と重なる。配線が抜けたことは
+ * **節が `(なし)` に落ちる**ことで判別する。
+ */
+test("用語集は関連語だけが検証段へ渡る（参加者名は渡らない）", async (t) => {
+  const h = harness(t, () => "Qdrant", ["Qdrant Cloud", "山田太郎", "株式会社テスト工業"]);
+  await h.send(utterance("A"), [card("Qdrant", { correctedFrom: "クドラント" })]);
+
+  assert.equal(h.verifyInputs.length, 1);
+  const hints = h.verifyInputs[0]!.split("# 用語集の関連語")[1]!.split("#")[0]!;
+  assert.ok(hints.includes("Qdrant"), "候補と一致した用語集の語が届く");
+  assert.ok(!hints.includes("(なし)"), "配線が抜けると節が (なし) に落ちる");
+  assert.ok(!h.verifyInputs[0]!.includes("山田太郎"), "参加者名は web 検索へ送らない");
+  assert.ok(!h.verifyInputs[0]!.includes("株式会社テスト工業"), "社名も送らない");
+  assert.ok(!h.verifyInputs[0]!.includes("Cloud"), "当たった語以外は同じ行にあっても渡さない");
+});
+
 test("棄却は status: unresolved として届き、term と reason だけを記録する", async (t) => {
   const chunk = utterance("A");
   const h = harness(t, () => null);
@@ -251,6 +292,10 @@ test("棄却は status: unresolved として届き、term と reason だけを�
   assert.equal(h.warnings.length, 1);
   assert.ok(h.warnings[0]!.includes("クーベルタン"), "term は記録する");
   assert.ok(h.warnings[0]!.includes("テストの判定"), "reason も記録する");
+  // **棄却の内訳も記録する**（#25）。「実在しなかった」のか「実在するが会議の話では
+  // なかった」のかが本番ログでも読めないと、過剰 unresolved の原因分析ができない
+  assert.ok(h.warnings[0]!.includes("文脈に合わず"), "棄却の理由を記録する");
+  assert.ok(!h.warnings[0]!.includes("テストの根拠"), "evidence は出さない（自由文を増やさない）");
   assert.ok(!h.warnings[0]!.includes(chunk), "文字起こし本文はログに出さない");
 });
 
@@ -275,6 +320,13 @@ test("候補#2 が選ばれても term は改名しない（protocol に経路�
       links: [],
     },
   ], "term は変えず、status を unresolved にして見出しを surface form へ降ろす");
+
+  // **差し替えは棄却ではない。** ログの分岐が `!isVerified()` なのでここも通るが、
+  // 一律に棄却として扱うと `rejection` が null のまま `(理由なし)` と出る
+  // ——「実在: あり / 文脈整合: あり なのに棄却」と同じ形の自己矛盾した行になる。
+  assert.equal(h.warnings.length, 1);
+  assert.ok(h.warnings[0]!.includes("別候補"), "何が起きたのかを正しく書く");
+  assert.ok(!h.warnings[0]!.includes("理由なし"), "棄却の内訳を差し替えに流用しない");
   assert.equal(h.warnings.length, 1);
   assert.ok(h.warnings[0]!.includes("クアドラント"));
 });
@@ -324,6 +376,13 @@ test("検証を打ち切った後のカードは willEnrich: false で送る", a
     "打ち切り後は更新を送らないので、確認中の表示も出さない",
   );
   assert.equal(h.verifyInputs.length, 1, "2枚目は検証にも回さない");
+
+  // **打ち切りは利用者へ知らせる**（#25 のレビュー指摘）。抽出は `disableExtraction()` が
+  // 通知するのに検証だけ無言だと、以降ずっと未検証のカードが出続けることを誰も知れない。
+  // 確認中の表示すら出ないので、画面からは正常時と区別がつかない。
+  assert.equal(h.errors.length, 1, "検証を打ち切ったことを通知する");
+  assert.ok(h.errors[0]!.message.includes("検証を停止"), "何が止まったのかを伝える");
+  assert.equal(h.errors[0]!.permanent, undefined, "抽出は生きているので permanent は立てない");
 });
 
 /**

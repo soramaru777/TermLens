@@ -12,6 +12,10 @@ import type { TermCard, TermLink, TermStatus } from "../protocol.js";
 import { ContextWindow } from "./context.js";
 import { createExtractor, UNRESOLVED_DESCRIPTION } from "./extractor.js";
 import { isVerified, verifyAndEnrich } from "./enrich.js";
+// 見出しは `enrich.js` 経由で取らない。あちらは読み込みだけで `new OpenAI()` を
+// 評価するので、輸入経路が2本あると片方が API キーを要求する(`normalize.js` と同じ扱い)
+import { REJECTION_LABEL } from "./rejection.js";
+import { buildGlossaryIndex, type GlossaryIndex, relatedGlossary } from "./glossary.js";
 import { normalizeTerm } from "./normalize.js";
 import type { ExtractedCard } from "./schema.js";
 
@@ -199,6 +203,13 @@ export class ExtractionScheduler {
   private shownSet = new Set<string>();
   private timer: NodeJS.Timeout;
   private extract: ReturnType<typeof createExtractor>;
+  /**
+   * 用語集を語に割った索引(#25)。**セッションの間ずっと変わらないので1度だけ作る。**
+   *
+   * 生の配列は `createExtractor()` に渡したら要らない。索引が語の表記を持つので、
+   * 検証段へ渡す関連語はここから引ける。会議が終われば scheduler ごと落ちる。
+   */
+  private readonly glossaryIndex: GlossaryIndex;
 
   constructor(
     glossary: string[],
@@ -224,6 +235,7 @@ export class ExtractionScheduler {
     shownTerms: string[] = [],
   ) {
     this.extract = createExtractor(glossary);
+    this.glossaryIndex = buildGlossaryIndex(glossary);
     for (const term of shownTerms.slice(-SHOWN_TERMS_LIMIT)) {
       const key = normalizeTerm(term);
       if (this.shownSet.has(key)) continue;
@@ -381,12 +393,30 @@ export class ExtractionScheduler {
         candidates: card.candidates,
         correctedFrom: card.correctedFrom,
         context,
+        // **絞り込んでから渡す**(#25)。用語集は参加者名・社名を含み、web 検索は
+        // 外部サービスへの送信にあたる。`verifyAndEnrich()` の口が絞り込み済みの
+        // `glossaryHints` しか受けないので、ここを素通しにはできない
+        glossaryHints: relatedGlossary(this.glossaryIndex, card.candidates),
       });
       const verified = isVerified(card.term, result.chosen);
       if (!verified) {
-        // 棄却。出すのは term と reason だけで、**文字起こし本文は出さない**
-        // (既存の `console.error("[scheduler] extraction failed:", err)` と同じ扱い)。
-        console.warn(`[scheduler] verification rejected "${card.term}": ${result.reason}`);
+        // 棄却。出すのは term と**棄却の理由の内訳**(#25)だけで、**文字起こし本文は
+        // 出さない**(既存の `console.error("[scheduler] extraction failed:", err)` と
+        // 同じ扱い)。内訳を出すのは、棄却が「実在しなかった」のか「実在するが会議の話では
+        // なかった」のかが本番ログでも読めるようにするため(評価ハーネスの `VerifyTally` と対)。
+        //
+        // **`reason` も `evidence` もモデルが書く自由文で、どちらも文脈を引き写しうる。**
+        // `reason` を出しているのは #23 からの既存の扱いで、棄却の追跡にはこれが要る。
+        // `evidence` を足さないのは、同じ危険を負う自由文をもう1本増やす価値が
+        // 内訳(定型)を出せる今は無いから。区別は「安全か否か」ではなく本数の問題。
+        // **ここは棄却だけの分岐ではない。** `isVerified()` は候補#2 が選ばれた
+        // 「差し替え」でも false を返す。そのとき `rejection` は null なので、
+        // 一律に棄却として扱うと **`(理由なし)` という自己矛盾した行**が本番ログに載る。
+        const why =
+          result.chosen === null
+            ? REJECTION_LABEL[result.rejection ?? "unspecified"]
+            : `別候補「${result.chosen}」が選ばれた`;
+        console.warn(`[scheduler] verification not verified "${card.term}" (${why}): ` + result.reason);
       }
       // **棄却でも更新は必ず届ける。** 速報は `willEnrich: true` で送ってあり、クライアントは
       // `card_update` が来るまで「確認中」の表示を消さない(`public/app.js`)。ここで黙ると
@@ -416,6 +446,12 @@ export class ExtractionScheduler {
       if (isPermanent(err)) {
         this.verifyDisabled = true;
         console.error(`[scheduler] verification disabled after "${card.term}":`, err);
+        // **黙って止めない。** 抽出は `disableExtraction()` が `onError` で知らせるのに
+        // 検証だけ無言だと、利用者からは「未検証のカードが出続けている」ことが
+        // 区別できない(`willEnrich` が false になるので確認中の表示すら出ない)。
+        // 1枚目で踏めば以降のカードは全部未検証になるので、影響はセッション全体に及ぶ。
+        // 抽出は生きているので `permanent` は立てない — カードは出続ける。
+        this.callbacks.onError(`用語の検証を停止しました。${toUserMessage(err)}`);
       } else {
         console.error(`[scheduler] enrich failed for "${card.term}":`, err);
       }
