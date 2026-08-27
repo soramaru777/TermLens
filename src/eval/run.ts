@@ -3,6 +3,8 @@ import { pathToFileURL } from "node:url";
 // config.js は dotenv を読むだけ（OpenAI クライアントは作らない）。
 // レポートに実際のモデル名を残すために import する。
 import { config as appConfig } from "../config.js";
+// 型だけ。schema.js は zod しか読まないので OpenAI クライアントは評価されない。
+import type { ExtractedCard } from "../extract/schema.js";
 import { loadCases, type TermCase } from "./cases.js";
 import {
   aggregate,
@@ -68,6 +70,22 @@ export const EVAL_DEFAULTS = {
   concurrency: 4,
   /** ケースの `context` を抽出器に渡すか。`EVAL_NO_CONTEXT=1` で false にして比較する */
   useContext: true,
+  /**
+   * Stage 2（検証つき清書）まで通すか。`EVAL_WITH_VERIFY=1` で true にする（#23）。
+   *
+   * 既定は false。ハーネスは `createExtractor()` を直接呼ぶので、そのままでは
+   * **Stage 1 しか測らない**。2モードに分けてあるのは切り分けのためで、
+   * 「候補列挙のプロンプト変更」と「検証そのもの」は別々に悪化しうる。
+   * 有効にすると web 検索を伴うので**遅く高い**。
+   */
+  withVerify: false,
+  /**
+   * 検証の判定を評価側で適用するか。`EVAL_ALLOW_RENAME=1` で true（#23）。
+   *
+   * 既定 false は**本番と同じ**（改名の経路が無いので Stage 2 は term ベースの指標を
+   * 動かさない）。true は「改名できたらどうなるか」の探索用で、合否の根拠にはしない。
+   */
+  allowRename: false,
   minRecall: 0.8,
   maxMiscorrection: 0.05,
   minPrecision: 0.6,
@@ -77,6 +95,8 @@ export interface EvalConfig {
   runs: number;
   concurrency: number;
   useContext: boolean;
+  withVerify: boolean;
+  allowRename: boolean;
   minRecall: number;
   maxMiscorrection: number;
   minPrecision: number;
@@ -87,6 +107,8 @@ export function resolveConfig(overrides: Partial<EvalConfig> = {}): EvalConfig {
     runs: positiveIntEnv("EVAL_RUNS", EVAL_DEFAULTS.runs),
     concurrency: positiveIntEnv("EVAL_CONCURRENCY", EVAL_DEFAULTS.concurrency),
     useContext: EVAL_DEFAULTS.useContext && !flagEnv("EVAL_NO_CONTEXT"),
+    withVerify: flagEnv("EVAL_WITH_VERIFY") || EVAL_DEFAULTS.withVerify,
+    allowRename: flagEnv("EVAL_ALLOW_RENAME") || EVAL_DEFAULTS.allowRename,
     minRecall: numEnv("EVAL_MIN_RECALL", EVAL_DEFAULTS.minRecall),
     maxMiscorrection: numEnv("EVAL_MAX_MISCORRECTION", EVAL_DEFAULTS.maxMiscorrection),
     minPrecision: numEnv("EVAL_MIN_PRECISION", EVAL_DEFAULTS.minPrecision),
@@ -125,6 +147,8 @@ export interface EvalReport {
    * （測れなかったぶんが指標に反映されないため、通してしまうと過大評価になる）。
    */
   jobErrors: JobError[];
+  /** 検証（EVAL_WITH_VERIFY=1）の内訳。無効時は undefined */
+  verifyTally?: VerifyTally;
   failures: Failure[];
   pass: boolean;
 }
@@ -142,6 +166,89 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
   });
   await Promise.all(workers);
   return results;
+}
+
+type Verifier = (cards: ExtractedCard[], context: string) => Promise<ExtractedCard[]>;
+
+/** 検証が何をしたかの内訳。指標だけ見ても過剰棄却か正しい修正かが分からないため別に数える */
+export interface VerifyTally {
+  /** 検証にかけたカード数 */
+  checked: number;
+  /** どの候補も裏付けが取れず落としたカード数 */
+  rejected: number;
+  /** 検証が別候補へ差し替えたカード数 */
+  replaced: number;
+  /** 検証の呼び出し自体が失敗し、判断保留にしたカード数 */
+  failed: number;
+}
+
+/**
+ * 1ケース内で同時に走らせる検証の数。
+ *
+ * カード同士は独立なので直列にする理由が無い。実効の同時実行数は
+ * `config.concurrency`(既定4) × この値になるので、429 を踏まない範囲で小さく取る。
+ */
+const VERIFY_CONCURRENCY = 2;
+
+/**
+ * Stage 2（検証つき清書）を評価に通すための関数を組み立てる（#23）。
+ *
+ * 選定は本番と同じ `selectVerifyTargets()` を使う。ここにコピーを置くと、
+ * 本番の選定条件を変えたときに**評価だけ古い条件のまま緑になる**。
+ *
+ * **既定はカード集合を一切変えない（本番と同じ）。** 本番の `card_update` は `term` で
+ * カードを突き合わせるので改名の経路が無く、棄却しても速報カードはそのまま残る。
+ * つまり**現行の protocol では Stage 2 は term ベースの指標を動かさない**。評価だけ
+ * 差し替え・棄却を適用すると、本番なら `miscorrections` に数えられるカードが
+ * `correctionHit` に化け、**合否ゲート(`maxMiscorrection`)が本番より甘い側にずれる**。
+ * 検証が何をしたかは `VerifyTally` に出るので、判断材料はそちらで読む。
+ *
+ * `EVAL_ALLOW_RENAME=1` で「改名できたらどうなるか」の探索モードになる。別候補が
+ * 選ばれたら差し替え、裏付けがまったく取れなければ落とす。**この数値は本番の挙動では
+ * ないので、合否の根拠にはしないこと。** 読むときは誤補正率と正しい補正率を必ず
+ * セットで見る（何も補正しなくなれば誤補正率は 0 になる）。Precision の分母は用語数なので、
+ * カードを落とすほど見かけの Precision も上がる。
+ */
+async function createVerifier(allowRename: boolean): Promise<{
+  verify: Verifier;
+  tally: VerifyTally;
+}> {
+  // enrich.js / scheduler.js は import しただけで `new OpenAI()` を評価する。
+  // 既定モードでは読み込まないよう、createExtractor と同じく動的 import にする。
+  const { isVerified, verifyAndEnrich } = await import("../extract/enrich.js");
+  const { selectVerifyTargets } = await import("../extract/scheduler.js");
+  const tally: VerifyTally = { checked: 0, rejected: 0, replaced: 0, failed: 0 };
+
+  const verify: Verifier = async (cards, context) => {
+    const targets = selectVerifyTargets(cards);
+    const verified = await mapLimit(cards, VERIFY_CONCURRENCY, async (card) => {
+      if (!targets.has(card.term)) return card;
+      tally.checked += 1;
+      try {
+        const result = await verifyAndEnrich({
+          candidates: card.candidates,
+          correctedFrom: card.correctedFrom,
+          context,
+        });
+        if (isVerified(card.term, result.chosen)) return card;
+        if (result.chosen !== null) {
+          tally.replaced += 1;
+          return allowRename ? { ...card, term: result.chosen } : card;
+        }
+        tally.rejected += 1;
+        return allowRename ? null : card;
+      } catch (err) {
+        // 抽出の課金は済んでいる。1カードの検証失敗でそのケース1試行を丸ごと捨てない
+        // （このファイルの「1本の 429/500 で 30本ぶんの課金を捨てない」と同じ方針）。
+        // 判断がつかなかったので現状維持に倒す。
+        tally.failed += 1;
+        console.error(`[eval] verify failed for "${card.term}":`, err);
+        return card;
+      }
+    });
+    return verified.filter((c): c is ExtractedCard => c !== null);
+  };
+  return { verify, tally };
 }
 
 export async function runEval(
@@ -168,17 +275,22 @@ export async function runEval(
   const { createExtractor } = await import("../extract/extractor.js");
   // 用語集はケースごとに違うので抽出器もケースごとに作る（本番と同じく system は不変）
   const extractors = new Map(cases.map((c) => [c.id, createExtractor(c.glossary)]));
+  const verifier = config.withVerify ? await createVerifier(config.allowRename) : undefined;
 
   const jobErrors: JobError[] = [];
   const results = await mapLimit(jobs, config.concurrency, async (job) => {
     try {
       const extract = extractors.get(job.case.id)!;
-      const cards = (await extract({
+      const extracted = await extract({
         newTranscript: job.case.transcript,
         // 同じ fixture で文脈あり/なしを比較するため、無効化は空文字で表現する（#22）
         contextTranscript: config.useContext ? job.case.context : "",
         shownTerms: job.case.shownTerms,
-      })) as EvaluatedCard[];
+      });
+      // 本番の清書は「今回のチャンク」を文脈に渡す。評価では transcript がそれに当たる
+      const cards = (
+        verifier ? await verifier.verify(extracted, job.case.transcript) : extracted
+      ) as EvaluatedCard[];
       return scoreCase(job.case, cards, job.run);
     } catch (err) {
       // 1本の 429/500 で 30本ぶんの課金を捨てない。失敗は記録して集計は続ける。
@@ -236,6 +348,7 @@ export async function runEval(
     perCase,
     overall,
     jobErrors,
+    verifyTally: verifier?.tally,
     failures,
     // 失敗ジョブがあると測れなかったぶんが指標に出ない。不完全な結果は PASS にしない。
     pass: failures.length === 0 && jobErrors.length === 0,
@@ -245,6 +358,16 @@ export async function runEval(
 const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
 
 /** コンソール向けの表。等幅前提で桁を揃える。 */
+function formatVerifyTally(report: EvalReport): string {
+  const t = report.verifyTally;
+  if (!t) return "なし";
+  const mode = report.config.allowRename ? "改名あり(探索)" : "本番と同じ";
+  return (
+    `${t.checked}件を確認 / 棄却 ${t.rejected} / 差し替え ${t.replaced} / ` +
+    `失敗 ${t.failed}  適用: ${mode}`
+  );
+}
+
 export function formatTable(report: EvalReport): string {
   const headers = ["ケース", "Recall", "補正", "誤補正", "unresolved", "Precision"];
   const rows = report.perCase.map((p) => [
@@ -274,11 +397,16 @@ export function formatTable(report: EvalReport): string {
 
   const out = [
     `モデル: ${report.model}  試行: ${report.config.runs}回/ケース  ` +
-      `文脈: ${report.config.useContext ? "あり" : "なし"}  開始: ${report.startedAt}`,
+      `文脈: ${report.config.useContext ? "あり" : "なし"}  ` +
+      `開始: ${report.startedAt}`,
     `ジョブ: ${report.scores.length}/${report.totalJobs} 成功` +
       (report.jobErrors.length > 0
         ? `  ⚠ ${report.jobErrors.length}件が失敗しています（下の数字は成功したぶんだけの集計です）`
         : ""),
+    // 内訳を出さないと、下の指標が「検証が効いた結果」なのか「単に棄却しただけ」なのか
+    // 読めない。既定では棄却も差し替えも指標に反映されない（本番と同じ）ので、
+    // Stage 2 が何をしたかはこの行だけが伝える。
+    `検証: ${formatVerifyTally(report)}`,
     "",
     line(headers),
     cols.map((w) => "-".repeat(w)).join("  "),

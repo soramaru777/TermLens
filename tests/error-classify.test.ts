@@ -11,7 +11,13 @@ import {
   RateLimitError,
   UnprocessableEntityError,
 } from "openai";
-import { isPermanent, isQuotaExhausted, toUserMessage } from "../src/extract/scheduler.js";
+import { LengthFinishReasonError } from "openai/error";
+import {
+  isPermanent,
+  isQuotaExhausted,
+  isUnretryableChunk,
+  toUserMessage,
+} from "../src/extract/scheduler.js";
 
 /**
  * SDK が実際に投げるのと同じ形のエラーを合成する。
@@ -162,4 +168,28 @@ test("恒久エラーだけがバッファを捨てる側に分類される", ()
   for (const status of transientStatuses) {
     assert.equal(isPermanent(apiError(status, { message: "x" })), false, `${status} は一時のはず`);
   }
+});
+
+/**
+ * 出力長超過は「恒久」でも「一時」でもない第3の分類（#23）。
+ *
+ * 一時エラーに落ちると**同じ長さのチャンクを戻して再送し続ける**（確実に同じ所で切れる）。
+ * かといって恒久エラーにすると会議中ずっと抽出が止まる。捨てるのはそのチャンクだけでよい。
+ */
+test("出力長超過はチャンク固有として分類される", () => {
+  const lengthErr = new LengthFinishReasonError();
+  assert.equal(isUnretryableChunk(lengthErr), true);
+  // **ここが要点** — SDK 上は `APIError` ではないので既存の分類には引っかからない
+  assert.equal(isPermanent(lengthErr), false, "恒久にすると抽出が丸ごと止まる");
+});
+
+test("通常の API エラーはチャンク固有ではない", () => {
+  for (const status of [400, 429, 500]) {
+    assert.equal(
+      isUnretryableChunk(apiError(status, { message: "x" })),
+      false,
+      `${status} は既存の恒久/一時の分類で扱う`,
+    );
+  }
+  assert.equal(isUnretryableChunk(new Error("boom")), false);
 });
