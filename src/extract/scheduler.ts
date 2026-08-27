@@ -136,14 +136,18 @@ export function selectVerifyTargets<
   const ranked = [...targetable].sort(
     (a, b) =>
       rarityRank[b.rarity] - rarityRank[a.rarity] ||
-      (a.status === "probable" ? -1 : 0) - (b.status === "probable" ? -1 : 0),
+      (a.status !== "confirmed" ? -1 : 0) - (b.status !== "confirmed" ? -1 : 0),
   );
-  // 分母は元のカード数のまま。unresolved が多い回に枠まで縮むと、検証すべき
-  // probable が漏れる
-  const targets = new Set(ranked.slice(0, Math.ceil(cards.length / 2)).map((c) => c.term));
-  // 誤補正が疑わしいカードはレア度に関係なく必ず検証する
+  // **分母は `targetable` の枚数。** 元のカード数のままにすると、`unresolved` が多い回ほど
+  // 枠が余り、検証する意味のない confirmed カードまで web 検索に回る(枠が
+  // `targetable.length` を超えると全部入る)。「並べ替えは対象を狭く保つためにある」という
+  // 上の方針と逆向きになる。`probable` は下のループが無条件に足すので枠が縮んでも漏れない。
+  const targets = new Set(ranked.slice(0, Math.ceil(targetable.length / 2)).map((c) => c.term));
+  // 誤補正が疑わしいカードはレア度に関係なく必ず検証する。
+  // `!== "confirmed"` と書くのは、将来 status が増えたときに黙って対象から漏れないため
+  // (`targetable` の時点で unresolved は除いてあるので、いまは probable と同義)。
   for (const card of targetable) {
-    if (card.correctedFrom !== null || card.status === "probable") targets.add(card.term);
+    if (card.correctedFrom !== null || card.status !== "confirmed") targets.add(card.term);
   }
   return targets;
 }

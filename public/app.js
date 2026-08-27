@@ -692,8 +692,8 @@ function addCard(card) {
   // 「確認中」は清書前(links が空)かつ willEnrich のときだけに限定する。
   //
   // **unresolved はリンクを一切出さない(#24)。** どの用語か特定できていない以上、
-  // 関連リンクは「別の用語の資料」になりかねない。検証には回る(`selectVerifyTargets`)が
-  // 昇格の経路が無いので、「確認中」を見せても畳まれるだけで意味がない。
+  // 関連リンクは「別の用語の資料」になりかねない。そもそも検証にも回さないので
+  // (`selectVerifyTargets` が除く)、「確認中」を見せても更新は来ない。
   if (cardStatus(card) !== "unresolved") {
     const linksEl = el("div", "links");
     div.append(linksEl);

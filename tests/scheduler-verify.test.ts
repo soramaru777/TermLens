@@ -76,7 +76,9 @@ test("unresolved はレア度上位の枠も食わない", () => {
     card("D", { rarity: "common" }),
   ];
   const targets = selectVerifyTargets(cards);
-  assert.deepEqual([...targets].sort(), ["C", "D"], "unresolved を除いた中から枠を埋める");
+  // 枠の分母は targetable の枚数（2）なので ceil(2/2) = 1。元のカード数（4）を分母に
+  // すると枠が2つ余り、検証する意味のない confirmed まで入る
+  assert.deepEqual([...targets].sort(), ["C"], "unresolved を除いた中から枠を埋める");
 });
 
 test("補正なし・confirmed のカードは対象外になりうる", () => {
