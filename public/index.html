@@ -34,6 +34,12 @@
     </div>
 
     <footer class="home-footer">
+      <!-- 収音モードはホームに常時出す。設定画面を開かないと分からないと、
+           前回スピーカー収音で使った設定のまま対面会議を始めてしまう(#26) -->
+      <button id="capture-mode-row" class="row-link">
+        <span>収音モード</span>
+        <span class="row-value"><span id="capture-mode-current"></span> ›</span>
+      </button>
       <button id="glossary-row" class="row-link">
         <span>用語集</span>
         <span class="row-value"><span id="glossary-count">0語</span> ›</span>
@@ -58,6 +64,12 @@
       <textarea id="glossary" rows="10" placeholder="例)&#10;田中太郎&#10;Kubernetes&#10;RAG"></textarea>
       <p class="hint">参加者名・社名・専門用語を入れると、音声認識の段階で精度が上がります。</p>
 
+      <label for="capture-mode">収音モード</label>
+      <!-- 選択肢は capture-mode.js の CAPTURE_MODES から app.js が組み立てる
+           (ここに文言を書き写すと定義が2箇所になる) -->
+      <select id="capture-mode"></select>
+      <p id="capture-mode-hint" class="hint"></p>
+
       <label class="checkbox-row"><input id="persist-toggle" type="checkbox"> 会議の内容をこの端末に保存する</label>
       <p class="hint">音声は保存されません。保存から24時間で自動的に削除されます。</p>
 
@@ -75,7 +87,15 @@
     <div id="export-row" hidden>
       <button id="dl-transcript" class="export-btn">⬇ 文字起こし.md</button>
       <button id="dl-terms" class="export-btn">⬇ 用語カード.md</button>
+      <!-- 診断は独立したファイルにする。実機比較の結果を共有するときに、
+           会話本文を含むファイルを渡さずに済むため(#26) -->
+      <button id="dl-diagnostics" class="export-btn">⬇ 収音診断.md</button>
     </div>
+    <!-- 収音診断(#26)。既定は畳んでおき、会議中の表示を邪魔しない -->
+    <details id="diag-panel" hidden>
+      <summary id="diag-summary">収音診断</summary>
+      <table id="diag-table"></table>
+    </details>
     <div id="transcript" aria-label="文字起こし">
       <div id="final-text"></div>
       <div id="interim-text"></div>

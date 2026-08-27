@@ -18,6 +18,24 @@ import {
   escMd,
   isHttpUrl,
 } from "./terms-markdown.js";
+// 収音モードの constraints は capture-mode.js が唯一の定義箇所(#26)。
+// ここに constraints をベタ書きすると、既定モードを固定しているテストが空振りする。
+import {
+  CAPTURE_MODES,
+  audioConstraints,
+  captureModeHint,
+  captureModeLabel,
+  normalizeCaptureMode,
+} from "./capture-mode.js";
+// 診断の整形も純関数側(diagnostics.js)。getSettings() の採用リストもそこにある。
+import {
+  audioStatRows,
+  buildDiagnosticsMarkdown,
+  emptyAudioStats,
+  mergeAudioStats,
+  pickTrackSettings,
+  trackSettingRows,
+} from "./diagnostics.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -50,6 +68,13 @@ const restoreBanner = $("restore-banner");
 const restoreInfo = $("restore-info");
 const restoreBtn = $("restore-btn");
 const discardBtn = $("discard-btn");
+const captureModeSelect = $("capture-mode");
+const captureModeHintEl = $("capture-mode-hint");
+const captureModeRow = $("capture-mode-row");
+const captureModeCurrent = $("capture-mode-current");
+const dlDiagnosticsBtn = $("dl-diagnostics");
+const diagPanel = $("diag-panel");
+const diagTable = $("diag-table");
 
 let ws = null;
 let audioContext = null;
@@ -63,6 +88,19 @@ let captureActive = false; // マイク/Wake Lock を保持している区間か
 // 「戻る」の破棄警告に使う。片方だけ保存して戻ると、もう片方が失われるため別々に持つ
 let savedTranscript = false;
 let savedTerms = false;
+/**
+ * 収音診断(#26)。**マイクを開いた区間でだけ非 null。**
+ *
+ * `{ mode, trackSettings, contextSampleRate, stats }` の4つは同じライフタイムを持つ
+ * (同時に決まり、同時に捨てる)。別々の変数にすると「全部そろっているか」が代入の順序と
+ * コメントで守られることになり、項目を足すたびに宣言・リセット・代入・描画・書き出しの
+ * 5箇所を機械的に直す羽目になる。1本なら初期化は `diag = null` の1行で済む。
+ *
+ * `trackSettings` は `pickTrackSettings()` を通した後の値だけを持つ。生の
+ * `getSettings()` は保持しない — 端末識別子を握った変数を作らなければ、
+ * うっかり表示・保存する経路も作れない。
+ */
+let diag = null;
 let stopping = false; // 停止操作によるクローズか(意図しない切断と区別する)
 // 再接続: 指数バックオフ 1s, 2s, 4s, 8s, 16s の最大5回。
 // マイクは掴んだまま(releaseCapture を呼ばない)、送信だけ止めて待つ
@@ -88,11 +126,38 @@ const getGlossary = () =>
     .filter(Boolean);
 // 既定 ON。明示的に "false" が保存されている場合のみ OFF(要件5)
 const getPersistEnabled = () => localStorage.getItem("termlens.persist") !== "false";
+// 保存値は信頼境界の外なので必ず normalizeCaptureMode() を通す(未知の名前は既定に倒れる)
+const getCaptureMode = () => normalizeCaptureMode(localStorage.getItem("termlens.captureMode"));
 
 function refreshGlossaryCount() {
   glossaryCount.textContent = `${getGlossary().length}語`;
 }
 refreshGlossaryCount();
+
+// ---- 収音モード(#26) ----
+// 選択肢は CAPTURE_MODES から組み立てる。HTML に文言を書き写すと定義が2箇所になる
+for (const [value, mode] of Object.entries(CAPTURE_MODES)) {
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = mode.label;
+  captureModeSelect.append(option);
+}
+
+// ホーム画面に現在のモードを常時出す。設定画面を開かないと分からない状態にすると、
+// 前回スピーカー収音で使った設定のまま対面会議を始める事故が起きる
+function refreshCaptureMode() {
+  captureModeCurrent.textContent = captureModeLabel(getCaptureMode());
+}
+
+/** 設定画面の説明文を選択中のモードに合わせる */
+function syncCaptureHint() {
+  captureModeHintEl.textContent = captureModeHint(captureModeSelect.value);
+}
+refreshCaptureMode();
+
+captureModeSelect.addEventListener("change", () => {
+  syncCaptureHint();
+});
 
 // ---- サーバー情報 ----
 let serverInfo = null;
@@ -121,7 +186,10 @@ function showLive() {
 // 100dvh からヘッダ分を引いて決める。その実測値を CSS 変数に渡す。
 function measureLiveChrome() {
   const header = live.querySelector("header");
-  const h = (header?.offsetHeight ?? 52) + (exportRow.hidden ? 0 : exportRow.offsetHeight);
+  const h =
+    (header?.offsetHeight ?? 52) +
+    (exportRow.hidden ? 0 : exportRow.offsetHeight) +
+    (diagPanel.hidden ? 0 : diagPanel.offsetHeight);
   document.documentElement.style.setProperty("--live-chrome", `${h}px`);
 }
 function showHome() {
@@ -129,12 +197,15 @@ function showHome() {
   settings.hidden = true;
   home.hidden = false;
   refreshGlossaryCount();
+  refreshCaptureMode();
 }
 function showSettings() {
   // 入力欄は開くたびに保存値から復元する(「戻る」で破棄できるようにするため)
   tokenInput.value = getToken();
   glossaryInput.value = getGlossaryText();
   persistToggle.checked = getPersistEnabled();
+  captureModeSelect.value = getCaptureMode();
+  syncCaptureHint();
   home.hidden = true;
   live.hidden = true;
   settings.hidden = false;
@@ -152,12 +223,17 @@ function showError(message) {
 // ---- 設定画面 ----
 openSettingsBtn.addEventListener("click", () => showSettings());
 glossaryRow.addEventListener("click", () => showSettings());
+captureModeRow.addEventListener("click", () => showSettings());
 // 「戻る」は保存せずに破棄する
 closeSettingsBtn.addEventListener("click", () => showHome());
 saveSettingsBtn.addEventListener("click", () => {
   localStorage.setItem("termlens.token", tokenInput.value.trim());
   localStorage.setItem("termlens.glossary", glossaryInput.value);
   localStorage.setItem("termlens.persist", String(persistToggle.checked));
+  // 保存はそのまま。option は CAPTURE_MODES から自分で組み立てたもの(＝信頼境界の内側)で、
+  // ここで丸めても option 生成が壊れたときに黙って既定へ倒すだけになる。
+  // 境界は読み側の getCaptureMode() 1箇所に閉じる
+  localStorage.setItem("termlens.captureMode", captureModeSelect.value);
   // OFF にした時点で保存済みのものも消す。「ONに戻すまで一切残さない」を保証するため(要件5)。
   // 復元案内(pendingRestoreSession とバナー)も一緒に戻さないと、保存をOFFにしたのに
   // 案内からは復元できてしまう(L1)
@@ -224,6 +300,11 @@ function resetSessionState() {
   sessionEndedAt = null;
   exportRow.hidden = true;
   stopBtn.textContent = "停止";
+  // 診断は前回のセッションの値を持ち越さない。持ち越すと、比較のために
+  // モードを変えて撮り直した数値に前回ぶんが混ざる(#26)
+  diag = null;
+  diagPanel.hidden = true;
+  renderDiagnostics();
   // 前回セッションの再接続待ちが万一残っていたら止める(持ち越さない)
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
@@ -251,21 +332,25 @@ startBtn.addEventListener("click", async () => {
   try {
     // モックSTTモードでは音声不要なのでマイク取得をスキップ
     if (serverInfo?.sttProvider !== "mock") {
-      // iOS Safari: getUserMedia と AudioContext 生成はユーザージェスチャ内で行う必要がある
-      // 対面の会議で、離れた席の声まで拾うための設定。
-      // エコーキャンセルとノイズ抑制はブラウザ側で「近くの1人の声」を残す方向に働き、
-      // 会議室の遠い話者を環境音として削ってしまう。文字起こしでは欠落の原因になるため切る。
-      // 自動ゲインは距離差による音量差を均すので残す。
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
+      // iOS Safari: getUserMedia と AudioContext 生成はユーザージェスチャ内で行う必要がある。
+      // constraints はモードごとに capture-mode.js が持つ(既定=対面会議の値は #26 以前と同一)。
+      // このセッションで使うモードはここで固定する。以降は会議中に設定が変わっても影響しない
+      const mode = getCaptureMode();
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints(mode) });
+      // ブラウザ/端末が実際に適用した設定。**採用リストを通した値だけを持つ** —
+      // 生の getSettings() には端末ごとに安定した識別子が含まれる(diagnostics.js を参照)
+      const trackSettings = pickTrackSettings(mediaStream.getAudioTracks()[0]?.getSettings?.());
       // sampleRate は指定しない(iOSでは無視/失敗するため)。実測値からWorkletでダウンサンプルする
       audioContext = new AudioContext();
+      // **マイクも AudioContext も開けてから一度に作る。** 途中で代入していくと、
+      // 許可拒否や addModule 失敗で catch へ抜けたときに「一部だけ埋まった診断」が残り、
+      // 「マイクを開いた区間でだけ真」という hasDiagnostics() の意味が壊れる
+      diag = {
+        mode,
+        trackSettings,
+        contextSampleRate: audioContext.sampleRate,
+        stats: emptyAudioStats(),
+      };
       await audioContext.resume();
       await audioContext.audioWorklet.addModule("/audio-processor.js");
 
@@ -275,14 +360,30 @@ startBtn.addEventListener("click", async () => {
           targetSampleRate: TARGET_SAMPLE_RATE,
         },
       });
+      // Worklet は同じポートで**音声(ArrayBuffer)と入力統計(プレーンオブジェクト)**の
+      // 2種類を送ってくる。判別しないと統計オブジェクトが音声ストリームに混ざって
+      // そのまま Deepgram へ送られる(#26)。型で分岐する
+      // 種類は名前で分ける(理由は audio-processor.js の postMessage 側)
       workletNode.port.onmessage = (e) => {
-        if (sendAudio && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount < 1_000_000) {
-          ws.send(e.data);
+        switch (e.data?.type) {
+          case "audio":
+            if (sendAudio && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount < 1_000_000) {
+              ws.send(e.data.buf);
+            }
+            return;
+          case "stats":
+            if (diag) diag.stats = mergeAudioStats(diag.stats, e.data.stats);
+            renderDiagnostics();
+            return;
+          default:
+            return;
         }
       };
       const source = audioContext.createMediaStreamSource(mediaStream);
       source.connect(workletNode);
       // 出力には繋がない(モニタ不要)
+      diagPanel.hidden = false;
+      renderDiagnostics();
     }
 
     sessionStartedAt = new Date();
@@ -801,6 +902,53 @@ function buildTranscriptMarkdown() {
   return out.join("\n");
 }
 
+// ---- 収音診断(#26) ----
+// 画面の表と Markdown が **同じ行データ**(diagnostics.js)から描く。ラベルを両方に
+// 書き写すと、項目を足したときに片方だけ増える。
+
+// 診断が1つでも出せる状態か。mock モードや復元経路ではマイクを開いていないので false
+const hasDiagnostics = () => diag !== null;
+
+function renderDiagnostics() {
+  // **畳んだままなら描かない。** 統計は毎秒届くが、既定で閉じている <details> の
+  // 中身を作り直しても誰も見ない(会議中ずっと捨てる仕事になる)。開いた瞬間に
+  // toggle から呼ぶので、表示される内容は変わらない
+  if (!diagPanel.open) return;
+  diagTable.textContent = "";
+  if (!hasDiagnostics()) return;
+  const rows = [
+    ["収音モード", captureModeLabel(diag.mode)],
+    ...trackSettingRows(diag.trackSettings, diag.contextSampleRate),
+    ...audioStatRows(diag.stats),
+  ];
+  for (const [label, value] of rows) {
+    const tr = el("tr");
+    tr.append(el("td", null, label), el("td", null, value));
+    diagTable.append(tr);
+  }
+}
+
+// パネルの開閉で高さが変わる。横並びレイアウトの --live-chrome を取り直す
+diagPanel.addEventListener("toggle", () => {
+  renderDiagnostics();
+  measureLiveChrome();
+});
+
+function buildDiagnosticsMd() {
+  const started = sessionStartedAt ?? new Date();
+  const ended = sessionEndedAt ?? new Date();
+  // 整形は diagnostics.js の純関数に任せる(テストから読めるようにするため)。
+  // trackSettings は既に採用リストを通してあるが、整形側でももう一度通る
+  return buildDiagnosticsMarkdown({
+    modeLabel: captureModeLabel(diag.mode),
+    startedAt: fmtDateTime(started),
+    elapsed: fmtElapsed(ended.getTime() - started.getTime()),
+    trackSettings: diag.trackSettings,
+    contextSampleRate: diag.contextSampleRate,
+    stats: diag.stats,
+  });
+}
+
 function buildTermsMarkdown() {
   // 整形は `terms-markdown.js` の純関数に任せる（テストから読めるようにするため）。
   // ここは画面の状態（開始時刻・カード順）を渡すだけ。
@@ -851,11 +999,19 @@ dlTermsBtn.addEventListener("click", async () => {
     discardWarned = false;
   }
 });
+// 診断は会話本文を含まないため、未保存警告(discardWarned)の対象にしない。
+// 対象にすると、診断を見ていない大多数のセッションでも「戻る」が毎回警告になり、
+// 本当に守りたい文字起こし・用語カードの警告まで無視されるようになる(#26)
+dlDiagnosticsBtn.addEventListener("click", async () => {
+  const stamp = fmtStamp(sessionStartedAt ?? new Date());
+  await saveMarkdown(`termlens-diagnostics-${stamp}.md`, buildDiagnosticsMd());
+});
 
 function showExport() {
   sessionEndedAt ??= new Date();
   dlTranscriptBtn.disabled = spokenLines().length === 0;
   dlTermsBtn.disabled = cardData.size === 0;
+  dlDiagnosticsBtn.disabled = !hasDiagnostics();
   exportRow.hidden = false;
   measureLiveChrome();
 }
@@ -1141,6 +1297,9 @@ async function cleanupAudio() {
   mediaStream = null;
   audioContext = null;
 
+  // ハンドラを先に外す。disconnect と ctx.close() の間にキュー済みの統計が届くと、
+  // 停止後の数十ms ぶんが診断に足される
+  if (node) node.port.onmessage = null;
   try { node?.disconnect(); } catch {}
   if (stream) {
     for (const track of stream.getTracks()) track.stop();
