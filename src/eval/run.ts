@@ -5,6 +5,8 @@ import { pathToFileURL } from "node:url";
 import { config as appConfig } from "../config.js";
 // 型だけ。schema.js は zod しか読まないので OpenAI クライアントは評価されない。
 import type { ExtractedCard } from "../extract/schema.js";
+// 依存ゼロのモジュール。`enrich.js` から取ると既定モードでも `new OpenAI()` が走る
+import { REJECTION_KINDS, REJECTION_LABEL, type RejectionKind } from "../extract/rejection.js";
 import { loadCases, type TermCase } from "./cases.js";
 import {
   aggregate,
@@ -133,6 +135,8 @@ export interface EvalReport {
   /** 前回結果との差分比較で「同じ条件か」を見分けるための情報 */
   startedAt: string;
   model: string;
+  /** そのランで実際に効いていた web 検索の上限(#25)。0 なら上限なし */
+  maxWebSearches: number;
   config: EvalConfig;
   /** 投入したジョブ数（ケース数 × 試行回数） */
   totalJobs: number;
@@ -168,18 +172,37 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
   return results;
 }
 
-type Verifier = (cards: ExtractedCard[], context: string) => Promise<ExtractedCard[]>;
+type Verifier = (
+  cards: ExtractedCard[],
+  context: string,
+  glossary: string[],
+) => Promise<ExtractedCard[]>;
 
 /** 検証が何をしたかの内訳。指標だけ見ても過剰棄却か正しい修正かが分からないため別に数える */
 export interface VerifyTally {
   /** 検証にかけたカード数 */
   checked: number;
-  /** どの候補も裏付けが取れず落としたカード数 */
-  rejected: number;
+  /**
+   * 棄却の内訳(#25)。**`rejected` の一本槍から理由別に割ったのが #25 の核心。**
+   *
+   * 合算したままだと「実在しない」と「実在するが会議の話ではない」が混ざり、
+   * **過剰 unresolved が諦めなのか正しい棄却なのかを読めない**（#24 で最大リスクと
+   * した問題の原因分析ができない）。合計を見たいときは値を足す。
+   *
+   * **`replaced` は含まない。** 別候補への差し替えも本番相当モードでは unresolved 降格
+   * ＝棄却の一種だが、原因が違う（候補の順位づけの問題）ので別に数える。
+   * 「棄却」の欄だけを読んで全体像だと思わないこと。
+   */
+  rejected: Record<RejectionKind, number>;
   /** 検証が別候補へ差し替えたカード数 */
   replaced: number;
   /** 検証の呼び出し自体が失敗し、判断保留にしたカード数 */
   failed: number;
+  /**
+   * web 検索の実行回数の合計(#25)。**`MAX_WEB_SEARCHES` の値を人が決めるための材料。**
+   * `checked` で割れば1カードあたりの平均になる。
+   */
+  searches: number;
 }
 
 /**
@@ -217,10 +240,22 @@ async function createVerifier(allowRename: boolean): Promise<{
   // 既定モードでは読み込まないよう、createExtractor と同じく動的 import にする。
   const { isVerified, verifyAndEnrich } = await import("../extract/enrich.js");
   const { selectVerifyTargets } = await import("../extract/scheduler.js");
-  const tally: VerifyTally = { checked: 0, rejected: 0, replaced: 0, failed: 0 };
+  const { buildGlossaryIndex, relatedGlossary } = await import("../extract/glossary.js");
+  const tally: VerifyTally = {
+    checked: 0,
+    rejected: Object.fromEntries(REJECTION_KINDS.map((k) => [k, 0])) as Record<
+      RejectionKind,
+      number
+    >,
+    replaced: 0,
+    failed: 0,
+    searches: 0,
+  };
 
-  const verify: Verifier = async (cards, context) => {
+  const verify: Verifier = async (cards, context, glossary) => {
     const targets = selectVerifyTargets(cards);
+    // **本番と同じく1ケースにつき1度だけ索引を作る**(`ExtractionScheduler` のフィールドと対)
+    const glossaryIndex = buildGlossaryIndex(glossary);
     const verified = await mapLimit(cards, VERIFY_CONCURRENCY, async (card) => {
       if (!targets.has(card.term)) return card;
       tally.checked += 1;
@@ -229,7 +264,11 @@ async function createVerifier(allowRename: boolean): Promise<{
           candidates: card.candidates,
           correctedFrom: card.correctedFrom,
           context,
+          // **用語集も本番と同じ経路で渡す**(#25)。渡さないと関連語が常に空になり、
+          // 評価だけ本番と違う入力を測る(`selectVerifyTargets()` を共有しているのと同じ理由)。
+          glossaryHints: relatedGlossary(glossaryIndex, card.candidates),
         });
+        tally.searches += result.searches;
         // **本番の Stage 2 は status を動かす(#24)。** 既定モードはカード集合を変えないが、
         // status だけは本番と同じに揃える。揃えないと `EVAL_WITH_VERIFY=1` の
         // probable / unresolved 列が Stage 1 の申告のままになり、検証の効果が数字に出ない。
@@ -242,7 +281,11 @@ async function createVerifier(allowRename: boolean): Promise<{
             ? { ...card, term: result.chosen }
             : { ...card, status: "unresolved" as const };
         }
-        tally.rejected += 1;
+        // **棄却は内訳に分けて数える**(#25)。理由は `verifyAndEnrich()` が
+        // `rejection` として返すものをそのまま使い、ここで `verification` から
+        // 推測し直さない。候補外の棄却はモデルが `exists: true, fitsContext: true` と
+        // 言ったまま起きるので、推測すると「文脈に合わない」に化ける。
+        tally.rejected[result.rejection ?? "unspecified"] += 1;
         return allowRename ? null : { ...card, status: "unresolved" as const };
       } catch (err) {
         // 抽出の課金は済んでいる。1カードの検証失敗でそのケース1試行を丸ごと捨てない
@@ -296,7 +339,9 @@ export async function runEval(
       });
       // 本番の清書は「今回のチャンク」を文脈に渡す。評価では transcript がそれに当たる
       const cards = (
-        verifier ? await verifier.verify(extracted, job.case.transcript) : extracted
+        verifier
+          ? await verifier.verify(extracted, job.case.transcript, job.case.glossary)
+          : extracted
       ) as EvaluatedCard[];
       return scoreCase(job.case, cards, job.run);
     } catch (err) {
@@ -349,6 +394,9 @@ export async function runEval(
     // 実際に叩いたモデル。process.env.LLM_MODEL だと未設定時に "(既定)" としか残らず、
     // 後日 config.ts の既定を変えたときに別モデルの結果が同じラベルで並んでしまう。
     model: appConfig.llmModel,
+    // 上限も**実効値**を残す(`model` と同じ理由)。`web検索 N回` の行は、
+    // そのランの上限がいくつだったか分からなければ読めない
+    maxWebSearches: appConfig.maxWebSearches,
     config,
     totalJobs: jobs.length,
     scores,
@@ -369,9 +417,21 @@ function formatVerifyTally(report: EvalReport): string {
   const t = report.verifyTally;
   if (!t) return "なし";
   const mode = report.config.allowRename ? "改名あり(探索)" : "本番と同じ";
+  // **棄却は必ず内訳つきで出す**(#25)。合計だけだと「実在しない」と「実在するが文脈に
+  // 合わない」が混ざり、過剰 unresolved が諦めなのか正しい棄却なのかを読めない。
+  const rejected = Object.values(t.rejected).reduce((a, b) => a + b, 0);
+  // 0 の理由まで並べると読みづらいので、出たものだけ内訳に出す
+  const breakdown = REJECTION_KINDS.filter((kind) => t.rejected[kind] > 0)
+    .map((kind) => `${REJECTION_LABEL[kind]} ${t.rejected[kind]}`)
+    .join(" / ");
+  // 平均検索回数は上限値を決めるための数字。0件確認のときは割らない
+  const perCard = t.checked > 0 ? (t.searches / t.checked).toFixed(1) : "-";
+  // **そのランの上限も一緒に出す。** 上限がいくつだったか分からない平均は読めない
+  const cap = report.maxWebSearches > 0 ? `上限${report.maxWebSearches}` : "上限なし";
   return (
-    `${t.checked}件を確認 / 棄却 ${t.rejected} / 差し替え ${t.replaced} / ` +
-    `失敗 ${t.failed}  適用: ${mode}`
+    `${t.checked}件を確認 / 棄却 ${rejected}${breakdown === "" ? "" : `(${breakdown})`} / ` +
+    `差し替え ${t.replaced} / 失敗 ${t.failed} / ` +
+    `web検索 ${t.searches}回(1件あたり ${perCard} / ${cap})  適用: ${mode}`
   );
 }
 

@@ -74,6 +74,7 @@ npm run dev            # http://localhost:8080
 | `STT_PROVIDER` | — | `deepgram` / `mock`(既定)。mockはキー・マイク不要のダミー会議再生 |
 | `LLM_MODEL` | — | 既定 `gpt-5.6-luna`(安価・高速)。`gpt-5.6-terra` / `gpt-5.6-sol` に切替可 |
 | `DEEPGRAM_MODEL` | — | 既定 `nova-3`(keyterm方式)。`nova-2`(keywords方式)に切替可 |
+| `MAX_WEB_SEARCHES` | — | 1カードの検証で許す web 検索の回数。既定 5、`0` で上限なし(計測用) |
 | `AUTH_TOKEN` | 公開時 | 共有アクセストークン。未設定なら認証なし(ローカル開発用) |
 | `PORT` | — | 既定 8080 |
 

@@ -74,8 +74,11 @@ import するために要る。
 | `card-status.test.ts` | `cardStatus()` / `cardHeading()`（`public/card-status.js`） | **後方互換** — `status` が無い旧カードを `confidence` から導出すること（`low` → `probable`、それ以外 `confirmed`）、`status` を `confidence` より優先すること（降格したカードが復元で戻らない）、どちらも無ければ `confirmed` に倒すこと。**`unresolved` の見出し**が `surfaceForms[0]` → `correctedFrom` → `term` の順に落ちること、`confirmed` / `probable` は `term` のままであること |
 | `app-wiring.test.ts` | `public/app.js` が `card-status.js` のガードを**実際に呼んでいる**こと | **ソース文字列を読む不格好なテスト**。純関数の中身は押さえてあっても「app.js がそれを使っている」ことは1本も守られておらず、**#24 のレビューで2度指摘された不具合そのものを書き戻しても全テストが緑のまま**だった（変異で確認）。`app.js` はモジュール評価時に `document` を触るので Node から import できず、jsdom はビルドレスの方針に対して重い。壊れやすいが**壊れたときに直すべきなのは呼び出し側**なので誤検知にならない。「本文を畳み込み後のカードから描く」は該当行が2箇所あるため**悪い形の不在**で判定する |
 | `candidates.test.ts` | `normalizeCandidates()`（`src/extract/extractor.ts`） | 上限（`MAX_CANDIDATES` = 3）で切ること、**先頭を差し込んだ後に切る**こと（先に切ると `term` 自身が枠から溢れる）、`term` を先頭へ移すこと、候補が空なら `term` 1件を補うこと、**先頭の表記を `card.term` に揃える**こと（不変条件 `candidates[0].term === term` を表記ゆれで条件付きにしない）、正規化キーが同じ候補を畳むこと、空・空白だけの候補を落とすこと、他フィールドと入力配列を変えないこと |
-| `verify-parse.test.ts` | `parseVerifyOutput()` / `isVerified()` / `buildVerifyInput()` / `verifyAndEnrich()` の配線（`src/extract/enrich.ts`） | **候補に無い用語を採らない**こと（採れると検証段が新しい誤補正を作れてしまう）、`chosen` が null/空文字なら棄却、`chosen` の表記ゆれを候補側の表記に揃えること、コードフェンス・前置き越しでも JSON を拾うこと、`description` の引用記法除去と120字クランプ、**解釈できない出力を例外にする**こと（握り潰すと検証が効いていないことに気づけない）、`isVerified()` が候補#2 の採用を裏付け無しとすること、**`tools`（web検索）と `text`（構造化出力）と `include`（検索結果の同梱）を同時に要求している**こと、**後ろに別のオブジェクトや `}` を含む後書きが続いても最初の1件だけを拾う**こと（末尾の `}` まで舐めると巻き込んでパースに失敗する）。`responses.create` だけ差し替えて実 API は叩かない |
-| `scheduler-verify.test.ts` | `selectVerifyTargets()` と検証つき清書の分岐（`src/extract/scheduler.ts`） | 補正あり・`status !== "confirmed"` はレア度が最下位でも検証対象になること（**レア度上位の枠を埋めた状態で確かめる**。枠が空いていると従来条件だけで通ってしまい、追加した条件を消しても落ちないテストになる）、**`unresolved` も対象に入ること**（`status === "probable"` と書くと黙って漏れる）、検証に回るカード数が選定と一致すること、`willEnrich` が選定と一致すること、補正なし `confirmed` は対象外になりうること、**`candidates` がクライアント向けカードに含まれない**こと（スプレッドで漏れる）、棄却時に **`status: "unresolved"` が `card_update` で届く**こと（#24 の肝。ここが `confirmed` のままだと裏付けの取れなかったカードが通常カードとして残る）、**裏付けが取れたら `confirmed` が届く**こと、解説は速報のまま・リンクは空であること（送らないと「確認中」の表示が畳まれず回り続ける）、速報カードは消さないこと、`console.warn` が `term` と `reason` だけを出し**文字起こし本文を含まない**こと、候補#2 が選ばれた場合も改名せず `unresolved` に降格すること |
+| `verify-parse.test.ts` | `parseVerifyOutput()` / `isVerified()` / `buildVerifyInput()` / `verifyAndEnrich()` の配線（`src/extract/enrich.ts`） | **候補に無い用語を採らない**こと（採れると検証段が新しい誤補正を作れてしまう）、`chosen` が null/空文字なら棄却、`chosen` の表記ゆれを候補側の表記に揃えること、コードフェンス・前置き越しでも JSON を拾うこと、`description` の引用記法除去と120字クランプ、**解釈できない出力を例外にする**こと（握り潰すと検証が効いていないことに気づけない）、`isVerified()` が候補#2 の採用を裏付け無しとすること、**`verification.exists` か `fitsContext` が false なら `chosen` を null に倒す**こと（#25。素通しにすると「実在が確認できていない用語」が `confirmed` で表示される）、整合が取れていれば `normalizeVerification()` が**オブジェクトごと素通し**すること、`verification` を欠いた応答を例外にすること（既定値で埋めると内訳が常に `exists: true` に化ける）、**用語集は関連語だけが入力に乗る**こと、`countWebSearches()` が web 検索の回数を数え**棄却でも返す**こと、**`max_tool_calls` がリクエストに乗り、soft cap より厳密に大きい**こと（AC5。落とすと上限が消え、同値だと API の打ち切りが soft cap より先に効く）、`searchLimit()` が上限なし（0 以下）で `max_tool_calls` を送らないこと（計測用の無検閲ベースライン）、**SYSTEM が「## 候補の検証」「## 解説の作成」の2節に分かれている**こと（AC4 の半分はプロンプトの見出しに載っているので、畳んでも型もテストも落ちない）、SYSTEM が soft cap と関連語の使い方を指示すること、**`tools`（web検索）と `text`（構造化出力）と `include`（検索結果の同梱）を同時に要求している**こと、**後ろに別のオブジェクトや `}` を含む後書きが続いても最初の1件だけを拾う**こと（末尾の `}` まで舐めると巻き込んでパースに失敗する）。`responses.create` だけ差し替えて実 API は叩かない |
+| `scheduler-verify.test.ts` | `selectVerifyTargets()` と検証つき清書の分岐（`src/extract/scheduler.ts`） | 補正あり・`status !== "confirmed"` はレア度が最下位でも検証対象になること（**レア度上位の枠を埋めた状態で確かめる**。枠が空いていると従来条件だけで通ってしまい、追加した条件を消しても落ちないテストになる）、**`unresolved` も対象に入ること**（`status === "probable"` と書くと黙って漏れる）、検証に回るカード数が選定と一致すること、`willEnrich` が選定と一致すること、補正なし `confirmed` は対象外になりうること、**`candidates` がクライアント向けカードに含まれない**こと（スプレッドで漏れる）、棄却時に **`status: "unresolved"` が `card_update` で届く**こと（#24 の肝。ここが `confirmed` のままだと裏付けの取れなかったカードが通常カードとして残る）、**裏付けが取れたら `confirmed` が届く**こと、解説は速報のまま・リンクは空であること（送らないと「確認中」の表示が畳まれず回り続ける）、速報カードは消さないこと、`console.warn` が `term` と `reason` だけを出し**文字起こし本文を含まない**こと、候補#2 が選ばれた場合も改名せず `unresolved` に降格すること、**用語集の関連語だけが検証段へ届き参加者名は届かない**こと（#25 の配線。届かないと関連語が常に空になり、絞り込みのテストが空回りになる。関連語は候補と重なるので、**配線が抜けたことは節が `(なし)` に落ちることで判別する**）、**候補#2 の差し替えを棄却として記録しない**こと（ログの分岐は `!isVerified()` なので差し替えも通る。一律に棄却扱いすると `rejection` が null のまま `(理由なし)` と出る）、`console.warn` が**棄却の理由**（`RejectionKind` の定型見出し）を出し `evidence` は出さないこと、**検証を打ち切ったら `onError` で利用者へ通知する**こと（無言だと以降ずっと未検証のカードが出続けることを誰も知れない）とそのとき `permanent` を立てないこと（抽出は生きている） |
+| `glossary.test.ts` | `relatedGlossary()` / `buildGlossaryIndex()`（`src/extract/glossary.ts`） | **何が外部へ出るか**（#25）。候補と関係のない語（**参加者名・社名を模した合成データ**）が1件も返らないこと、**短い候補がローマ字の氏名に当たらない**こと（`Go` → `Kengo Yamada` / `AI` → `Aiko Tanaka` / `SAS` → `Ken Sasaki`。レビューで見つかった穴の回帰）、**4文字以上でも語の一部には当たらない**こと（文字数の閾値では塞げない）、**候補の `term` でも社名の一部に当たらない**こと（読みを外しただけでは塞がっていなかった）、**当たった語だけを返す**こと（`Qdrant 担当 山田太郎` → `Qdrant`。2語でも巻き込まない）、区切り記号の無い複合語をスクリプト遷移で割ること（`Zoom株式会社` / camelCase）、全角の括弧・空白・ハイフンも区切りになること、**候補の `reading` は使わない**こと、空文字を落とすこと、`MAX_GLOSSARY_HINTS` で切ること、正規化キーが同じ語を畳むこと。**期待値には絞られる側の実データ形（ローマ字氏名）を必ず入れること** — 合成データが日本語の氏名だけだったせいで、10本あっても部分一致の穴を1本も検出できなかった |
+| `config-env.test.ts` | env ノブの検証（`src/config.ts`） | `MAX_WEB_SEARCHES` が整数でなければ**起動時に落ちる**こと（`2.5` が通ると `max_tool_calls: 4.5` になって API 側 400 → そのセッションの検証が丸ごと止まる）、空文字は未設定と同じ扱いになること、`0` が「上限なし」として通ること。`config.ts` は import した瞬間に検証するので別プロセスで確かめる |
+| `verify-tally.test.ts` | `VerifyTally` の集計と `formatTable`（`src/eval/run.ts`） | **人が判断するための数字**（#25）。棄却を `rejectedNotExist` / `rejectedOffContext` に**分けて**数えること（合算すると過剰 unresolved が諦めなのか正しい棄却なのか読めない）、web 検索回数を**棄却でも**合計すること（採用できたぶんだけ数えると分布が良い側へ偏る）、内訳と検索回数が `formatTable` に出ること。抽出の `chat.completions.parse` と検証の `responses.create` を両方差し替えて `runEval()` を本番と同じ経路で1周させる（実 API は叩かない） |
 | `scheduler-context.test.ts` | `ExtractionScheduler` の文脈保持（`src/extract/scheduler.ts`） | 成功したチャンクだけが次回の `contextTranscript` になること、**一時エラーのチャンクは積まれない**こと（回帰テストの本体。戻ってきたチャンクが文脈と新規の両方に出ない）、恒久エラーで文脈も捨てること、**既出用語のデデュープが壊れていない**こと。private の `extract` を差し替えて LLM を呼ばずに回す |
 | `normalize-term.test.ts` | `normalizeTerm()`（`src/extract/normalize.ts`） | NFKC・小文字化・空白除去で表記ゆれが同一キーに畳まれる／別語は衝突しない |
 | `error-classify.test.ts` | `isPermanent()` / `isQuotaExhausted()` / `toUserMessage()` | 400/401/403/404/422/429(quota) は恒久、408/409/429(rate)/5xx/接続エラーは一時。利用者向け文言 |
@@ -114,14 +117,26 @@ import するために要る。
 `src/extract/extractor.ts` と `enrich.ts` は **モジュール読み込み時に `new OpenAI()` を評価する**。
 API キーが無いとその場で例外になる。対策は2つ。
 
-1. **純粋な文字列関数を切り離す。** `normalizeTerm()` は依存ゼロの `src/extract/normalize.ts`
-   に置く。`scheduler.ts`（OpenAI を抱える）と同居させていたせいで、正規化を使いたいだけの
-   `normalize-term.test.ts` / `eval-metrics.test.ts` / `src/eval/metrics.ts` まで API キーを
-   要求していた。`scheduler.ts` は `normalize.ts` から import して使う（re-export はしない）。
+1. **純粋な文字列関数を切り離す。** `normalizeTerm()` / `splitWords()` は依存ゼロの
+   `src/extract/normalize.ts`、棄却理由の見出しは `src/extract/rejection.ts`、用語集の
+   絞り込みは `src/extract/glossary.ts` に置く。`scheduler.ts`（OpenAI を抱える）と
+   同居させていたせいで、正規化を使いたいだけの `normalize-term.test.ts` /
+   `eval-metrics.test.ts` / `src/eval/metrics.ts` まで API キーを要求していた。
+   **re-export はしない。** #25 で一度 `enrich.ts` が `REJECTION_LABEL` を re-export したが、
+   これは「`new OpenAI()` を引き込まずに読める」という切り出しの目的を打ち消す**保証が逆の
+   第2の輸入経路**になる（見出しだけ欲しいモジュールがそちらを真似ると、防いだはずの事故が
+   起きる）。消費側は依存ゼロのモジュールから直接 import する。
 2. **残りはランナーレベルで注入する。** `package.json` の test スクリプトが
    `tsx --test --import ./tests/helpers/openai-env.ts` でダミーキーを先回りさせる。
    ファイル先頭の import 順に依存しないので、将来 import ソート（Prettier organize-imports、
    eslint `import/order`）を入れても壊れない。
+
+**テスト用のファクトリは `tests/helpers/` に集約する。** カードは `cards.ts` の `card()` /
+`candidate()`、検証段の応答は `verify.ts` の `verifyOutput()` / `VERIFIED`。散らすと
+スキーマに1フィールド足すたびに全部を機械的に直すことになり、しかも応答モックは
+`JSON.stringify` を通るので**型検査が効かない** — 直し漏れると「モックだけ古いスキーマを
+返し続け、テストは緑のまま実装とズレる」という一番気づきにくい形で出る（#25 で実際に
+3ファイルを直す羽目になった）。
 
 `extractor.ts` の `client` と `enrich.ts` の `client` は **どちらも export してある**。
 `chat.completions.parse` / `responses.create` だけを差し替えれば、実 API を叩かずに
@@ -291,6 +306,29 @@ EVAL_NO_CONTEXT=1 npm run eval:llm -- --out /tmp/without-context.json
 
 > **誤補正率だけを見ると過剰棄却を見逃す。** 何も補正しなくなれば誤補正率は 0 になる。
 > `expectCorrection`（正しい補正率）と**必ずセットで**読むこと。リスクとしてはここが最大。
+
+> 2026-08-27 追記（#25）: **`VerifyTally` に「棄却の内訳」と「web 検索回数」が増えた。**
+> `formatTable` の検証行はこう読む。
+>
+> ```
+> 検証: 12件を確認 / 棄却 5(実在せず 2 / 文脈に合わず 3) / 差し替え 1 / 失敗 0 / web検索 31回(1件あたり 2.6)  適用: 本番と同じ
+> ```
+>
+> - **棄却の内訳** — 「そんな用語は実在しなかった」と「実在するが、この会議の話ではなかった」。
+>   合算したままだと**過剰 unresolved が諦めなのか正しい棄却なのかを読めない**（#24 の最大
+>   リスクの原因分析ができない）。`unresolved` 率が上がったとき、内訳が「実在せず」に寄って
+>   いれば抽出段の候補が悪く、「文脈に合わず」に寄っていれば文脈か絞り込みを疑う
+> - **web 検索回数** — `MAX_WEB_SEARCHES` の値を**人が決めるための材料**。用語集も本番と同じく
+>   `relatedGlossary()` を通して渡している（渡さないと評価だけ本番と違う入力を測る）。
+>   分布を測るランは **`MAX_WEB_SEARCHES=0`** で回すこと — 上限を入れたまま測ると、
+>   上限値を決めるための分布を上限が壊す
+> - **棄却の内訳** — 理由別（`RejectionKind`）。`verification` から導き直すと、
+>   候補外の棄却が「文脈に合わない」に化ける
+> - **実効の上限値** — レポートの `maxWebSearches`。`model` を実効値で残しているのと
+>   同じ理由で、上限がいくつだったか分からない平均は読めない
+>
+> 上限を入れた後は、**`unresolved` 率・`unresolvedRecall` とセットで**もう一度回すこと。
+> 絞りすぎは裏付けが取れなくなり、この2つに現れる。
 
 ### 「何も測らなかった」を PASS にしない
 
