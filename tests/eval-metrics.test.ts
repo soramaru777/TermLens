@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { TermCaseSchema, type TermCase } from "../src/eval/cases.js";
 import { aggregate, scoreCase, type EvaluatedCard } from "../src/eval/metrics.js";
+import type { TermStatus } from "../src/protocol.js";
 
 /**
  * 指標の集計そのものを LLM 抜きで検証する。
@@ -11,8 +12,13 @@ function makeCase(overrides: Partial<TermCase> & { id: string; transcript: strin
   return TermCaseSchema.parse(overrides);
 }
 
-function card(term: string, correctedFrom: string | null = null, confidence: "high" | "low" = "high"): EvaluatedCard {
-  return { term, correctedFrom, confidence };
+function card(
+  term: string,
+  correctedFrom: string | null = null,
+  status: TermStatus = "confirmed",
+  surfaceForms: string[] = [],
+): EvaluatedCard {
+  return { term, correctedFrom, status, surfaceForms };
 }
 
 const base = makeCase({
@@ -61,10 +67,30 @@ test("誤補正率: ケース数ぶんの平均になる", () => {
   assert.equal(aggregate([clean, clean]).miscorrection, 0);
 });
 
-test("unresolved 率: カードは出たが confidence が low のもの ÷ expectTerms 総数", () => {
-  const score = scoreCase(base, [card("Kubernetes", "クバネテス", "low"), card("Pod")]);
-  assert.equal(aggregate([score]).unresolved, 0.5);
-  assert.equal(aggregate([score]).recall, 1, "low でも Recall には数える");
+test("probable 率: カードは出たが status が probable のもの ÷ expectTerms 総数", () => {
+  const score = scoreCase(base, [card("Kubernetes", "クバネテス", "probable"), card("Pod")]);
+  assert.equal(aggregate([score]).probable, 0.5);
+  assert.equal(aggregate([score]).unresolved, 0, "probable は unresolved 列に混ぜない");
+  assert.equal(aggregate([score]).recall, 1, "probable でも Recall には数える");
+});
+
+test("unresolved 率: probable とは別の列に数える（#24）", () => {
+  // **2列に分けたことがこのテストの本題。** 合算していると「補正はしたが自信がない」と
+  // 「そもそも特定できない」が混ざり、過剰 unresolved（何でも諦める退行）に気づけない。
+  const score = scoreCase(base, [
+    card("Kubernetes", "クバネテス", "unresolved"),
+    card("Pod", null, "probable"),
+  ]);
+  const metrics = aggregate([score]);
+  assert.equal(metrics.unresolved, 0.5);
+  assert.equal(metrics.probable, 0.5);
+  assert.equal(metrics.recall, 1, "unresolved でもカードは出ているので Recall には数える");
+});
+
+test("confirmed はどちらの列にも数えない", () => {
+  const metrics = aggregate([scoreCase(base, [card("Kubernetes", "クバネテス"), card("Pod")])]);
+  assert.equal(metrics.probable, 0);
+  assert.equal(metrics.unresolved, 0);
 });
 
 test("Precision: expectTerms ∪ allowLowConfidence に含まれるカードの割合", () => {
@@ -96,6 +122,7 @@ test("期待が空のケース: Recall/補正は減点せず、Precision と禁�
   const empty = aggregate([scoreCase(noExpect, [])]);
   assert.equal(empty.recall, 1);
   assert.equal(empty.correction, 1);
+  assert.equal(empty.probable, 0);
   assert.equal(empty.unresolved, 0);
   assert.equal(empty.miscorrection, 0);
 
@@ -112,4 +139,77 @@ test("集計は分子分母の合算（ケース平均の平均にしない）",
     scoreCase(one, []),
   ]);
   assert.equal(metrics.recall, 4 / 5);
+});
+
+/**
+ * 「特定できない」が正解のケース(#24)。
+ *
+ * `expectTerms` は「出てほしい用語」の集合なので、特定できないのが正解のケースは
+ * 分母にも分子にも入らず、**追加した fixture が unresolved 率をまったく動かせなかった**
+ * （レビュー指摘）。聞き取られた表記を別の分母として持つ。
+ */
+test("expectUnresolved: 狙いどおり unresolved になれば当たり", () => {
+  const c = makeCase({
+    id: "u1",
+    transcript: "グラファトスを入れましょう。",
+    expectUnresolved: ["グラファトス"],
+  });
+  const hit = scoreCase(c, [card("Grafana", "グラファトス", "unresolved")]);
+  assert.equal(hit.unresolvedHit, 1);
+  assert.equal(hit.unresolvedTotal, 1);
+  assert.deepEqual(hit.unresolvedMiss, []);
+});
+
+test("expectUnresolved: surfaceForms 経由でも突き合わせる", () => {
+  const c = makeCase({
+    id: "u2",
+    transcript: "グラファトスを入れましょう。",
+    expectUnresolved: ["グラファトス"],
+  });
+  // 補正を試みなかった（correctedFrom が null）ケース
+  const s = scoreCase(c, [card("グラファトス", null, "unresolved", ["グラファトス"])]);
+  assert.equal(s.unresolvedHit, 1);
+});
+
+test("expectUnresolved: 断定してしまったら外れ。内訳に何に断定したかを残す", () => {
+  const c = makeCase({
+    id: "u3",
+    transcript: "グラファトスを入れましょう。",
+    expectUnresolved: ["グラファトス"],
+  });
+  const miss = scoreCase(c, [card("Grafana", "グラファトス", "confirmed")]);
+  assert.equal(miss.unresolvedHit, 0);
+  assert.equal(miss.unresolvedMiss.length, 1);
+  assert.ok(miss.unresolvedMiss[0]!.includes("Grafana"), "何に断定したかが分かること");
+});
+
+/**
+ * unresolved のカードは誤補正に数えない(#24)。
+ *
+ * 降格したカードは term を画面に出さない（見出しは聞き取られた表記）ので、利用者から
+ * 見て「その用語に補正した」とは言えない。ここを見ないと Stage 2 が正しく棄却しても
+ * 誤補正として数え続け、**この機能の効果が指標に一切現れない**。
+ */
+test("unresolved のカードは forbidTerms に当たっても誤補正にしない", () => {
+  const c = makeCase({
+    id: "m1",
+    transcript: "クドラントを使います。",
+    forbidTerms: ["Qdrant"],
+  });
+  const dropped = scoreCase(c, [card("Qdrant", "クドラント", "unresolved")]);
+  assert.equal(dropped.miscorrected, false, "画面に Qdrant は出ていない");
+
+  const shown = scoreCase(c, [card("Qdrant", "クドラント", "confirmed")]);
+  assert.equal(shown.miscorrected, true, "断定して表示したなら誤補正のまま");
+});
+
+test("unresolved のカードは expectCorrection の取り違えにも数えない", () => {
+  const c = makeCase({
+    id: "m2",
+    transcript: "クドラントを使います。",
+    expectCorrection: { クドラント: "Qdrant" },
+  });
+  const dropped = scoreCase(c, [card("Quadrant", "クドラント", "unresolved")]);
+  assert.equal(dropped.correctionHit, 0, "正しい補正でもない");
+  assert.equal(dropped.miscorrected, false, "だが誤補正でもない（表示していないため）");
 });

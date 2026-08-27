@@ -6,11 +6,29 @@ export interface TermLink {
   url: string;
 }
 
+/**
+ * 用語カードの判定状態(#24)。`confidence: "high" | "low"` を置き換えたもので、
+ * `low` が `probable` に 1:1 で対応する。
+ *
+ * **同じ事実を2フィールドで持たないために「追加」ではなく「置き換え」にしてある。**
+ * `confidence` と併存させると、LLM が `high` かつ `unresolved` のような矛盾した組を
+ * 返したときの正解が決まらない。
+ *
+ * - `confirmed`  — 補正なし、または確信のある補正
+ * - `probable`   — 補正したが確信がない(旧 `confidence: "low"`。UI は「もしかして?」)
+ * - `unresolved` — 音声認識の表記から正しい用語を特定できなかった。
+ *   **UI は推定した term を見せず、聞き取られた表記そのものを見出しにする**
+ *
+ * `unresolved` から上へは戻さない。`card_update` は `term` でカードを突き合わせる仕様で
+ * 改名の経路が無く(#23)、解説だけ差し替えると表示が食い違うため。
+ */
+export type TermStatus = "confirmed" | "probable" | "unresolved";
+
 export interface TermCard {
   term: string;
   reading: string;
   description: string;
-  confidence: "high" | "low";
+  status: TermStatus;
   correctedFrom: string | null;
   /** 文字起こし中に実際に登場した表記(ハイライト用) */
   surfaceForms: string[];
@@ -33,7 +51,9 @@ export type ServerMessage =
   | { type: "ready" }
   | { type: "transcript"; text: string; isFinal: boolean; speaker: number | null }
   | { type: "cards"; cards: TermCard[] }
-  | { type: "card_update"; term: string; description: string; links: TermLink[] }
+  // status は optional にしない。送り側(scheduler)では検証の結果として必ず決まるので、
+  // 省略できる形にすると受け側が「変化なし」と「未指定」を区別できなくなる(#24)。
+  | { type: "card_update"; term: string; status: TermStatus; description: string; links: TermLink[] }
   | { type: "status"; state: "stt_connecting" | "stt_open" | "stt_closed" | "extracting" }
   | {
       type: "error";

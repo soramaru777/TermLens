@@ -2,19 +2,21 @@ import assert from "node:assert/strict";
 import test, { mock, type TestContext } from "node:test";
 import { client as enrichClient } from "../src/extract/enrich.js";
 import type { ExtractorInput } from "../src/extract/extractor.js";
+import { APIError } from "openai";
+import { UNRESOLVED_DESCRIPTION } from "../src/extract/extractor.js";
 import type { ExtractedCard } from "../src/extract/schema.js";
 import { card, candidate, settle, utterance } from "./helpers/cards.js";
 import { ExtractionScheduler, selectVerifyTargets } from "../src/extract/scheduler.js";
-import type { TermCard, TermLink } from "../src/protocol.js";
+import type { TermCard, TermLink, TermStatus } from "../src/protocol.js";
 
 /**
  * 検証つき清書のスケジューラ側（#23）。
  *
  * 固定したいのは3つ。
- * 1. **検証対象の選定** — 補正あり・confidence low は必ず通す。従来のレア度上位も残す
+ * 1. **検証対象の選定** — 補正あり・`status !== "confirmed"` は必ず通す。従来のレア度上位も残す
  * 2. **`candidates` をクライアントへ送らない** — `{ ...c }` のスプレッドなので放っておくと漏れる
- * 3. **棄却しても表示を変えない**（既定）。記録は `term` と `reason` だけで、
- *    **文字起こし本文をログに出さない**
+ * 3. **棄却は `status: "unresolved"` として届く**（#24）。解説は速報のまま・リンクは空。
+ *    記録は `term` と `reason` だけで、**文字起こし本文をログに出さない**
  *
  * 実 API は叩かない。抽出は private `extract` を差し替え、清書は `enrich.ts` の
  * `client.responses.create` を差し替える。**`enrichCard` は `void` の投げっぱなしなので、
@@ -25,28 +27,61 @@ type ExtractFn = (input: ExtractorInput) => Promise<ExtractedCard[]>;
 
 // --- 検証対象の選定 -----------------------------------------------------
 
-test("補正あり・confidence low は必ず検証する", () => {
+test("補正あり・status が confirmed でないカードは必ず検証する", () => {
   // **rare を3枚並べてレア度上位の枠を埋めておく。** 枠が空いていると C/D が
   // 従来条件だけで入ってしまい、追加した条件を消しても落ちないテストになる
-  // （同レア度内では confidence low が優先されるので、common + low は特に紛れやすい）。
+  // （同レア度内では非 confirmed が優先されるので、common + probable は特に紛れやすい）。
   const cards = [
     card("A", { rarity: "rare" }),
     card("B", { rarity: "rare" }),
     card("C", { rarity: "rare" }),
     card("D", { rarity: "common", correctedFrom: "でぃー" }),
-    card("E", { rarity: "common", confidence: "low" }),
+    card("E", { rarity: "common", status: "probable" }),
     card("F", { rarity: "common" }),
   ];
   const targets = selectVerifyTargets(cards);
   assert.deepEqual(
     [...targets].sort(),
     ["A", "B", "C", "D", "E"],
-    "レア度上位の半数(A,B,C)に、補正ありの D と confidence low の E が加わる",
+    "レア度上位の半数(A,B,C)に、補正ありの D と probable の E が加わる",
   );
-  assert.ok(!targets.has("F"), "補正なし・high・レア度下位は対象外のまま");
+  assert.ok(!targets.has("F"), "補正なし・confirmed・レア度下位は対象外のまま");
 });
 
-test("補正なし・confidence high のカードは対象外になりうる", () => {
+/**
+ * `unresolved` は検証に回さない（#24 のレビュー指摘）。
+ *
+ * 昇格の経路が無く（`card_update` は term で突き合わせるので改名できない）、解説も
+ * 定型文で固定されるため、**検証結果を使える余地が1つも無い**。回すと web 検索の
+ * 課金だけが増える。昇格を防ぎつつ解説だけ更新すると「特定できませんでした」の見出しの
+ * 下に確定した別用語の断定的な解説が出て、この Issue が防ごうとした形そのものになる。
+ */
+test("unresolved は検証に回さない（#24）", () => {
+  const cards = [
+    card("A", { rarity: "rare", status: "unresolved", correctedFrom: "えー" }),
+    card("B", { rarity: "common", status: "probable" }),
+  ];
+  const targets = selectVerifyTargets(cards);
+  assert.ok(!targets.has("A"), "レア度上位でも補正ありでも回さない");
+  assert.ok(targets.has("B"), "probable は従来どおり回す");
+});
+
+test("unresolved はレア度上位の枠も食わない", () => {
+  // 枠まで食われると、検証すべき probable が漏れる。
+  // 分母は元のカード数（4）のままなので枠は2つ
+  const cards = [
+    card("A", { rarity: "rare", status: "unresolved" }),
+    card("B", { rarity: "rare", status: "unresolved" }),
+    card("C", { rarity: "uncommon" }),
+    card("D", { rarity: "common" }),
+  ];
+  const targets = selectVerifyTargets(cards);
+  // 枠の分母は targetable の枚数（2）なので ceil(2/2) = 1。元のカード数（4）を分母に
+  // すると枠が2つ余り、検証する意味のない confirmed まで入る
+  assert.deepEqual([...targets].sort(), ["C"], "unresolved を除いた中から枠を埋める");
+});
+
+test("補正なし・confirmed のカードは対象外になりうる", () => {
   // 従来どおりレア度上位の約半数だけが通る。補正なしカードまで web 検索に回すと
   // 呼び出しが増えるだけで、AC「単純で明確な補正は従来程度の低レイテンシ」も崩れる
   const cards = [card("A", { rarity: "rare" }), card("B", { rarity: "common" })];
@@ -62,24 +97,38 @@ test("空配列なら対象も空", () => {
 
 interface Harness {
   emitted: TermCard[][];
-  updates: Array<{ term: string; description: string; links: TermLink[] }>;
+  updates: Array<{ term: string; status: TermStatus; description: string; links: TermLink[] }>;
   warnings: string[];
   /** `responses.create` に渡った入力（清書1回につき1件） */
   verifyInputs: string[];
+  /** 次回以降の検証を失敗させる（null で解除） */
+  failVerify: (err: unknown) => void;
+  /** `extract()` に渡った入力（呼ばれた順） */
+  extractInputs: ExtractorInput[];
   send: (text: string, cards: ExtractedCard[]) => Promise<void>;
+}
+
+/** SDK が実際に投げるのと同じ形のエラー（`error-classify.test.ts` と同じ作法）。 */
+function apiError(status: number): APIError {
+  return APIError.generate(status, { error: { message: "test" } }, undefined, new Headers());
 }
 
 /** `chosen` を決めるモック。入力に含まれる用語で分岐させ、並列でも取り違えない。 */
 function harness(t: TestContext, decide: (input: string) => string | null): Harness {
   const emitted: TermCard[][] = [];
-  const updates: Array<{ term: string; description: string; links: TermLink[] }> = [];
+  const updates: Array<{ term: string; status: TermStatus; description: string; links: TermLink[] }> =
+    [];
   const warnings: string[] = [];
   const verifyInputs: string[] = [];
+  const extractInputs: ExtractorInput[] = [];
   let impl: ExtractFn = async () => [];
 
+  // 次回以降の検証を失敗させる（null で解除）。例外パスの回帰テスト用
+  let verifyError: unknown = null;
   const createSpy = mock.method(enrichClient.responses, "create", async (body: never) => {
     const input = String((body as unknown as { input: string }).input);
     verifyInputs.push(input);
+    if (verifyError) throw verifyError;
     return {
       output_text: JSON.stringify({
         chosen: decide(input),
@@ -99,18 +148,26 @@ function harness(t: TestContext, decide: (input: string) => string | null): Harn
 
   const scheduler = new ExtractionScheduler([], {
     onCards: (c) => emitted.push(c),
-    onCardUpdate: (term, description, links) => updates.push({ term, description, links }),
+    onCardUpdate: (term, status, description, links) =>
+      updates.push({ term, status, description, links }),
     onExtracting: () => {},
     onError: () => {},
   });
   t.after(() => scheduler.stop());
-  (scheduler as unknown as { extract: ExtractFn }).extract = (input) => impl(input);
+  (scheduler as unknown as { extract: ExtractFn }).extract = (input) => {
+    extractInputs.push(input);
+    return impl(input);
+  };
 
   return {
     emitted,
     updates,
     warnings,
     verifyInputs,
+    failVerify: (err: unknown) => {
+      verifyError = err;
+    },
+    extractInputs,
     send: async (text, cards) => {
       impl = async () => cards;
       scheduler.addUtterance(text);
@@ -152,12 +209,15 @@ test("candidates はクライアント向けカードに含めない", async (t)
   );
 });
 
-test("裏付けが取れたら card_update で差し替える", async (t) => {
+test("裏付けが取れたら card_update で差し替え、status は confirmed になる", async (t) => {
   const h = harness(t, () => "Kubernetes");
-  await h.send(utterance("A"), [card("Kubernetes", { correctedFrom: "クバネテス" })]);
+  // 速報は probable。**Stage 2 が裏付けたらここで格上げになる**ことまで見る
+  await h.send(utterance("A"), [
+    card("Kubernetes", { correctedFrom: "クバネテス", status: "probable" }),
+  ]);
 
   assert.deepEqual(h.updates, [
-    { term: "Kubernetes", description: "検証後の解説。", links: [] },
+    { term: "Kubernetes", status: "confirmed", description: "検証後の解説。", links: [] },
   ]);
   assert.equal(h.warnings.length, 0);
   assert.ok(
@@ -166,18 +226,28 @@ test("裏付けが取れたら card_update で差し替える", async (t) => {
   );
 });
 
-test("棄却しても解説は変えず、term と reason だけを記録する", async (t) => {
+test("棄却は status: unresolved として届き、term と reason だけを記録する", async (t) => {
   const chunk = utterance("A");
   const h = harness(t, () => null);
-  const drafted = card("クーベルタン", { correctedFrom: "クバネテス", confidence: "low" });
+  const drafted = card("クーベルタン", { correctedFrom: "クバネテス", status: "probable" });
   await h.send(chunk, [drafted]);
 
-  assert.equal(h.emitted.at(-1)!.length, 1, "速報カードは従来どおり出る（既定 (c)）");
-  // **解説はそのまま・リンクは空**で更新を届ける。速報を willEnrich: true で送っている以上、
-  // 何も返さないと「確認中」の表示が消えない（#23 のレビュー指摘）。
+  assert.equal(h.emitted.at(-1)!.length, 1, "速報カードは消さない（見た目だけ降格させる）");
+  // **#24 の肝。** 棄却が初めて利用者に伝わる経路で、ここが confirmed のままだと
+  // 「裏付けが取れなかったカード」が通常カードとして残る。
+  // **解説も定型文に差し替える。** 速報の解説は「誤補正した用語」の説明なので、
+  // 残すと「特定できませんでした」と言いながら別用語の断定的な定義を読ませることになる
+  // （抽出段の `normalizeStatus` が同じことを担保しているので、降格経路だけ素通しにすると
+  // 方針が非対称になる）。リンクは空でクライアントは確認中の表示を畳む。
   assert.deepEqual(h.updates, [
-    { term: "クーベルタン", description: drafted.description, links: [] },
-  ], "解説は速報のまま。リンクが空なのでクライアントは確認中の表示を畳む");
+    {
+      term: "クーベルタン",
+      status: "unresolved",
+      description: UNRESOLVED_DESCRIPTION,
+      links: [],
+    },
+  ], "term は改名しない。status を unresolved へ降格し、解説は定型文にする");
+  assert.notEqual(drafted.description, UNRESOLVED_DESCRIPTION, "速報の解説とは別物であること");
   assert.equal(h.warnings.length, 1);
   assert.ok(h.warnings[0]!.includes("クーベルタン"), "term は記録する");
   assert.ok(h.warnings[0]!.includes("テストの判定"), "reason も記録する");
@@ -198,8 +268,80 @@ test("候補#2 が選ばれても term は改名しない（protocol に経路�
   // card_update は term でカードを突き合わせるので、表示中のカードを別の用語へ
   // 改名できない。解説だけ差し込むと表示が食い違うため裏付け無しと同じ扱いにする。
   assert.deepEqual(h.updates, [
-    { term: "クアドラント", description: drafted.description, links: [] },
-  ], "term も解説も変えない。確認中の表示だけ畳む");
+    {
+      term: "クアドラント",
+      status: "unresolved",
+      description: UNRESOLVED_DESCRIPTION,
+      links: [],
+    },
+  ], "term は変えず、status を unresolved にして見出しを surface form へ降ろす");
   assert.equal(h.warnings.length, 1);
   assert.ok(h.warnings[0]!.includes("クアドラント"));
+});
+
+/**
+ * 検証が例外で落ちても「確認中」を畳む（#24 のレビュー指摘）。
+ *
+ * 速報を `willEnrich: true` で送った以上、黙ると回り続けるスピナーが残り、
+ * localStorage にもその状態で保存されるので復元しても消えない。#23 で棄却時に
+ * 踏んだのと同じ穴が、例外パスに残っていた。**#24 で `unresolved` を検証対象に
+ * 足したぶん Stage 2 に回るカードが増えており、被弾面積が広がっている。**
+ */
+test("検証が例外で落ちても card_update を送り、速報の status を保つ", async (t) => {
+  const h = harness(t, () => "Kubernetes");
+  h.failVerify(new Error("boom"));
+  const drafted = card("Kubernetes", { correctedFrom: "クバネテス", status: "probable" });
+  await h.send(utterance("A"), [drafted]);
+
+  assert.deepEqual(h.updates, [
+    {
+      term: "Kubernetes",
+      status: "probable",
+      description: drafted.description,
+      links: [],
+    },
+  ], "検証できなかっただけなので status と解説はそのまま。リンクだけ空で確認中を畳む");
+});
+
+/**
+ * 恒久エラーで検証を打ち切った後は `willEnrich: false` で送る。
+ *
+ * `willEnrich` は「後から `card_update` が来る」の予告なので、打ち切り後も true だと
+ * 誰も更新を送らないまま確認中の表示が会議の終わりまで残る。
+ */
+test("検証を打ち切った後のカードは willEnrich: false で送る", async (t) => {
+  const h = harness(t, () => "Kubernetes");
+  h.failVerify(apiError(401));
+  await h.send(utterance("A"), [card("Kubernetes", { correctedFrom: "クバネテス" })]);
+  // 1チャンク目で verifyDisabled が立つ
+  h.failVerify(null);
+  await h.send(utterance("B"), [card("Grafana", { correctedFrom: "グラハム" })]);
+
+  const second = h.emitted.at(-1)!;
+  assert.deepEqual(
+    second.map((c) => [c.term, c.willEnrich]),
+    [["Grafana", false]],
+    "打ち切り後は更新を送らないので、確認中の表示も出さない",
+  );
+  assert.equal(h.verifyInputs.length, 1, "2枚目は検証にも回さない");
+});
+
+/**
+ * unresolved の推定 term はプロンプトの「表示済み用語リスト」に載せない（#24 のレビュー指摘）。
+ *
+ * 載せると規則2「表示済みの用語は出力しない」が効き、**後で誰かが同じ用語を明瞭に
+ * 発話しても正しいカードが出なくなる**。特定できなかった推定でデデュープの枠を
+ * 永久に占有させない。
+ */
+test("unresolved の term は表示済みリストに載せない", async (t) => {
+  const h = harness(t, () => "Grafana");
+  await h.send(utterance("A"), [
+    card("Grafana", { status: "unresolved", correctedFrom: "グラファトス" }),
+    card("Kubernetes", { status: "confirmed" }),
+  ]);
+  // 2チャンク目の入力に渡った表示済みリストを見る
+  await h.send(utterance("B"), []);
+
+  const shown = h.extractInputs.at(-1)!.shownTerms;
+  assert.deepEqual(shown, ["Kubernetes"], "特定できた用語だけがリストに載る");
 });

@@ -23,10 +23,20 @@ export const CandidateSchema = z.object({
 export type Candidate = z.infer<typeof CandidateSchema>;
 
 export const TermCardSchema = z.object({
+  // **`term` より前に置く。** 構造化出力はスキーマの順に生成されるので、term を
+  // 書き終えてから status を決めさせると、規則1の「自信がなければ term を無理に
+  // 確定しない」が原理的に守りにくい。先に状態を決めさせてから表記を書かせる。
+  // #24 で `confidence: "high" | "low"` を置き換えた(`low` → `probable` が 1:1 対応)。
+  // 併存させると同じ事実を2フィールドで持つことになり、矛盾した組が返ったときの正解が
+  // 決まらない。**enum の値そのものが仕様の説明**になるよう describe に3値の使い分けを書く。
+  status: z
+    .enum(["confirmed", "probable", "unresolved"])
+    .describe(
+      "用語の判定状態。confirmed=補正していない、または確信のある補正。probable=補正したが確信がない。unresolved=音声認識の表記から正しい用語を特定できない(この場合 term を無理に確定せず、description も書かない)",
+    ),
   term: z.string().describe("正規化した用語名。誤認識で崩れたカタカナは正しい表記に直す(例: クバネテス → Kubernetes)"),
   reading: z.string().describe("用語のカタカナ読み"),
   description: z.string().describe("日本語の解説。約100文字、最大120文字"),
-  confidence: z.enum(["high", "low"]).describe("誤認識からの推定に自信がない場合は low"),
   rarity: z
     .enum(["common", "uncommon", "rare"])
     .describe(

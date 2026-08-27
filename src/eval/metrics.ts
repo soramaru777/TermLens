@@ -1,4 +1,5 @@
 import { normalizeTerm } from "../extract/normalize.js";
+import type { TermStatus } from "../protocol.js";
 import type { TermCase } from "./cases.js";
 
 /**
@@ -7,8 +8,10 @@ import type { TermCase } from "./cases.js";
  */
 export interface EvaluatedCard {
   term: string;
-  confidence: "high" | "low";
+  status: TermStatus;
   correctedFrom: string | null;
+  /** 「特定できない」が正解の表記との突き合わせに使う(#24) */
+  surfaceForms: string[];
 }
 
 /** 1ケース・1試行ぶんの素点。集計は分子分母を足し合わせて行う（ケース平均の平均にしない）。 */
@@ -28,8 +31,21 @@ export interface CaseScore {
   miscorrected: boolean;
   /** 誤補正の内訳（レポート用） */
   miscorrections: string[];
-  /** expectTerms のうち、カードは出たが confidence が low だったもの */
+  /**
+   * expectTerms のうち、カードは出たが status が probable だったもの。
+   *
+   * **#24 以前の `unresolved` はこの量を指していた。** `status` の導入で
+   * 同名のフィールドが別の意味になるため、旧指標は名前ごとこちらへ移してある
+   * （同名で意味を変えると実装前後のレポート比較が静かに壊れる）。
+   */
+  probable: number;
+  /** expectTerms のうち、カードは出たが status が unresolved だったもの(#24 で新設) */
   unresolved: number;
+  /** expectUnresolved のうち、狙いどおり unresolved のカードが出たもの(#24) */
+  unresolvedHit: number;
+  unresolvedTotal: number;
+  /** 「特定できない」が正解だったのにそうならなかった内訳（レポート用） */
+  unresolvedMiss: string[];
   /** 出力カード（正規化キーで dedupe 済み）のうち expectTerms ∪ allowLowConfidence に含まれるもの */
   precisionHit: number;
   /** dedupe 後の出力カード数。同じ用語が2枚出ても1件として数える */
@@ -47,8 +63,12 @@ export interface Metrics {
   correction: number;
   /** 誤補正率 */
   miscorrection: number;
-  /** unresolved 率 */
+  /** probable 率(旧 unresolved 率。#24 で改名) */
+  probable: number;
+  /** unresolved 率(#24 で新設。「特定できなかった」と明示した割合) */
   unresolved: number;
+  /** 「特定できない」が正解のケースで、狙いどおり unresolved にできた割合(#24) */
+  unresolvedRecall: number;
   /** カード Precision */
   precision: number;
 }
@@ -60,7 +80,10 @@ export interface Totals {
   correctionTotal: number;
   miscorrectedCases: number;
   caseRuns: number;
+  probable: number;
   unresolved: number;
+  unresolvedHit: number;
+  unresolvedTotal: number;
   precisionHit: number;
   precisionTotal: number;
 }
@@ -88,8 +111,9 @@ export function scoreCase(c: TermCase, cards: EvaluatedCard[], run = 0): CaseSco
     if (!byTerm.has(key)) byTerm.set(key, card);
   }
 
-  // --- 用語 Recall / unresolved 率 ---
+  // --- 用語 Recall / probable 率 / unresolved 率 ---
   let recallHit = 0;
+  let probable = 0;
   let unresolved = 0;
   const missing: string[] = [];
   for (const expected of c.expectTerms) {
@@ -99,15 +123,23 @@ export function scoreCase(c: TermCase, cards: EvaluatedCard[], run = 0): CaseSco
       continue;
     }
     recallHit += 1;
-    if (card.confidence === "low") unresolved += 1;
+    // 2つを分けて数える。「補正したが自信がない(probable)」と「そもそも特定できない
+    // (unresolved)」は利用者から見て別の失敗で、足し合わせると過剰 unresolved に気づけない
+    if (card.status === "probable") probable += 1;
+    else if (card.status === "unresolved") unresolved += 1;
   }
 
   // --- 正しい補正率 / 誤補正（②誤表記に対する term の取り違え） ---
   let correctionHit = 0;
   const miscorrections: string[] = [];
+  // **unresolved のカードは補正の判定から外す**(#24)。降格したカードは term を画面に
+  // 出さない（見出しは聞き取られた表記）ので、利用者から見て「その用語に補正した」とは
+  // 言えない。ここを見ないと Stage 2 が正しく棄却しても誤補正として数え続け、
+  // この機能の効果が指標に一切現れない。
+  const corrected = cards.filter((card) => card.status !== "unresolved");
   for (const [wrong, right] of Object.entries(c.expectCorrection)) {
     const wrongKey = normalizeTerm(wrong);
-    const matched = cards.filter((card) => normalizeTerm(card.correctedFrom ?? "") === wrongKey);
+    const matched = corrected.filter((card) => normalizeTerm(card.correctedFrom ?? "") === wrongKey);
     const correct = matched.find((card) => normalizeTerm(card.term) === normalizeTerm(right));
     if (correct) {
       correctionHit += 1;
@@ -119,8 +151,24 @@ export function scoreCase(c: TermCase, cards: EvaluatedCard[], run = 0): CaseSco
 
   // --- 誤補正（①出てはいけない用語） ---
   const forbidden = new Set(c.forbidTerms.map(normalizeTerm));
-  for (const card of cards) {
+  for (const card of corrected) {
     if (forbidden.has(normalizeTerm(card.term))) miscorrections.push(`禁止語が出た: ${card.term}`);
+  }
+
+  // --- 「特定できない」が正解だった表記(#24) ---
+  // 聞き取られた表記を correctedFrom / surfaceForms に持つカードが unresolved で出たか。
+  // expectTerms 経由では測れない（特定できないのが正解なので分母に入らない）。
+  let unresolvedHit = 0;
+  const unresolvedMiss: string[] = [];
+  for (const surface of c.expectUnresolved) {
+    const key = normalizeTerm(surface);
+    const card = cards.find(
+      (x) =>
+        normalizeTerm(x.correctedFrom ?? "") === key ||
+        x.surfaceForms.some((f) => normalizeTerm(f) === key),
+    );
+    if (card?.status === "unresolved") unresolvedHit += 1;
+    else unresolvedMiss.push(`${surface} → ${card ? `${card.term}(${card.status})` : "カードなし"}`);
   }
 
   // --- カード Precision ---
@@ -144,7 +192,11 @@ export function scoreCase(c: TermCase, cards: EvaluatedCard[], run = 0): CaseSco
     correctionTotal: Object.keys(c.expectCorrection).length,
     miscorrected: miscorrections.length > 0,
     miscorrections,
+    probable,
     unresolved,
+    unresolvedHit,
+    unresolvedTotal: c.expectUnresolved.length,
+    unresolvedMiss,
     precisionHit,
     precisionTotal: byTerm.size,
     missing,
@@ -160,7 +212,10 @@ export function sumTotals(scores: CaseScore[]): Totals {
     correctionTotal: 0,
     miscorrectedCases: 0,
     caseRuns: scores.length,
+    probable: 0,
     unresolved: 0,
+    unresolvedHit: 0,
+    unresolvedTotal: 0,
     precisionHit: 0,
     precisionTotal: 0,
   };
@@ -169,7 +224,10 @@ export function sumTotals(scores: CaseScore[]): Totals {
     totals.recallTotal += s.recallTotal;
     totals.correctionHit += s.correctionHit;
     totals.correctionTotal += s.correctionTotal;
+    totals.probable += s.probable;
     totals.unresolved += s.unresolved;
+    totals.unresolvedHit += s.unresolvedHit;
+    totals.unresolvedTotal += s.unresolvedTotal;
     totals.precisionHit += s.precisionHit;
     totals.precisionTotal += s.precisionTotal;
     if (s.miscorrected) totals.miscorrectedCases += 1;
@@ -183,7 +241,11 @@ export function toMetrics(totals: Totals): Metrics {
     correction: ratio(totals.correctionHit, totals.correctionTotal),
     // 誤補正率だけは「無ければ 0（良い）」。ratio() の 0除算=1 とは向きが逆なので個別に書く。
     miscorrection: totals.caseRuns === 0 ? 0 : totals.miscorrectedCases / totals.caseRuns,
+    // 分母はどちらも expectTerms の総数。同じ土俵で並べないと2列を足し引きして読めない
+    probable: totals.recallTotal === 0 ? 0 : totals.probable / totals.recallTotal,
     unresolved: totals.recallTotal === 0 ? 0 : totals.unresolved / totals.recallTotal,
+    // 分母 0（期待が無い）は減点しない。ratio() と同じ扱い
+    unresolvedRecall: ratio(totals.unresolvedHit, totals.unresolvedTotal),
     precision: ratio(totals.precisionHit, totals.precisionTotal),
   };
 }

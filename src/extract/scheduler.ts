@@ -8,9 +8,9 @@ import {
 } from "openai";
 // パッケージのルートからは再エクスポートされていないのでサブパスから取る
 import { LengthFinishReasonError } from "openai/error";
-import type { TermCard, TermLink } from "../protocol.js";
+import type { TermCard, TermLink, TermStatus } from "../protocol.js";
 import { ContextWindow } from "./context.js";
-import { createExtractor } from "./extractor.js";
+import { createExtractor, UNRESOLVED_DESCRIPTION } from "./extractor.js";
 import { isVerified, verifyAndEnrich } from "./enrich.js";
 import { normalizeTerm } from "./normalize.js";
 import type { ExtractedCard } from "./schema.js";
@@ -101,9 +101,15 @@ export function toUserMessage(err: unknown): string {
 /**
  * 検証つき清書(Stage 2)に回すカードを選ぶ(#23)。
  *
- * 従来の「レア度上位の約半数」に **「補正あり または confidence low」** を足した和集合。
- * 誤補正が疑わしいのはこの2つで、レア度ランキングが選ぶ集合とは大きく重なるため、
- * web 検索の呼び出し増は小さい。
+ * 従来の「レア度上位の約半数」に **「補正あり または status が confirmed でない」** を
+ * 足した和集合。誤補正が疑わしいのはこの2つで、レア度ランキングが選ぶ集合とは大きく
+ * 重なるため、web 検索の呼び出し増は小さい。
+ *
+ * **`unresolved` は検証に回さない(#24)。** 昇格の経路が無い(`card_update` は term で
+ * 突き合わせるので改名できない)うえ、解説も定型文で固定されるため、**検証結果を
+ * 使える余地が1つも無い**。回すと web 検索の課金だけが増える。
+ * さらに、昇格を防ぎつつ解説だけ更新すると「特定できませんでした」の見出しの下に
+ * 確定した別用語の断定的な解説が出る — この Issue が防ごうとしていた形そのものになる。
  *
  * **補正のないカードは Stage 2 を通さない。** そもそも速報は従来どおり即時表示で、
  * Stage 2 は非同期の `card_update` なので、表示までの時間はどちらにせよ変わらない。
@@ -115,24 +121,33 @@ export function selectVerifyTargets<
   T extends {
     term: string;
     rarity: "common" | "uncommon" | "rare";
-    confidence: "high" | "low";
+    status: TermStatus;
     correctedFrom: string | null;
   },
 >(cards: T[]): Set<string> {
-  // レア度上位の約半数。同レア度なら誤認識疑い(low)を先に詰める。
-  // **この並べ替えは対象を広げるためではなく、狭く保つためにある。** low は下のループで
-  // どのみち全部入るので、上位半数の枠を先に食わせておくと和集合の増分が小さくなる
-  // (枠が空くと補正なし・high のカードが余分に入る)。
+  // **`unresolved` は最初に除く。** 検証結果を使える余地が無いので、レア度ランキング
+  // 経由でも入れない(除かないと上位半数の枠まで食う)。
+  const targetable = cards.filter((c) => c.status !== "unresolved");
+  // レア度上位の約半数。同レア度なら誤認識疑い(probable)を先に詰める。
+  // **この並べ替えは対象を広げるためではなく、狭く保つためにある。** probable は
+  // 下のループでどのみち全部入るので、上位半数の枠を先に食わせておくと和集合の増分が
+  // 小さくなる(枠が空くと補正なし・confirmed のカードが余分に入る)。
   const rarityRank = { rare: 2, uncommon: 1, common: 0 };
-  const ranked = [...cards].sort(
+  const ranked = [...targetable].sort(
     (a, b) =>
       rarityRank[b.rarity] - rarityRank[a.rarity] ||
-      (a.confidence === "low" ? -1 : 0) - (b.confidence === "low" ? -1 : 0),
+      (a.status !== "confirmed" ? -1 : 0) - (b.status !== "confirmed" ? -1 : 0),
   );
-  const targets = new Set(ranked.slice(0, Math.ceil(cards.length / 2)).map((c) => c.term));
-  // 誤補正が疑わしいカードはレア度に関係なく必ず検証する
-  for (const card of cards) {
-    if (card.correctedFrom !== null || card.confidence === "low") targets.add(card.term);
+  // **分母は `targetable` の枚数。** 元のカード数のままにすると、`unresolved` が多い回ほど
+  // 枠が余り、検証する意味のない confirmed カードまで web 検索に回る(枠が
+  // `targetable.length` を超えると全部入る)。「並べ替えは対象を狭く保つためにある」という
+  // 上の方針と逆向きになる。`probable` は下のループが無条件に足すので枠が縮んでも漏れない。
+  const targets = new Set(ranked.slice(0, Math.ceil(targetable.length / 2)).map((c) => c.term));
+  // 誤補正が疑わしいカードはレア度に関係なく必ず検証する。
+  // `!== "confirmed"` と書くのは、将来 status が増えたときに黙って対象から漏れないため
+  // (`targetable` の時点で unresolved は除いてあるので、いまは probable と同義)。
+  for (const card of targetable) {
+    if (card.correctedFrom !== null || card.status !== "confirmed") targets.add(card.term);
   }
   return targets;
 }
@@ -152,7 +167,7 @@ function toClientCard(card: ExtractedCard, willEnrich: boolean): TermCard {
     term: card.term,
     reading: card.reading,
     description: card.description,
-    confidence: card.confidence,
+    status: card.status,
     correctedFrom: card.correctedFrom,
     surfaceForms: card.surfaceForms,
     rarity: card.rarity,
@@ -189,7 +204,16 @@ export class ExtractionScheduler {
     glossary: string[],
     private callbacks: {
       onCards: (cards: TermCard[]) => void;
-      onCardUpdate: (term: string, description: string, links: TermLink[]) => void;
+      /**
+       * 清書(検証)の結果をクライアントへ届ける。`status` は #24 で追加した。
+       * 裏付けが取れれば `confirmed`、棄却なら `unresolved` に**降格**する。
+       */
+      onCardUpdate: (
+        term: string,
+        status: TermStatus,
+        description: string,
+        links: TermLink[],
+      ) => void;
       onExtracting: () => void;
       /** permanent: 恒久エラーで抽出を打ち切ったときだけ true(#10)。一時エラーは省略/false。 */
       onError: (message: string, permanent?: boolean) => void;
@@ -292,18 +316,25 @@ export class ExtractionScheduler {
         const key = normalizeTerm(c.term);
         if (this.shownSet.has(key)) return false;
         this.shownSet.add(key);
-        this.shownTerms.push(c.term);
+        // **`unresolved` の推定 term はプロンプトの「表示済み用語リスト」に載せない**(#24)。
+        // 載せると規則2「表示済みの用語は出力しない」が効いてしまい、後で誰かが同じ用語を
+        // **明瞭に発話しても正しいカードが出なくなる**。特定できなかった推定でデデュープの
+        // 枠を永久に占有させない。`shownSet` には積むので、同じチャンク内での重複は防げる。
+        if (c.status !== "unresolved") this.shownTerms.push(c.term);
         return true;
       });
       if (fresh.length > 0) {
-        const enrichTargets = selectVerifyTargets(fresh);
+        // **`verifyDisabled` を選定と同じ場所で見る。** `willEnrich` は「後から
+        // `card_update` が来る」の予告なので、検証を打ち切った後も true で送ると
+        // 誰も更新を送らないまま「確認中」の表示が会議の終わりまで残る。
+        const enrichTargets = this.verifyDisabled
+          ? new Set<string>()
+          : selectVerifyTargets(fresh);
         // 速報: LLMの知識ベースのドラフト解説で即表示
-        this.callbacks.onCards(
-          fresh.map((c) => toClientCard(c, enrichTargets.has(c.term))),
-        );
+        this.callbacks.onCards(fresh.map((c) => toClientCard(c, enrichTargets.has(c.term))));
         // 清書: 選ばれた用語だけweb検索で候補を検証し、要約+関連リンクで更新
         for (const card of fresh) {
-          if (!this.verifyDisabled && enrichTargets.has(card.term)) void this.enrichCard(card, chunk);
+          if (enrichTargets.has(card.term)) void this.enrichCard(card, chunk);
         }
       }
     } catch (err) {
@@ -353,33 +384,46 @@ export class ExtractionScheduler {
       });
       const verified = isVerified(card.term, result.chosen);
       if (!verified) {
-        // 棄却(#23 の既定)。**表示は変えず内部に記録するだけ**にして、まず誤補正率の
-        // 変化を測る土台を作る。表示への反映は unresolved 状態の Issue でまとめて入れる。
-        // 出すのは term と reason だけで、**文字起こし本文は出さない**
+        // 棄却。出すのは term と reason だけで、**文字起こし本文は出さない**
         // (既存の `console.error("[scheduler] extraction failed:", err)` と同じ扱い)。
         console.warn(`[scheduler] verification rejected "${card.term}": ${result.reason}`);
       }
       // **棄却でも更新は必ず届ける。** 速報は `willEnrich: true` で送ってあり、クライアントは
       // `card_update` が来るまで「確認中」の表示を消さない(`public/app.js`)。ここで黙ると
-      // **誤補正が最も疑わしいカードにだけ**回り続けるスピナーが残る。棄却時は速報と同じ
-      // description を送るので表示テキストは動かない。
+      // **誤補正が最も疑わしいカードにだけ**回り続けるスピナーが残る。
+      //
+      // #24 で `status` を載せ、**棄却は表示にも反映されるようになった**。
+      // - 裏付けあり → `confirmed`。速報が probable だった場合はここで格上げになる
+      // - 棄却 → `unresolved` へ**降格**。候補#2 が選ばれた場合も同じ扱いで、
+      //   改名の経路が無い以上「この見出しは当てにならない」と伝えるほうが正確
+      //
+      // **降格時は解説も定型文に差し替える。** 速報の解説は「誤補正した用語」の説明なので、
+      // 「特定できませんでした」と言いながら別用語の断定的な定義を読ませることになる。
+      // しかも見出しは surface form に替わっているので、何の説明なのかも分からない。
+      // 抽出段(`normalizeStatus`)が同じことをサーバー側で担保している以上、降格経路だけ
+      // 素通しにすると方針が非対称になり、AC「架空/別用語の説明を生成しない」が破れる。
       // 停止後でも flush 済みカードの更新は届けてよい(送信可否は session 側が判定する)
       this.callbacks.onCardUpdate(
         card.term,
-        verified ? result.description : card.description,
+        verified ? "confirmed" : "unresolved",
+        verified ? result.description : UNRESOLVED_DESCRIPTION,
         verified ? result.links : [],
       );
     } catch (err) {
-      // 清書失敗時はドラフト解説のまま(リンクなし)。1枚の失敗は致命的ではないのでログのみ。
       // **ただし恒久エラー(残高切れを含む)は別。** 抽出側は `disableExtraction()` で1回止まるのに
       // 検証側が素通しだと、選ばれたカードごとに web 検索つきの呼び出しを投げ続け、
       // 誰にも通知されないまま課金だけが進む(#23 で対象集合を広げたぶん影響が大きい)。
       if (isPermanent(err)) {
         this.verifyDisabled = true;
         console.error(`[scheduler] verification disabled after "${card.term}":`, err);
-        return;
+      } else {
+        console.error(`[scheduler] enrich failed for "${card.term}":`, err);
       }
-      console.error(`[scheduler] enrich failed for "${card.term}":`, err);
+      // **失敗しても更新は必ず届ける。** 速報を `willEnrich: true` で送った以上、
+      // 黙るとクライアントの「確認中」が会議の終わりまで回り続け、localStorage にも
+      // その状態で保存されるので復元しても消えない(#23 で棄却時に踏んだのと同じ穴)。
+      // 検証できなかっただけなので**速報の status と解説はそのまま**、リンクだけ空で送る。
+      this.callbacks.onCardUpdate(card.term, card.status, card.description, []);
     }
   }
 }

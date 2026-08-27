@@ -4,6 +4,20 @@
 // 目標サンプルレートは Worklet 側のローパス設計と揃っている必要があるため、
 // 定義元(lowpass.js)から取る。ここで数値をベタ書きすると片方だけ変わりうる。
 import { TARGET_SAMPLE_RATE } from "./lowpass.js";
+// カードの状態と見出しの導出は card-status.js が唯一の定義箇所(#24)。
+// ここで `card.status` を直接読むと、復元経路（status を持たない旧カード）だけ表示が変わる。
+import {
+  cardHeading,
+  cardStatus,
+  mergeCardUpdate,
+  shouldApplyResend,
+  UNRESOLVED_LABEL,
+} from "./card-status.js";
+import {
+  buildTermsMarkdown as buildTermsMarkdownPure,
+  escMd,
+  isHttpUrl,
+} from "./terms-markdown.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -583,14 +597,6 @@ function showErrorBanner(message) {
 // http/https 以外のスキームを弾く(サーバー側 src/extract/enrich.ts の isHttpUrl と同じ検証)。
 // サーバー側で既に弾いている想定だが、上流(web検索の citation)の出力形式に検証をかけず
 // a.href に渡すのは危険なため、クライアント側でも多層防御として同じチェックを行う。
-function isHttpUrl(url) {
-  try {
-    const { protocol } = new URL(url);
-    return protocol === "http:" || protocol === "https:";
-  } catch {
-    return false;
-  }
-}
 
 // カードのリンク一覧を linksEl に描画する共通関数。addCard(cards受信・セッション復元)と
 // updateCard(card_update)の両方から呼ぶことで、描画コードを二重に持たない(#10)。
@@ -611,6 +617,41 @@ function renderCardLinks(linksEl, links) {
   return shown;
 }
 
+// カードの見出し部（状態クラス・見出し・バッジ・音声表記）を card の**現在の中身から
+// 組み直す**。addCard と updateCard の両方が呼ぶ(#24)。
+//
+// updateCard で `probable → unresolved` の降格が起きると、見出しそのものが term から
+// surface form に変わる。差分だけを当てにいくと「バッジは消えたが見出しは古いまま」の
+// 中途半端な状態が作れてしまうので、状態に依存する部分は毎回まとめて作り直す。
+function renderCardHead(div, card) {
+  const status = cardStatus(card);
+  const heading = cardHeading(card);
+  div.classList.remove("confirmed", "probable", "unresolved");
+  div.classList.add(status);
+
+  let header = div.querySelector(".card-header");
+  if (!header) {
+    header = el("div", "card-header");
+    div.prepend(header);
+  }
+  header.textContent = "";
+  header.append(el("span", "term", heading));
+  // unresolved の reading は「特定できなかった用語」の読みなので出さない。
+  // 見出しが surface form(カタカナ)になっている以上、読み仮名を添える意味もない。
+  if (status !== "unresolved" && card.reading) {
+    header.append(el("span", "reading", card.reading));
+  }
+  if (status === "probable") header.append(el("span", "maybe", "もしかして?"));
+  if (status === "unresolved") header.append(el("span", "unknown", `❓ ${UNRESOLVED_LABEL}`));
+
+  // 「音声: 〜」は見出しと違う表記のときだけ意味がある。unresolved では見出し自体が
+  // 聞き取られた表記なので、同じ文字列を2行に並べない。
+  div.querySelector(".corrected")?.remove();
+  if (card.correctedFrom && card.correctedFrom !== heading) {
+    header.after(el("div", "corrected", `音声: ${card.correctedFrom}`));
+  }
+}
+
 function addCard(card) {
   const existing = cardData.get(card.term);
   if (existing) {
@@ -618,9 +659,11 @@ function addCard(card) {
     // 再接続直後はサーバー側のデデュープ状態が空から始まるため、既出用語が再びカードとして
     // 届きうる。清書済み(既存 links がある)ならドラフト(links: [])で
     // description/links を上書きしない。未清書ならドラフト説明の更新は許可する。
-    if (existing.links.length === 0) {
+    // 畳み込むかの判断は shouldApplyResend() に集約する（DOM 抜きで固定するため）
+    if (shouldApplyResend(existing)) {
       existing.description = card.description;
       existing.willEnrich = card.willEnrich;
+      // status は上書きしない。「unresolved から上へは戻さない」は再接続の経路でも守る
       const div = [...cardsEl.children].find((c) => c.dataset.term === card.term);
       if (div) {
         div.querySelector(".desc").textContent = card.description;
@@ -638,25 +681,29 @@ function addCard(card) {
 
   cardData.set(card.term, { ...card });
   const div = el("div", "card");
+  // **dataset.term は term のまま。** 見出しが surface form になっても改名はしない(#24)。
+  // card_update・cardData・highlightOwner がすべて term で突き合わせているため。
   div.dataset.term = card.term;
-  const header = el("div");
-  header.append(el("span", "term", card.term), el("span", "reading", card.reading));
-  if (card.confidence === "low") header.append(el("span", "maybe", "もしかして?"));
-  div.append(header);
-  if (card.correctedFrom) div.append(el("div", "corrected", `音声: ${card.correctedFrom}`));
+  renderCardHead(div, card);
   div.append(el("div", "desc", card.description));
   // リンクは renderCardLinks で描画する(updateCard と共通)。清書済み(links がある)なら
   // willEnrich の真偽によらずリンクを出す。復元直後は WS が無く card_update が来ないため、
   // ここでリンクを出さないと清書済みカードでも「確認中」のまま固まってしまう(#10)。
   // 「確認中」は清書前(links が空)かつ willEnrich のときだけに限定する。
-  const linksEl = el("div", "links");
-  div.append(linksEl);
-  if (renderCardLinks(linksEl, card.links) === 0) {
-    if (card.willEnrich) {
-      linksEl.classList.add("pending");
-      linksEl.textContent = "🔎 最新情報を確認中…";
-    } else {
-      linksEl.remove();
+  //
+  // **unresolved はリンクを一切出さない(#24)。** どの用語か特定できていない以上、
+  // 関連リンクは「別の用語の資料」になりかねない。そもそも検証にも回さないので
+  // (`selectVerifyTargets` が除く)、「確認中」を見せても更新は来ない。
+  if (cardStatus(card) !== "unresolved") {
+    const linksEl = el("div", "links");
+    div.append(linksEl);
+    if (renderCardLinks(linksEl, card.links) === 0) {
+      if (card.willEnrich) {
+        linksEl.classList.add("pending");
+        linksEl.textContent = "🔎 最新情報を確認中…";
+      } else {
+        linksEl.remove();
+      }
     }
   }
   // バナーがあればその直後に挿入し、バナーを常に先頭に保つ
@@ -667,20 +714,37 @@ function addCard(card) {
   scheduleSessionSave();
 }
 
-function updateCard({ term, description, links }) {
+function updateCard({ term, status, description, links }) {
   const stored = cardData.get(term);
-  // cardData が変化するのはここなので、DOM が見つからず早期returnする場合でも保存はする
-  if (stored) {
-    Object.assign(stored, { description, links });
-    scheduleSessionSave();
+  // 表示の材料は cardData が正。stored が無ければ描く根拠が無いので何もしない
+  // （合成すると surfaceForms が空になり、unresolved の見出しが**推定した term** に
+  // 落ちる — 特定できていない用語名をバッジ付きで断定してしまう）。
+  if (!stored) return;
+  // **unresolved からは戻さない。** 再接続でカードが再抽出されると同じ用語が再び
+  // Stage 2 に回り、今度は裏付けが取れることがある（LLM + web 検索なので非決定的）。
+  // 昇格を許すと「特定できませんでした」が通常カードに戻り、見出しが surface form から
+  // term に切り替わる。addCard の再送経路にも同じガードがあり、そちらと揃える。
+  // 畳み込みの判断は mergeCardUpdate() に集約する（不変条件を DOM 抜きで固定するため）
+  Object.assign(stored, mergeCardUpdate(stored, { status, description, links }));
+  scheduleSessionSave();
+  const div = [...cardsEl.children].find((c) => c.dataset.term === term);
+  if (!div) return;
+  // 状態の判定はカード全体を渡して cardStatus() に任せる（`status` を直接読まない）
+  const card = stored;
+  // 検証の結果で見出しが変わりうる（probable → unresolved の降格で surface form になる）
+  renderCardHead(div, card);
+  div.querySelector(".desc").textContent = card.description;
+
+  let linksEl = div.querySelector(".links");
+  if (cardStatus(card) === "unresolved") {
+    // 特定できなかったカードにリンクは出さない(addCard と同じ理由)。
+    // サーバーは棄却時に links: [] を送るが、ここでも落としておく
+    linksEl?.remove();
+    return;
   }
-  const card = [...cardsEl.children].find((c) => c.dataset.term === term);
-  if (!card) return;
-  card.querySelector(".desc").textContent = description;
-  let linksEl = card.querySelector(".links");
   if (!linksEl) {
     linksEl = el("div", "links");
-    card.append(linksEl);
+    div.append(linksEl);
   }
   linksEl.classList.remove("pending");
   if (renderCardLinks(linksEl, links) === 0) linksEl.remove();
@@ -707,9 +771,7 @@ function fmtElapsed(ms) {
 
 // Markdown の記号が含まれても記法として解釈されないようにする。
 // 記号を含まない文字列は素通りするので、通常の発話では出力は変わらない。
-const escMd = (s) => String(s ?? "").replace(/([\\`*_[\]<>#])/g, "\\$1");
 // 括弧を含む URL は <> で囲む(囲まないとリンクが途中で切れる)
-const mdUrl = (u) => (/[()\s]/.test(u) ? `<${u}>` : u);
 
 function buildTranscriptMarkdown() {
   const started = sessionStartedAt ?? new Date();
@@ -740,35 +802,9 @@ function buildTranscriptMarkdown() {
 }
 
 function buildTermsMarkdown() {
-  const started = sessionStartedAt ?? new Date();
-  const cards = [...cardData.values()];
-  const out = [
-    `# 用語カード ${fmtDateTime(started)}`,
-    "",
-    `- 件数: ${cards.length}`,
-    "",
-    "> TermLens が会話から自動抽出した用語です。解説は生成AIによるもので、誤りを含む場合があります。",
-    "> 登場順に並んでいます。",
-    "",
-    "---",
-    "",
-  ];
-  for (const card of cards) {
-    const reading = card.reading ? `（${escMd(card.reading)}）` : "";
-    const maybe = card.confidence === "low" ? " ※要確認" : "";
-    out.push(`## ${escMd(card.term)}${reading}${maybe}`, "");
-    if (card.correctedFrom) out.push(`> 音声認識では「${escMd(card.correctedFrom)}」と聞き取られた語です。`, "");
-    if (card.description) out.push(escMd(card.description), "");
-    // 復元経路では links が localStorage 由来になり信頼境界が一段緩いため、
-    // addCard/updateCard の描画と同じ isHttpUrl 検証をここでも通す(M5)
-    const validLinks = (card.links ?? []).filter((link) => isHttpUrl(link.url));
-    if (validLinks.length) {
-      out.push("**関連リンク**", "");
-      for (const link of validLinks) out.push(`- [${escMd(link.title)}](${mdUrl(link.url)})`);
-      out.push("");
-    }
-  }
-  return out.join("\n");
+  // 整形は `terms-markdown.js` の純関数に任せる（テストから読めるようにするため）。
+  // ここは画面の状態（開始時刻・カード順）を渡すだけ。
+  return buildTermsMarkdownPure([...cardData.values()], fmtDateTime(sessionStartedAt ?? new Date()));
 }
 
 // ホーム画面に追加した PWA では <a download> が働かない場合があるため、

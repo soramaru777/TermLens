@@ -26,9 +26,32 @@ export const TermCaseSchema = z.object({
   expectTerms: z.array(z.string()).default([]),
   /** 誤認識表記 → 正しい表記。正しい補正率の分母 */
   expectCorrection: z.record(z.string(), z.string()).default({}),
-  /** 出てはいけない用語。1つでも出たら誤補正扱い */
+  /**
+   * 出てはいけない用語。1つでも出たら誤補正扱い。
+   *
+   * **`status: "unresolved"` のカードは対象外**（#24）。降格したカードは term を画面に
+   * 出さない（見出しは聞き取られた表記になる）ので、利用者から見て「その用語に補正した」
+   * とは言えない。ここを見ないと、Stage 2 が正しく棄却しても誤補正として数え続け、
+   * この機能の効果が指標に一切現れない。
+   */
   forbidTerms: z.array(z.string()).default([]),
-  /** 出ても減点しない用語（表記ゆれ・関連語）。Precision の分子に算入する */
+  /**
+   * 「特定できない」が正解の表記（#24）。**音声認識が聞き取った表記**を並べる。
+   *
+   * その表記を `correctedFrom` か `surfaceForms` に持つカードが `status: "unresolved"`
+   * で出れば正解。`expectTerms` は「出てほしい用語」の集合なので、特定できないのが
+   * 正解のケースは分母にも分子にも入らず、**unresolved 率をまったく動かせなかった**。
+   */
+  expectUnresolved: z.array(z.string()).default([]),
+  /**
+   * 出ても減点しない用語（表記ゆれ・関連語）。Precision の分子に算入する。
+   *
+   * **名前は `confidence` 時代のままだが、判定に status は使っていない**（#24）。
+   * ここは「この用語のカードが出ても想定内」という**用語の集合**で、状態とは無関係に
+   * Precision の分子へ入れる。`unresolved` のカードも term はそのまま残る（改名しない）
+   * ので、unresolved を期待するケースでは**聞き取られた表記そのもの**をここに置く。
+   * 改名すると過去レポートとの比較がしづらくなるため、キー名は据え置いてある。
+   */
   allowLowConfidence: z.array(z.string()).default([]),
 });
 

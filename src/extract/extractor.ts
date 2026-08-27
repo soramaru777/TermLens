@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { zodResponseFormat } from "openai/helpers/zod";
+import type { TermStatus } from "../protocol.js";
 import { normalizeTerm } from "./normalize.js";
 import {
   ExtractionResultSchema,
@@ -18,12 +19,12 @@ export const client = new OpenAI();
 export const ROLE_PROMPT = `あなたは会議のリアルタイム文字起こしを監視し、聞き手が知らない可能性のある専門用語・固有名詞・重要語を抽出して、日本語で約100文字(最大120文字)の解説カードを作るアシスタントです。
 
 ルール:
-1. 文字起こしは音声認識由来で、特にカタカナ語・英語由来の用語が崩れていることがある。文脈と用語集から本来の用語を推定して term に正規化し、元の崩れた表記を correctedFrom に入れること(例: 「クバネテス」→ term: Kubernetes, correctedFrom: クバネテス)。推定に自信がなければ confidence を low にすること。
+1. 文字起こしは音声認識由来で、特にカタカナ語・英語由来の用語が崩れていることがある。文脈と用語集から本来の用語を推定して term に正規化し、元の崩れた表記を correctedFrom に入れること(例: 「クバネテス」→ term: Kubernetes, correctedFrom: クバネテス)。推定の確からしさは status で表すこと: 補正していない、または確信のある補正なら confirmed、補正したが確信がなければ probable。**どの用語なのか特定できない場合は unresolved にし、term を無理に確定しないこと。** 音韻が似ているだけの実在用語を当てにいくより、特定できないと言うほうがよい。unresolved のときは description を空文字でよい(表示は定型文に差し替える)。
 2. 「表示済み用語リスト」にある用語(表記ゆれ・言い換えを含む)は出力しないこと。
 3. 一般的な日常語や、解説不要な平易な語は出力しないこと。該当する用語がなければ cards は空配列でよい。
 4. 用語集の語は主に音声認識の補助情報である。参加者名・社名そのものはカード化不要だが、文脈上重要な専門用語であればカード化してよい。
 5. 解説は前提知識のないビジネスパーソンにも分かる平易な日本語で書くこと。
-6. rarity は用語のレア度: よく知られた一般用語は common、業界人なら知っている用語は uncommon、ニッチ・新しい・固有名詞・誤認識から復元した用語は rare とすること。
+6. rarity は用語のレア度: よく知られた一般用語は common、業界人なら知っている用語は uncommon、ニッチ・新しい・固有名詞は rare とすること。誤認識から復元した用語(status が probable または unresolved のもの)も rare とすること — 確認価値が高いので後段のウェブ検索に回す。
 7. surfaceForms には、その用語が「新しい文字起こし」に登場した表記を原文のまま列挙すること(カタカナ表記・誤認識表記を含む。文字起こしに現れない表記は入れない)。
 8. term の表記は次の基準で決めること。日本語の会議で読むカードなので、日本語話者が実際に使う表記に合わせる。
    - 製品名・サービス名・企業名・規格名・略語など、正式な原表記があるものはその表記のまま書く(例: Kubernetes、Grafana、Pinecone、Qdrant、OAuth、PKCE、NDA、Jira、RAG)。無理に日本語訳・カタカナ化しないこと。
@@ -113,6 +114,52 @@ export function normalizeCandidates<
 }
 
 /**
+ * `status: "unresolved"` のカードに必ず入る解説文(#24)。
+ *
+ * **カード側で言い換えを許さない。** 「特定できませんでした」の文言が用語ごとに揺れると、
+ * 利用者から見て「解説なのか、解説できないという断り書きなのか」が読み分けられなくなる。
+ */
+export const UNRESOLVED_DESCRIPTION = "音声認識の表記から正しい用語を特定できませんでした。";
+
+/**
+ * `unresolved` のカードの解説を定型文に差し替える(#24)。
+ *
+ * AC「unresolved 時に架空/別用語の説明を生成しない」を**サーバー側で担保する**ための関数。
+ * プロンプト規則1でも「description は空文字でよい」と指示しているが、
+ * `filterSurfaceForms()` / `normalizeCandidates()` と同じく **LLM の従順さに依存しない**。
+ * 特定できていないのに解説だけ書いてくると、利用者から見れば「別の用語の説明を
+ * 断定的に読まされる」ことになり、この Issue で防ぎたかった害がそのまま出る。
+ *
+ * `unresolved` 以外のカードは**オブジェクトごと素通しする**(新しい参照を作らない)。
+ * 触っていないことが `assert.equal(out[0], input[0])` で確かめられる。
+ */
+export function normalizeStatus<
+  T extends {
+    status: TermStatus;
+    description: string;
+    correctedFrom: string | null;
+    surfaceForms: string[];
+  },
+>(cards: T[]): T[] {
+  return cards
+    .filter((card) => {
+      if (card.status !== "unresolved") return true;
+      // **見出しに出せる材料が無い unresolved カードは落とす。**
+      // クライアントは `surfaceForms[0] ?? correctedFrom ?? term` を見出しにするので、
+      // どちらも無いと**推定した term が見出しに出る** — 「特定できませんでした」の
+      // バッジ付きで誤った実在用語を断定するという、この Issue が最も避けたい形になる。
+      // `filterSurfaceForms()` は文字起こしに実在する表記しか残さないので、表記が僅かに
+      // ズレただけで surfaceForms は空になりうる(`surface-forms.test.ts` の
+      // 「空になってもカード自体は残す」経路)。特定できていないうえ元の表記も示せない
+      // カードは利用者に何も伝えないので、出さないほうがよい。
+      return card.surfaceForms.length > 0 || card.correctedFrom !== null;
+    })
+    .map((card) =>
+      card.status === "unresolved" ? { ...card, description: UNRESOLVED_DESCRIPTION } : card,
+    );
+}
+
+/**
  * user ターンを組み立てる。
  *
  * **判断対象(新しい文字起こし)を末尾＝直近に置く。** 参考情報が先、対象が後。
@@ -156,6 +203,9 @@ export function createExtractor(glossary: string[]) {
     });
 
     const cards = response.choices[0]?.message.parsed?.cards ?? [];
-    return normalizeCandidates(filterSurfaceForms(cards, input.newTranscript));
+    // 3つとも「プロンプトの指示をサーバー側でも担保する」純関数。順番に意味はある
+    // (normalizeStatus は最後 — 手前の2つが description を触らないので、定型文への
+    // 差し替えが後段で上書きされることはない)。
+    return normalizeStatus(normalizeCandidates(filterSurfaceForms(cards, input.newTranscript)));
   };
 }

@@ -21,7 +21,7 @@ export function card(term: string, overrides: Partial<ExtractedCard> = {}): Extr
     term,
     reading: "テストヨミ",
     description: "テスト用のカード。",
-    confidence: "high",
+    status: "confirmed",
     rarity: "rare",
     correctedFrom: null,
     surfaceForms: [],
