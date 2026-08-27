@@ -21,7 +21,7 @@ updated: 2026-08-27
 
 | 層 | 対象 | 実行 | 決定的か |
 |---|---|---|---|
-| 決定的テスト | 純関数（正規化・エラー分類・引用除去・話者分割・FIR 設計） | `npm test` / CI 常時 | はい |
+| 決定的テスト | 純関数（正規化・エラー分類・引用除去・話者分割・FIR 設計・収音モード・診断） | `npm test` / CI 常時 | はい |
 | LLM 評価 | 用語抽出そのものの精度 | `RUN_LLM_EVAL=1 npm test` / `npm run eval:llm` | いいえ（3回平均） |
 
 ## コマンド
@@ -72,7 +72,7 @@ import するために要る。
 | `surface-forms.test.ts` | `filterSurfaceForms()`（`src/extract/extractor.ts`） | `newTranscript` に**実在する表記だけ**が残ること、**空になってもカードは落とさない**こと、他フィールドと入力配列を変えないこと、空文字列（`includes("")` が常に true になる穴） |
 | `normalize-status.test.ts` | `normalizeStatus()`（`src/extract/extractor.ts`） | `unresolved` の `description` が**定型文（`UNRESOLVED_DESCRIPTION`）に差し替わる**こと（空文字で返ってきた場合も埋める）、`confirmed` / `probable` は**オブジェクトごと素通し**すること（`assert.equal(out[0], input[0])` で参照ごと固定）、他フィールドと入力配列を変えないこと、**`extract()` が実際に通していること**（配線。`parse` だけ差し替えて実 API は叩かない） |
 | `card-status.test.ts` | `cardStatus()` / `cardHeading()`（`public/card-status.js`） | **後方互換** — `status` が無い旧カードを `confidence` から導出すること（`low` → `probable`、それ以外 `confirmed`）、`status` を `confidence` より優先すること（降格したカードが復元で戻らない）、どちらも無ければ `confirmed` に倒すこと。**`unresolved` の見出し**が `surfaceForms[0]` → `correctedFrom` → `term` の順に落ちること、`confirmed` / `probable` は `term` のままであること |
-| `app-wiring.test.ts` | `public/app.js` が `card-status.js` のガードを**実際に呼んでいる**こと | **ソース文字列を読む不格好なテスト**。純関数の中身は押さえてあっても「app.js がそれを使っている」ことは1本も守られておらず、**#24 のレビューで2度指摘された不具合そのものを書き戻しても全テストが緑のまま**だった（変異で確認）。`app.js` はモジュール評価時に `document` を触るので Node から import できず、jsdom はビルドレスの方針に対して重い。壊れやすいが**壊れたときに直すべきなのは呼び出し側**なので誤検知にならない。「本文を畳み込み後のカードから描く」は該当行が2箇所あるため**悪い形の不在**で判定する |
+| `app-wiring.test.ts` | `public/app.js` が `card-status.js` のガードを**実際に呼んでいる**こと | **ソース文字列を読む不格好なテスト**。純関数の中身は押さえてあっても「app.js がそれを使っている」ことは1本も守られておらず、**#24 のレビューで2度指摘された不具合そのものを書き戻しても全テストが緑のまま**だった（変異で確認）。`app.js` はモジュール評価時に `document` を触るので Node から import できず、jsdom はビルドレスの方針に対して重い。壊れやすいが**壊れたときに直すべきなのは呼び出し側**なので誤検知にならない。「本文を畳み込み後のカードから描く」は該当行が2箇所あるため**悪い形の不在**で判定する。#26 で収音モードと診断の配線も追加した — constraints が `capture-mode.js` 由来であること（**app.js に `echoCancellation:` 等がベタ書きされていないこと**を悪い形の不在で見る。ベタ書きが戻ると `capture-mode.test.ts` が見ていない値で実際のマイクが開く）、**`e.data instanceof ArrayBuffer` で音声と統計を判別し、`ws.send` がその分岐の中にあること**（判別が抜けると統計オブジェクトがそのまま Deepgram へ送られる）、`getSettings()` が採用リストを通ること（かつ **app.js が `deviceId` という文字列に触れていないこと**）、ホーム画面にモードが常時出ること、選択肢が `CAPTURE_MODES` から組み立てられること（HTML に `<option>` を書き写すと定義が2箇所になる）、保存値が `normalizeCaptureMode()` を通ること |
 | `candidates.test.ts` | `normalizeCandidates()`（`src/extract/extractor.ts`） | 上限（`MAX_CANDIDATES` = 3）で切ること、**先頭を差し込んだ後に切る**こと（先に切ると `term` 自身が枠から溢れる）、`term` を先頭へ移すこと、候補が空なら `term` 1件を補うこと、**先頭の表記を `card.term` に揃える**こと（不変条件 `candidates[0].term === term` を表記ゆれで条件付きにしない）、正規化キーが同じ候補を畳むこと、空・空白だけの候補を落とすこと、他フィールドと入力配列を変えないこと |
 | `verify-parse.test.ts` | `parseVerifyOutput()` / `isVerified()` / `buildVerifyInput()` / `verifyAndEnrich()` の配線（`src/extract/enrich.ts`） | **候補に無い用語を採らない**こと（採れると検証段が新しい誤補正を作れてしまう）、`chosen` が null/空文字なら棄却、`chosen` の表記ゆれを候補側の表記に揃えること、コードフェンス・前置き越しでも JSON を拾うこと、`description` の引用記法除去と120字クランプ、**解釈できない出力を例外にする**こと（握り潰すと検証が効いていないことに気づけない）、`isVerified()` が候補#2 の採用を裏付け無しとすること、**`verification.exists` か `fitsContext` が false なら `chosen` を null に倒す**こと（#25。素通しにすると「実在が確認できていない用語」が `confirmed` で表示される）、整合が取れていれば `normalizeVerification()` が**オブジェクトごと素通し**すること、`verification` を欠いた応答を例外にすること（既定値で埋めると内訳が常に `exists: true` に化ける）、**用語集は関連語だけが入力に乗る**こと、`countWebSearches()` が web 検索の回数を数え**棄却でも返す**こと、**`max_tool_calls` がリクエストに乗り、soft cap より厳密に大きい**こと（AC5。落とすと上限が消え、同値だと API の打ち切りが soft cap より先に効く）、`searchLimit()` が上限なし（0 以下）で `max_tool_calls` を送らないこと（計測用の無検閲ベースライン）、**SYSTEM が「## 候補の検証」「## 解説の作成」の2節に分かれている**こと（AC4 の半分はプロンプトの見出しに載っているので、畳んでも型もテストも落ちない）、SYSTEM が soft cap と関連語の使い方を指示すること、**`tools`（web検索）と `text`（構造化出力）と `include`（検索結果の同梱）を同時に要求している**こと、**後ろに別のオブジェクトや `}` を含む後書きが続いても最初の1件だけを拾う**こと（末尾の `}` まで舐めると巻き込んでパースに失敗する）。`responses.create` だけ差し替えて実 API は叩かない |
 | `scheduler-verify.test.ts` | `selectVerifyTargets()` と検証つき清書の分岐（`src/extract/scheduler.ts`） | 補正あり・`status !== "confirmed"` はレア度が最下位でも検証対象になること（**レア度上位の枠を埋めた状態で確かめる**。枠が空いていると従来条件だけで通ってしまい、追加した条件を消しても落ちないテストになる）、**`unresolved` も対象に入ること**（`status === "probable"` と書くと黙って漏れる）、検証に回るカード数が選定と一致すること、`willEnrich` が選定と一致すること、補正なし `confirmed` は対象外になりうること、**`candidates` がクライアント向けカードに含まれない**こと（スプレッドで漏れる）、棄却時に **`status: "unresolved"` が `card_update` で届く**こと（#24 の肝。ここが `confirmed` のままだと裏付けの取れなかったカードが通常カードとして残る）、**裏付けが取れたら `confirmed` が届く**こと、解説は速報のまま・リンクは空であること（送らないと「確認中」の表示が畳まれず回り続ける）、速報カードは消さないこと、`console.warn` が `term` と `reason` だけを出し**文字起こし本文を含まない**こと、候補#2 が選ばれた場合も改名せず `unresolved` に降格すること、**用語集の関連語だけが検証段へ届き参加者名は届かない**こと（#25 の配線。届かないと関連語が常に空になり、絞り込みのテストが空回りになる。関連語は候補と重なるので、**配線が抜けたことは節が `(なし)` に落ちることで判別する**）、**候補#2 の差し替えを棄却として記録しない**こと（ログの分岐は `!isVerified()` なので差し替えも通る。一律に棄却扱いすると `rejection` が null のまま `(理由なし)` と出る）、`console.warn` が**棄却の理由**（`RejectionKind` の定型見出し）を出し `evidence` は出さないこと、**検証を打ち切ったら `onError` で利用者へ通知する**こと（無言だと以降ずっと未検証のカードが出続けることを誰も知れない）とそのとき `permanent` を立てないこと（抽出は生きている） |
@@ -84,6 +84,9 @@ import するために要る。
 | `error-classify.test.ts` | `isPermanent()` / `isQuotaExhausted()` / `toUserMessage()` | 400/401/403/404/422/429(quota) は恒久、408/409/429(rate)/5xx/接続エラーは一時。利用者向け文言 |
 | `strip-citations.test.ts` | `stripInlineCitations()` | 除去する記法と、触ってはいけない日本語の記号 |
 | `lowpass.test.ts` | `designLowpass()` | 通過域・阻止域・直流ゲイン・線形位相 |
+| `capture-mode.test.ts` | `CAPTURE_MODES` / `audioConstraints()`（`public/capture-mode.js`） | **既定モード（対面会議）の constraints が #26 以前と1バイトも違わないこと**（AC6。ここが動くとモードを一度も触っていない利用者の文字起こしまで変わる。**期待値はリテラルで書く** — 定義元からimport すると定義を変えたときに一緒に動いて何も守らない）、スピーカー収音が echoCancellation / noiseSuppression だけを反転させること（自動ゲインとチャンネル数まで動くと比較実験の変数が増える）、2モードが同じ値でないこと、未知のモード名が既定に倒れること、**`"constructor"` などの Object.prototype 由来のキーを受け付けないこと**（モード名は localStorage から来る。素の `CAPTURE_MODES[mode]` だと truthy になり `constraints` が undefined のまま getUserMedia へ渡る）、`audioConstraints()` が毎回新しいオブジェクトを返すこと |
+| `diagnostics.test.ts` | `pickTrackSettings()` / `mergeAudioStats()` / `buildDiagnosticsMarkdown()`（`public/diagnostics.js`） | **何が診断に出るか**（#26）。`deviceId` / `groupId` が出ないこと、**除外リストではなく採用リストであること**（知らないキーを足しても通らない。ここが落ちないと「ブラウザが将来キーを足しても混ざらない」という性質を誰も守らない）、`getSettings()` が無い/空でも落ちないこと、統計の加算と **`peak` だけ最大値**であること、**分布のビン配列を要素ごとに足す**こと（長さの違う配列で分布が崩れないこと）、**無音の水準を後から変えられる**こと（集計時に畳むと閾値を決めるための分布が壊れる）、dBFS のビン分けが境界で取り違えないこと、壊れた統計で累積を NaN に落とさないこと、1サンプルも無ければ `null`（「測れていない」と「全部ゼロ」を区別する）、Markdown に**生の `getSettings()` を渡しても端末識別子が出ない**こと、会話本文を含まないと明記すること |
+| `audio-stats.test.ts` | `public/audio-processor.js` の入力統計（#26） | **worklet を実際に走らせる**。`AudioWorkletProcessor` / `registerProcessor` をスタブすれば `process()` は素の JS なので決定的に叩ける。**統計がローパス前の生入力から取られていること**を、阻止域の 12kHz を入れて RMS が落ちないことで判定する（ソースを目で見て順番を確かめるだけだと、後から `filter()` の後ろへ動かされて静かに壊れる）。あわせて**音声の経路が無傷**（4000 サンプルの ArrayBuffer が従来どおり出る）、統計と音声が別の型で送られること、無音・飽和が比率に出ること、統計が約1秒ごとで**区間ごとに 0 に戻る**こと（累積を送っていると 2 件目以降が膨らむ） |
 | `eval-metrics.test.ts` | `src/eval/metrics.ts` | 6指標の計算そのもの（LLM 抜き）。**`probable` と `unresolved` を別々の列に数える**こと（#24。合算すると過剰 unresolved に気づけない） |
 | `llm-eval.test.ts` | 用語抽出（LLM） | 既定では **skip**。ケース JSON のスキーマ検証だけ常時実行 |
 
@@ -186,6 +189,32 @@ import する。テストが値をコピーしていると、本番側を変え�
 > わずかに届かないため、コメントは `lowpass.js`（定数の移動先）で実測値に書き換えてある。
 > 44.1kHz は入力ナイキストが低いぶん阻止域が 9.8kHz 付近まで押し下がり、10dB 以上の余裕がある。
 > 実用上の差は無いが、閾値は実測から決めている。
+
+### AudioWorklet は2行のスタブで Node から走らせられる
+
+> 2026-08-27 追加（Issue #26）: `tests/audio-stats.test.ts`。
+
+`public/audio-processor.js` が Node から読めないのは `AudioWorkletProcessor` と
+`registerProcessor` が無いからだけで、**`process()` の中身は素の JS**。この2つを
+`globalThis` に置いてから `import()` すれば、そのまま決定的に叩ける。
+
+```
+globalThis.AudioWorkletProcessor = class { /* port.postMessage を記録するだけ */ };
+globalThis.registerProcessor = (_name, ctor) => { Registered = ctor; };
+await import("../public/audio-processor.js");
+```
+
+**ESM のモジュールキャッシュがあるので import は1度きり。** コンストラクタを掴んだら
+以後はそれを `new` する（テストごとに import し直そうとすると 2 回目以降は
+`registerProcessor` が呼ばれず `Registered` が undefined のままになる）。
+post されたものはインスタンスごとに溜める。
+
+これで**ソース文字列を読まずに済む性質**が増える。`app-wiring.test.ts` の不格好さは
+`app.js` がモジュール評価時に `document` を触るせいで、worklet 側には同じ制約が無い。
+
+**「統計をローパス前から取っている」ことは、順番を目で確かめても守れない。**
+後から `this.filter(channel)` の後ろへ動かせば静かに壊れる。阻止域（12kHz）の信号を
+入れて **RMS が落ちないこと**で判定すれば、位置が動いた瞬間に落ちる。
 
 ## LLM 評価（`src/eval/`）
 

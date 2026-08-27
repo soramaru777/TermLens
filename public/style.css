@@ -138,13 +138,15 @@ button.primary:disabled { opacity: 0.5; }
   gap: 4px;
 }
 .settings-body label { font-size: 0.85rem; font-weight: 600; margin-top: 16px; }
-.settings-body input, .settings-body textarea {
+.settings-body input, .settings-body textarea, .settings-body select {
   font-size: 1rem;
   padding: 10px;
   border: 1px solid #cfd6d4;
   border-radius: 8px;
   background: #fff;
   font-family: inherit;
+  /* select は既定色が端末依存。input と揃える */
+  color: var(--text);
   width: 100%;
 }
 .settings-body textarea { resize: vertical; }
@@ -209,6 +211,22 @@ button.primary:disabled { opacity: 0.5; }
   color: var(--muted);
   cursor: default;
 }
+/* 収音診断パネル(#26)。既定は畳んであり、開くと表を出す */
+#diag-panel {
+  padding: 6px 14px 8px;
+  background: #eef3f1;
+  border-bottom: 1px solid #dfe4e2;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+#diag-panel summary { cursor: pointer; font-weight: 600; }
+#diag-table {
+  margin-top: 6px;
+  border-collapse: collapse;
+  width: 100%;
+}
+#diag-table td { padding: 2px 6px 2px 0; vertical-align: top; }
+#diag-table td:last-child { color: var(--text); font-variant-numeric: tabular-nums; }
 #transcript {
   flex: 0 0 32%;
   overflow-y: auto;
@@ -396,7 +414,7 @@ button.primary:disabled { opacity: 0.5; }
 /* --live-chrome はヘッダ(+停止後のダウンロード行)の実測値。app.js が更新する */
 @media (min-width: 900px) {
   #live { flex-direction: row; flex-wrap: wrap; align-content: flex-start; }
-  #live header, #export-row { flex-basis: 100%; }
+  #live header, #export-row, #diag-panel { flex-basis: 100%; }
   #card-nav { display: none; }
   #transcript { flex: 1 1 50%; height: calc(100dvh - var(--live-chrome, 52px)); border-bottom: none; border-right: 1px solid #e2e5e3; }
   #cards { flex: 1 1 50%; height: calc(100dvh - var(--live-chrome, 52px)); }
