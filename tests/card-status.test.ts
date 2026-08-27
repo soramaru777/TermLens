@@ -6,6 +6,7 @@ import {
   cardHeading,
   cardStatus,
   mergeCardUpdate,
+  shouldApplyResend,
   UNRESOLVED_LABEL,
 } from "../public/card-status.js";
 
@@ -175,4 +176,45 @@ test("引数のカードを書き換えない", () => {
   mergeCardUpdate(stored, { status: "confirmed", description: "新", links: [] });
   assert.equal(stored.status, "probable");
   assert.equal(stored.description, "旧");
+});
+
+/**
+ * 再送された速報カードを畳み込むか（#24 のレビュー指摘）。
+ *
+ * **降格したカードへ更新が届く経路は2つある** — `card_update`（Stage 2）と
+ * `cards` の再送（再接続で Stage 1 が再抽出）。`mergeCardUpdate()` で前者を塞いだが、
+ * 後者に同じ穴が残っていた。status だけ守って description を通すと
+ * 「特定できませんでした」の見出しの下に断定的な解説が出る。
+ */
+test("unresolved のカードは再送を畳み込まない", () => {
+  assert.equal(
+    shouldApplyResend({ status: "unresolved", description: "定型文", links: [] }),
+    false,
+    "links が空でも据え置く（unresolved は常に links が空なので、links だけ見ると必ず通る）",
+  );
+});
+
+test("清書済みのカードは再送を畳み込まない", () => {
+  assert.equal(
+    shouldApplyResend({
+      status: "confirmed",
+      links: [{ title: "公式", url: "https://x.test/" }],
+    }),
+    false,
+    "ドラフトで清書を上書きしない（#8 からの判断）",
+  );
+});
+
+test("未清書の confirmed / probable は再送で更新する", () => {
+  assert.equal(shouldApplyResend({ status: "confirmed", links: [] }), true);
+  assert.equal(shouldApplyResend({ status: "probable", links: [] }), true);
+});
+
+test("status を持たない古いカードも confidence から判断する", () => {
+  assert.equal(shouldApplyResend({ confidence: "low", links: [] }), true, "probable 相当");
+});
+
+test("links が未定義でも落ちない", () => {
+  // localStorage から復元した壊れたカード
+  assert.equal(shouldApplyResend({ status: "confirmed" }), true);
 });

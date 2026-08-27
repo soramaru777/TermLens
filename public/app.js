@@ -10,6 +10,7 @@ import {
   cardHeading,
   cardStatus,
   mergeCardUpdate,
+  shouldApplyResend,
   UNRESOLVED_LABEL,
 } from "./card-status.js";
 import {
@@ -658,18 +659,16 @@ function addCard(card) {
     // 再接続直後はサーバー側のデデュープ状態が空から始まるため、既出用語が再びカードとして
     // 届きうる。清書済み(既存 links がある)ならドラフト(links: [])で
     // description/links を上書きしない。未清書ならドラフト説明の更新は許可する。
-    if (existing.links.length === 0) {
+    // 畳み込むかの判断は shouldApplyResend() に集約する（DOM 抜きで固定するため）
+    if (shouldApplyResend(existing)) {
       existing.description = card.description;
       existing.willEnrich = card.willEnrich;
-      // **status は上書きしない(#24)。** 再送されるのは速報（Stage 1）のカードなので、
-      // 検証で unresolved まで降格したカードを再抽出の判断で格上げしてしまう。
-      // 「unresolved から上へは戻さない」は再接続の経路でも守る。
+      // status は上書きしない。「unresolved から上へは戻さない」は再接続の経路でも守る
       const div = [...cardsEl.children].find((c) => c.dataset.term === card.term);
       if (div) {
         div.querySelector(".desc").textContent = card.description;
         const linksEl = div.querySelector(".links");
-        // unresolved にはリンクも「確認中」も出さない（降格後に再送されても戻さない）
-        if (card.willEnrich && !linksEl && cardStatus(existing) !== "unresolved") {
+        if (card.willEnrich && !linksEl) {
           div.append(el("div", "links pending", "🔎 最新情報を確認中…"));
         } else if (!card.willEnrich) {
           linksEl?.remove();

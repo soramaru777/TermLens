@@ -79,3 +79,22 @@ export function mergeCardUpdate(stored, update) {
     ...(update.status ? { status: update.status } : {}),
   };
 }
+
+/**
+ * 再送された速報カード（`cards`）を表示中のカードへ畳み込むか判断する（#24）。
+ *
+ * 再接続直後はサーバー側のデデュープ状態が空から始まるため、既出用語が再びカードとして
+ * 届きうる（#8 で冪等化した経路）。
+ *
+ * **据え置く条件は2つ。**
+ * - 清書済み（`links` がある）: ドラフトで上書きしない（#8 からの既存の判断）
+ * - `unresolved`: 検証で降格した判断を、再抽出の速報で上書きしない（#24）
+ *
+ * `status` だけ守って `description` を通すと「特定できませんでした」の見出しの下に
+ * **断定的な解説**が出る。`mergeCardUpdate()` に入れたのと同じガードで、
+ * **降格したカードへ更新が届く経路が2つある以上、両方に要る**。
+ */
+export function shouldApplyResend(existing) {
+  if (existing.links?.length) return false;
+  return cardStatus(existing) !== "unresolved";
+}
