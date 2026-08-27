@@ -6,11 +6,14 @@ import {
   PermissionDeniedError,
   RateLimitError,
 } from "openai";
+// パッケージのルートからは再エクスポートされていないのでサブパスから取る
+import { LengthFinishReasonError } from "openai/error";
 import type { TermCard, TermLink } from "../protocol.js";
 import { ContextWindow } from "./context.js";
 import { createExtractor } from "./extractor.js";
-import { enrichTerm } from "./enrich.js";
+import { isVerified, verifyAndEnrich } from "./enrich.js";
 import { normalizeTerm } from "./normalize.js";
+import type { ExtractedCard } from "./schema.js";
 
 const MIN_CHARS = 120;
 const MAX_WAIT_MS = 10_000;
@@ -54,6 +57,21 @@ export function isPermanent(err: unknown): boolean {
   return status >= 400 && status < 500 && !SDK_RETRYABLE_STATUSES.has(status);
 }
 
+/**
+ * **そのチャンクを再送しても必ず同じ結果になるエラーか**(#23)。
+ *
+ * `max_completion_tokens` に達すると SDK は `parsed` を null にするのではなく
+ * `LengthFinishReasonError` を投げる(`openai/lib/parser.js`)。これは `APIError` ではなく
+ * `OpenAIError` 直下なので `isPermanent()` は false を返し、素通しにすると一時エラー扱いで
+ * **同じ長さのチャンクをバッファ先頭に戻して再送し続ける**(確実に同じ所で切れる)。
+ *
+ * 抽出そのものは次のチャンクで復帰しうるので `disableExtraction()` までは行わず、
+ * **このチャンクだけ捨てる**。
+ */
+export function isUnretryableChunk(err: unknown): boolean {
+  return err instanceof LengthFinishReasonError;
+}
+
 /** 開発者向けの生メッセージを利用者向けの文言に変換する */
 export function toUserMessage(err: unknown): string {
   if (err instanceof AuthenticationError) {
@@ -81,6 +99,69 @@ export function toUserMessage(err: unknown): string {
 }
 
 /**
+ * 検証つき清書(Stage 2)に回すカードを選ぶ(#23)。
+ *
+ * 従来の「レア度上位の約半数」に **「補正あり または confidence low」** を足した和集合。
+ * 誤補正が疑わしいのはこの2つで、レア度ランキングが選ぶ集合とは大きく重なるため、
+ * web 検索の呼び出し増は小さい。
+ *
+ * **補正のないカードは Stage 2 を通さない。** そもそも速報は従来どおり即時表示で、
+ * Stage 2 は非同期の `card_update` なので、表示までの時間はどちらにせよ変わらない。
+ *
+ * 純関数として export してあるのは、評価ハーネス(`src/eval/run.ts`)が
+ * `EVAL_WITH_VERIFY=1` のときに**本番と同じ選定**で回すため。コピーすると drift する。
+ */
+export function selectVerifyTargets<
+  T extends {
+    term: string;
+    rarity: "common" | "uncommon" | "rare";
+    confidence: "high" | "low";
+    correctedFrom: string | null;
+  },
+>(cards: T[]): Set<string> {
+  // レア度上位の約半数。同レア度なら誤認識疑い(low)を先に詰める。
+  // **この並べ替えは対象を広げるためではなく、狭く保つためにある。** low は下のループで
+  // どのみち全部入るので、上位半数の枠を先に食わせておくと和集合の増分が小さくなる
+  // (枠が空くと補正なし・high のカードが余分に入る)。
+  const rarityRank = { rare: 2, uncommon: 1, common: 0 };
+  const ranked = [...cards].sort(
+    (a, b) =>
+      rarityRank[b.rarity] - rarityRank[a.rarity] ||
+      (a.confidence === "low" ? -1 : 0) - (b.confidence === "low" ? -1 : 0),
+  );
+  const targets = new Set(ranked.slice(0, Math.ceil(cards.length / 2)).map((c) => c.term));
+  // 誤補正が疑わしいカードはレア度に関係なく必ず検証する
+  for (const card of cards) {
+    if (card.correctedFrom !== null || card.confidence === "low") targets.add(card.term);
+  }
+  return targets;
+}
+
+/**
+ * 抽出結果をクライアント向けカードに落とす。
+ *
+ * **フィールドを1つずつ書き写す（スプレッドを使わない）。** `candidates` は検証段への
+ * 内部入力であってクライアントは使わないので、混ぜて送ると WS ペイロードと
+ * localStorage が候補ぶん太る(#19 で words を送らなかったのと同じ理由)。
+ * `{ ...card }` だと除外はコンパイラに守られず、`ExtractedCard` に内部用フィールドが
+ * 増えるたび黙って漏れる。明示的に書けば、増えたフィールドは何もしなければ漏れず、
+ * `TermCard` 側が増えたときは**型エラーで気づける**。
+ */
+function toClientCard(card: ExtractedCard, willEnrich: boolean): TermCard {
+  return {
+    term: card.term,
+    reading: card.reading,
+    description: card.description,
+    confidence: card.confidence,
+    correctedFrom: card.correctedFrom,
+    surfaceForms: card.surfaceForms,
+    rarity: card.rarity,
+    willEnrich,
+    links: [],
+  };
+}
+
+/**
  * 発話を蓄積し、「120文字以上」または「前回呼び出しから10秒経過かつ非空」で
  * LLM抽出を発火する。呼び出しは直列化し、既出用語はサーバー側でもデデュープする。
  *
@@ -94,6 +175,8 @@ export class ExtractionScheduler {
   private lastRunAt = Date.now();
   private running = false;
   private stopped = false;
+  /** 清書(検証)を打ち切ったか。残高切れ・恒久エラーで立てる。抽出は別に判定する */
+  private verifyDisabled = false;
   /** 恒久エラーで抽出を打ち切った状態。文字起こしは継続するのでセッションは止めない。 */
   private disabled = false;
   private consecutiveFailures = 0;
@@ -213,23 +296,14 @@ export class ExtractionScheduler {
         return true;
       });
       if (fresh.length > 0) {
-        // 清書(web検索)はレア度上位の約半数のみ。同レア度なら誤認識疑い(low)を優先
-        const rarityRank = { rare: 2, uncommon: 1, common: 0 };
-        const ranked = [...fresh].sort(
-          (a, b) =>
-            rarityRank[b.rarity] - rarityRank[a.rarity] ||
-            (a.confidence === "low" ? -1 : 0) - (b.confidence === "low" ? -1 : 0),
-        );
-        const enrichTargets = new Set(
-          ranked.slice(0, Math.ceil(fresh.length / 2)).map((c) => c.term),
-        );
+        const enrichTargets = selectVerifyTargets(fresh);
         // 速報: LLMの知識ベースのドラフト解説で即表示
         this.callbacks.onCards(
-          fresh.map((c) => ({ ...c, links: [], willEnrich: enrichTargets.has(c.term) })),
+          fresh.map((c) => toClientCard(c, enrichTargets.has(c.term))),
         );
-        // 清書: 選ばれた用語だけweb検索で最新情報を取得し、要約+関連リンクで更新
-        for (const term of enrichTargets) {
-          void this.enrichCard(term, chunk);
+        // 清書: 選ばれた用語だけweb検索で候補を検証し、要約+関連リンクで更新
+        for (const card of fresh) {
+          if (!this.verifyDisabled && enrichTargets.has(card.term)) void this.enrichCard(card, chunk);
         }
       }
     } catch (err) {
@@ -241,6 +315,14 @@ export class ExtractionScheduler {
         this.disableExtraction();
         // permanent: true。恒久エラーによる打ち切りだけがバナー表示の対象(#10)
         this.callbacks.onError(`用語抽出を停止しました。${toUserMessage(err)}`, true);
+        return;
+      }
+
+      if (isUnretryableChunk(err)) {
+        // 戻すと同じ長さで再送してまた切れる。連続失敗にも数えない(次のチャンクは通りうる)
+        console.warn(
+          `[scheduler] chunk dropped (${chunk.length} chars): 出力が上限に達したため再試行しない`,
+        );
         return;
       }
 
@@ -262,14 +344,42 @@ export class ExtractionScheduler {
     }
   }
 
-  private async enrichCard(term: string, context: string): Promise<void> {
+  private async enrichCard(card: ExtractedCard, context: string): Promise<void> {
     try {
-      const result = await enrichTerm(term, context);
+      const result = await verifyAndEnrich({
+        candidates: card.candidates,
+        correctedFrom: card.correctedFrom,
+        context,
+      });
+      const verified = isVerified(card.term, result.chosen);
+      if (!verified) {
+        // 棄却(#23 の既定)。**表示は変えず内部に記録するだけ**にして、まず誤補正率の
+        // 変化を測る土台を作る。表示への反映は unresolved 状態の Issue でまとめて入れる。
+        // 出すのは term と reason だけで、**文字起こし本文は出さない**
+        // (既存の `console.error("[scheduler] extraction failed:", err)` と同じ扱い)。
+        console.warn(`[scheduler] verification rejected "${card.term}": ${result.reason}`);
+      }
+      // **棄却でも更新は必ず届ける。** 速報は `willEnrich: true` で送ってあり、クライアントは
+      // `card_update` が来るまで「確認中」の表示を消さない(`public/app.js`)。ここで黙ると
+      // **誤補正が最も疑わしいカードにだけ**回り続けるスピナーが残る。棄却時は速報と同じ
+      // description を送るので表示テキストは動かない。
       // 停止後でも flush 済みカードの更新は届けてよい(送信可否は session 側が判定する)
-      this.callbacks.onCardUpdate(term, result.description, result.links);
+      this.callbacks.onCardUpdate(
+        card.term,
+        verified ? result.description : card.description,
+        verified ? result.links : [],
+      );
     } catch (err) {
-      // 清書失敗時はドラフト解説のまま(リンクなし)。致命的ではないのでログのみ
-      console.error(`[scheduler] enrich failed for "${term}":`, err);
+      // 清書失敗時はドラフト解説のまま(リンクなし)。1枚の失敗は致命的ではないのでログのみ。
+      // **ただし恒久エラー(残高切れを含む)は別。** 抽出側は `disableExtraction()` で1回止まるのに
+      // 検証側が素通しだと、選ばれたカードごとに web 検索つきの呼び出しを投げ続け、
+      // 誰にも通知されないまま課金だけが進む(#23 で対象集合を広げたぶん影響が大きい)。
+      if (isPermanent(err)) {
+        this.verifyDisabled = true;
+        console.error(`[scheduler] verification disabled after "${card.term}":`, err);
+        return;
+      }
+      console.error(`[scheduler] enrich failed for "${card.term}":`, err);
     }
   }
 }

@@ -130,5 +130,27 @@
     "expectCorrection": { "テラフォーム": "Terraform" },
     "forbidTerms": ["カナリアリリース", "ロールバック", "テラフォーム"],
     "allowLowConfidence": ["IaC", "Infrastructure as Code", "インフラ"]
+  },
+  {
+    "id": "lookalike-ansible",
+    "transcript": "サーバーの構成管理はアンシブルのプレイブックにまとめて、手順書からは順次移していきます。",
+    "context": "手作業でサーバーを設定していると環境ごとに差が出るので、そろそろ自動化したいという話をしていました。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["Ansible"],
+    "expectCorrection": { "アンシブル": "Ansible" },
+    "forbidTerms": ["アンサンブル", "Ensemble", "アンサンブル学習", "アンシブル"],
+    "allowLowConfidence": ["Playbook", "プレイブック", "構成管理", "IaC"]
+  },
+  {
+    "id": "lookalike-confluence",
+    "transcript": "議事録はコンフルエンスのスペースにまとめて、決定事項だけ別ページに切り出しましょう。",
+    "context": "ドキュメントの置き場所が人によってばらばらで、あとから探せないという声が出ていました。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["Confluence"],
+    "expectCorrection": { "コンフルエンス": "Confluence" },
+    "forbidTerms": ["Confluent", "コンフルエント", "Apache Kafka", "コンフルエンス"],
+    "allowLowConfidence": ["Atlassian", "スペース", "議事録"]
   }
 ]

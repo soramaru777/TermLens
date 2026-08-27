@@ -70,6 +70,9 @@ import するために要る。
 | `mock-words.test.ts` | `MOCK_SCRIPT` / `buildMockWords()` / `sliceMockWords()` / `MockSttAdapter` | 手書き word 分割の不変条件 `words.map(w => w.punctuated ?? w.word).join("") === text`、句読点を独立 word にしないこと、`start` が**スクリプト一周を通して**単調増加すること、誤認識語だけ低 confidence（`term-cases.json` の `expectCorrection` と**集合一致**）、interim で境界に跨る word を出さず空 transcript も送らないこと、スクリプトを一周すること（所要時間は `MOCK_SCRIPT.length` から算出）、**1 行が複数 final に割れること**と**`UtteranceBuilder` で組み直すと元の行に1文字も違わず戻ること**（この2つはセット。割れていなければ統合を何も検証しないテストになる） |
 | `context-window.test.ts` | `ContextWindow`（`src/extract/context.ts`） | 上限で**古いチャンクから丸ごと捨てる**こと（`" "` の区切りも長さに数える）、1チャンク単独で超えるときだけ `slice(-maxChars)` で頭を削ること、空文字を無視すること、`clear()` |
 | `surface-forms.test.ts` | `filterSurfaceForms()`（`src/extract/extractor.ts`） | `newTranscript` に**実在する表記だけ**が残ること、**空になってもカードは落とさない**こと、他フィールドと入力配列を変えないこと、空文字列（`includes("")` が常に true になる穴） |
+| `candidates.test.ts` | `normalizeCandidates()`（`src/extract/extractor.ts`） | 上限（`MAX_CANDIDATES` = 3）で切ること、**先頭を差し込んだ後に切る**こと（先に切ると `term` 自身が枠から溢れる）、`term` を先頭へ移すこと、候補が空なら `term` 1件を補うこと、**先頭の表記を `card.term` に揃える**こと（不変条件 `candidates[0].term === term` を表記ゆれで条件付きにしない）、正規化キーが同じ候補を畳むこと、空・空白だけの候補を落とすこと、他フィールドと入力配列を変えないこと |
+| `verify-parse.test.ts` | `parseVerifyOutput()` / `isVerified()` / `buildVerifyInput()` / `verifyAndEnrich()` の配線（`src/extract/enrich.ts`） | **候補に無い用語を採らない**こと（採れると検証段が新しい誤補正を作れてしまう）、`chosen` が null/空文字なら棄却、`chosen` の表記ゆれを候補側の表記に揃えること、コードフェンス・前置き越しでも JSON を拾うこと、`description` の引用記法除去と120字クランプ、**解釈できない出力を例外にする**こと（握り潰すと検証が効いていないことに気づけない）、`isVerified()` が候補#2 の採用を裏付け無しとすること、**`tools`（web検索）と `text`（構造化出力）と `include`（検索結果の同梱）を同時に要求している**こと、**後ろに別のオブジェクトや `}` を含む後書きが続いても最初の1件だけを拾う**こと（末尾の `}` まで舐めると巻き込んでパースに失敗する）。`responses.create` だけ差し替えて実 API は叩かない |
+| `scheduler-verify.test.ts` | `selectVerifyTargets()` と検証つき清書の分岐（`src/extract/scheduler.ts`） | 補正あり・`confidence: low` はレア度が最下位でも検証対象になること（**レア度上位の枠を埋めた状態で確かめる**。枠が空いていると従来条件だけで通ってしまい、追加した条件を消しても落ちないテストになる）、検証に回るカード数が選定と一致すること、`willEnrich` が選定と一致すること、補正なし high は対象外になりうること、**`candidates` がクライアント向けカードに含まれない**こと（スプレッドで漏れる）、棄却時も**解説は速報のまま・リンクは空で `card_update` を送る**こと（送らないと「確認中」の表示が畳まれず回り続ける）、速報カードは消さないこと、`console.warn` が `term` と `reason` だけを出し**文字起こし本文を含まない**こと、候補#2 が選ばれた場合も表示を変えないこと |
 | `scheduler-context.test.ts` | `ExtractionScheduler` の文脈保持（`src/extract/scheduler.ts`） | 成功したチャンクだけが次回の `contextTranscript` になること、**一時エラーのチャンクは積まれない**こと（回帰テストの本体。戻ってきたチャンクが文脈と新規の両方に出ない）、恒久エラーで文脈も捨てること、**既出用語のデデュープが壊れていない**こと。private の `extract` を差し替えて LLM を呼ばずに回す |
 | `normalize-term.test.ts` | `normalizeTerm()`（`src/extract/normalize.ts`） | NFKC・小文字化・空白除去で表記ゆれが同一キーに畳まれる／別語は衝突しない |
 | `error-classify.test.ts` | `isPermanent()` / `isQuotaExhausted()` / `toUserMessage()` | 400/401/403/404/422/429(quota) は恒久、408/409/429(rate)/5xx/接続エラーは一時。利用者向け文言 |
@@ -116,6 +119,12 @@ API キーが無いとその場で例外になる。対策は2つ。
    `tsx --test --import ./tests/helpers/openai-env.ts` でダミーキーを先回りさせる。
    ファイル先頭の import 順に依存しないので、将来 import ソート（Prettier organize-imports、
    eslint `import/order`）を入れても壊れない。
+
+`extractor.ts` の `client` と `enrich.ts` の `client` は **どちらも export してある**。
+`chat.completions.parse` / `responses.create` だけを差し替えれば、実 API を叩かずに
+配線（文脈が user ターンに乗るか、検証結果で分岐しているか）を端から端まで通せる。
+**`enrichCard` は `void` の投げっぱなし**なので、スケジューラのテストでここを潰さないと
+ダミーキーのまま api.openai.com へ本当にリクエストが飛ぶ。
 
 ヘルパは **キーの有無で分岐せず無条件に上書きする**。分岐させると `export OPENAI_API_KEY=sk-...`
 しているシェルでは実キーがクライアントに入り、「決定的テストからは本物の API を叩けない」が
@@ -177,7 +186,7 @@ npm run eval:llm > /tmp/eval.json          # stdout のリダイレクトでも�
 
 ### ケース（`tests/fixtures/term-cases.json`）
 
-13件。**すべて合成**で、実会議の録音・文字起こしからの抜粋は使っていない
+15件。**すべて合成**で、実会議の録音・文字起こしからの抜粋は使っていない
 （`src/stt/mock-script.ts` と同じ方針）。実会議の情報が混ざる経路を原理的に断つため。
 誤認識カタカナ（クバネテス／グラファナ／ピネコーネ）、略語の読み上げ（オーオース／
 ピーケーシーイー／エヌディーエー）、用語集ブースト、既出用語のデデュープ、
@@ -190,6 +199,16 @@ npm run eval:llm > /tmp/eval.json          # stdout のリダイレクトでも�
   `expectCorrection` に置く。**文脈あり/なしで正しい補正率が動くか**を見る
 - `context-no-recard` — `context` にしか登場しない用語を `forbidTerms` に置く。
   AC「過去文脈の用語を再カード化しない」を誤補正率として測る
+
+#23 で「**音韻的にそれらしい実在の別用語へ誤補正しやすい**」ケースを2件足した。
+誤答側を `forbidTerms`、正答側を `expectCorrection` に置いてあるので、検証が効いたかが
+数値で出る。狙いは「実在しない語を弾く」ではなく「**実在するが文脈に合わない語**を弾く」ほうで、
+そこが Stage 2 に web 検索という独立した情報源を持たせた理由でもある。
+
+- `lookalike-ansible` — 「アンシブル」→ `Ansible`。誤答側は `アンサンブル` / `Ensemble`
+  （ML の実在手法）。`context` は自動化・構成管理の話
+- `lookalike-confluence` — 「コンフルエンス」→ `Confluence`。誤答側は `Confluent`
+  （Kafka の企業。カタカナではほぼ同音）。`context` はドキュメントの置き場所の話
 
 ### 指標
 
@@ -225,6 +244,31 @@ EVAL_NO_CONTEXT=1 npm run eval:llm -- --out /tmp/without-context.json
 
 `0` / `1` 以外の値は例外にする。`EVAL_NO_CONTEXT=true` を黙って無視すると
 「文脈なしで測ったつもりが文脈ありだった」レポートができ、比較そのものが無意味になる。
+
+### 検証あり/なしの比較（`EVAL_WITH_VERIFY`）
+
+> 2026-08-27 追加（Issue #23）。
+
+**評価ハーネスは `createExtractor()` を直接呼ぶので、既定では Stage 1 しか測らない。**
+`EVAL_WITH_VERIFY=1` を付けると Stage 2（検証つき清書）まで通す。既定は false で、
+`flagEnv()` の作法は `EVAL_NO_CONTEXT` と同じ。`EvalConfig` に載るのでレポートにも表にも残る。
+
+| モード | 測るもの |
+|---|---|
+| 既定（Stage 1 のみ） | **候補列挙のプロンプト変更**が既存の指標を悪化させていないか |
+| `EVAL_WITH_VERIFY=1` | **検証そのもの**の効果。誤補正率が下がるか、正しい補正率が落ちていないか |
+
+分けるのは切り分けのため。プロンプト変更と検証は別々に悪化しうるので、まとめて測ると
+原因が分からない。`EVAL_WITH_VERIFY=1` は web 検索を伴うので**遅く高い**。
+
+検証対象の選定は本番と同じ `selectVerifyTargets()` を呼ぶ。**ここにコピーを置くと、
+本番の選定条件を変えたときに評価だけ古い条件のまま緑になる。**
+
+**裏付けの取れなかったカードは指標から落とす。** 本番の既定は「棄却しても表示は変えない」だが、
+評価で測りたいのは検証の判断そのものなので、判断を反映させる。
+
+> **誤補正率だけを見ると過剰棄却を見逃す。** 何も補正しなくなれば誤補正率は 0 になる。
+> `expectCorrection`（正しい補正率）と**必ずセットで**読むこと。リスクとしてはここが最大。
 
 ### 「何も測らなかった」を PASS にしない
 

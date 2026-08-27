@@ -17,6 +17,8 @@ import type { TermCard } from "../src/protocol.js";
  * LLM は呼ばない。インスタンスの private `extract` フィールドを差し替えて回す。
  */
 
+import { card, settle, utterance } from "./helpers/cards.js";
+
 type ExtractFn = (input: ExtractorInput) => Promise<ExtractionResult["cards"]>;
 
 // 清書(enrich)も実 API を叩く。`void` で投げっぱなしなので失敗は握り潰されるが、
@@ -27,30 +29,12 @@ mock.method(
   async () => {},
 );
 
-/** `MIN_CHARS`(120) を必ず超える発話。先頭の目印でどのチャンクか見分ける。 */
-function utterance(mark: string): string {
-  return `${mark}:${"あ".repeat(130)}`;
-}
-
-function card(term: string): ExtractionResult["cards"][number] {
-  return {
-    term,
-    reading: "テスト",
-    description: "テスト用のカード。",
-    confidence: "high",
-    rarity: "rare",
-    correctedFrom: null,
-    surfaceForms: [],
-  };
-}
 
 /** SDK が実際に投げるのと同じ形のエラー（`error-classify.test.ts` と同じ作法）。 */
 function apiError(status: number): APIError {
   return APIError.generate(status, { error: { message: "test" } }, undefined, new Headers());
 }
 
-/** run() の中の await を1巡させる。setImmediate はマイクロタスクを全部流してから走る。 */
-const settle = () => new Promise((r) => setImmediate(r));
 
 interface Harness {
   scheduler: ExtractionScheduler;

@@ -1,6 +1,12 @@
 import OpenAI from "openai";
 import { zodResponseFormat } from "openai/helpers/zod";
-import { ExtractionResultSchema, type ExtractionResult } from "./schema.js";
+import { normalizeTerm } from "./normalize.js";
+import {
+  ExtractionResultSchema,
+  MAX_CANDIDATES,
+  type Candidate,
+  type ExtractionResult,
+} from "./schema.js";
 import { config } from "../config.js";
 
 // テストから `chat.completions.parse` を差し替えられるよう export する。
@@ -25,7 +31,8 @@ export const ROLE_PROMPT = `あなたは会議のリアルタイム文字起こ�
    - 日本語の語として定着しているものは日本語で書く(例: 冗長化、二要素認証)。
    - この規則は表記の決め方だけを定めるものであり、どの語をカード化するかの判断(規則3)には影響しない。ここに挙げた例は表記の見本であって、「平易だから出力しない語」の例ではない。
    - 判断に迷う場合は、その会議で実際に話された表記に寄せること。
-9. 「直前の会話」は語義や固有名詞を判断するための参考情報であり、カード化の対象ではない。直前の会話にしか登場しない用語は出力しないこと。カードにするのは「新しい文字起こし」に登場した用語だけとする。`;
+9. 「直前の会話」は語義や固有名詞を判断するための参考情報であり、カード化の対象ではない。直前の会話にしか登場しない用語は出力しないこと。カードにするのは「新しい文字起こし」に登場した用語だけとする。
+10. candidates には、その崩れた表記から考えられる用語を確からしい順に最大${MAX_CANDIDATES}件挙げること。先頭は必ず term と同じ表記にすること。補正していない場合や迷いがない場合は term 自身を1件だけ入れること。rationale には「音韻が近い」「直前の会話がこの分野」「用語集にある」のように、その候補を挙げた根拠を一言で書くこと。候補は後段でウェブ検索により検証するので、**自信のない候補も切り捨てずに挙げること**。ただし${MAX_CANDIDATES}件を超えて挙げないこと。`;
 
 export interface ExtractorInput {
   /** 今回カード化・surfaceForms 抽出の対象 */
@@ -60,6 +67,49 @@ export function filterSurfaceForms<T extends { surfaceForms: string[] }>(
     ...card,
     surfaceForms: card.surfaceForms.filter((f) => f !== "" && newTranscript.includes(f)),
   }));
+}
+
+/**
+ * `candidates` を検証段(`enrich.ts`)が前提にできる形に整える(#23)。
+ *
+ * **不変条件: `candidates[0].term === term`、件数は最大 `MAX_CANDIDATES`。**
+ * こうしておくと「候補が1件だけ = 迷いがない」が素直に表現でき、検証段は `candidates`
+ * だけ見れば足りる。
+ *
+ * プロンプト規則10でも指示しているが、**LLM の従順さに依存しない**
+ * (`filterSurfaceForms()` と同じ方針)。構造化出力は件数の指示を守らないことがあり、
+ * 検証段へ渡す入力が膨らむ。**出力トークン超過を防ぐ効果は無い** —
+ * ここはパース成功後に走るので、超過時は先に `LengthFinishReasonError` が投げられる。
+ *
+ * 先頭の `term` は **`card.term` の表記で上書きする**。候補側が「Kubernetes 」のような
+ * 表記ゆれを返してきても、`===` の不変条件を条件付きにしないため。
+ */
+export function normalizeCandidates<
+  T extends { term: string; reading: string; candidates: Candidate[] },
+>(cards: T[]): T[] {
+  return cards.map((card) => {
+    // 空 term を落とし、正規化キーで重複を畳む。畳まないと上限の枠を同じ語で使い潰す。
+    // Map は挿入順を保つので、畳んだ後の並びはモデルが返した順のまま。
+    const byKey = new Map<string, Candidate>();
+    for (const candidate of card.candidates) {
+      const term = candidate.term.trim();
+      if (term === "") continue;
+      const key = normalizeTerm(term);
+      if (!byKey.has(key)) byKey.set(key, { ...candidate, term });
+    }
+
+    // 不変条件は `candidates[0].term === card.term`。表記は必ず card 側で上書きする
+    const headKey = normalizeTerm(card.term);
+    const matched = byKey.get(headKey);
+    byKey.delete(headKey);
+    const head: Candidate = matched
+      ? { ...matched, term: card.term }
+      : { term: card.term, reading: card.reading, rationale: "抽出時に選んだ表記" };
+
+    // 切り詰めは先頭を差し込んだ**後**。先に切っても head は合成されるので term 自体は
+    // 残るが、モデルが付けた reading と rationale が失われる
+    return { ...card, candidates: [head, ...byKey.values()].slice(0, MAX_CANDIDATES) };
+  });
 }
 
 /**
@@ -106,6 +156,6 @@ export function createExtractor(glossary: string[]) {
     });
 
     const cards = response.choices[0]?.message.parsed?.cards ?? [];
-    return filterSurfaceForms(cards, input.newTranscript);
+    return normalizeCandidates(filterSurfaceForms(cards, input.newTranscript));
   };
 }

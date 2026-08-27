@@ -26,6 +26,7 @@ function card(term: string, surfaceForms: string[]) {
     rarity: "rare" as const,
     correctedFrom: null,
     surfaceForms,
+    candidates: [{ term, reading: "テスト", rationale: "テスト用の根拠" }],
   };
 }
 
@@ -141,8 +142,11 @@ test("extract() は文脈を user ターンに乗せ、フィルタ済みのカ�
       choices: [
         {
           message: {
-            // 「クバネテス」は新しい文字起こしにあるが「テラフォーム」は文脈にしか無い
-            parsed: { cards: [card("Kubernetes", ["クバネテス", "テラフォーム"])] },
+            // 「クバネテス」は新しい文字起こしにあるが「テラフォーム」は文脈にしか無い。
+            // candidates は空で返し、サーバー側で term 自身が補われることも見る
+            parsed: {
+              cards: [{ ...card("Kubernetes", ["クバネテス", "テラフォーム"]), candidates: [] }],
+            },
           },
         },
       ],
@@ -164,6 +168,11 @@ test("extract() は文脈を user ターンに乗せ、フィルタ済みのカ�
       cards[0]!.surfaceForms,
       ["クバネテス"],
       "文脈にしか無い表記は extract() の戻り値から落ちている",
+    );
+    assert.deepEqual(
+      cards[0]!.candidates.map((c) => c.term),
+      ["Kubernetes"],
+      "normalizeCandidates() も extract() の中で効いている（#23 の不変条件）",
     );
   } finally {
     spy.mock.restore();
