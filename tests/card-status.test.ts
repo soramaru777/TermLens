@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 // public/ はビルドレスな素の JS。tsconfig.test.json の allowJs で解決している
 // （`tests/lowpass.test.ts` が public/lowpass.js を読むのと同じ）。
-import { cardHeading, cardStatus, UNRESOLVED_LABEL } from "../public/card-status.js";
+import {
+  cardHeading,
+  cardStatus,
+  mergeCardUpdate,
+  UNRESOLVED_LABEL,
+} from "../public/card-status.js";
 
 /**
  * クライアント側の状態導出（#24）。
@@ -110,4 +115,64 @@ test("丸めても正しい3値はそのまま通す", () => {
 
 test("status が空文字なら confidence から導出する（未設定と同じ扱い）", () => {
   assert.equal(cardStatus({ status: "", confidence: "low" }), "probable");
+});
+
+/**
+ * `card_update` の畳み込み（#24 のレビュー指摘）。
+ *
+ * 「unresolved から戻さない」を status だけに適用すると、**見出しは
+ * 「特定できませんでした」のまま本文が確定した別用語の解説に変わる**という、
+ * この Issue が防ごうとした形そのものになる。
+ */
+test("unresolved のカードは status も解説もリンクも据え置く", () => {
+  const stored = {
+    term: "Grafana",
+    status: "unresolved",
+    description: "音声認識の表記から正しい用語を特定できませんでした。",
+    links: [],
+  };
+  const merged = mergeCardUpdate(stored, {
+    status: "confirmed",
+    description: "メトリクスを可視化するダッシュボードです。",
+    links: [{ title: "公式", url: "https://grafana.com/" }],
+  });
+  assert.equal(merged.status, "unresolved", "昇格させない");
+  assert.equal(merged.description, stored.description, "本文も据え置く");
+  assert.deepEqual(merged.links, [], "リンクも据え置く（Markdown には出てしまうため）");
+});
+
+test("probable → unresolved の降格は通す", () => {
+  const merged = mergeCardUpdate(
+    { term: "Qdrant", status: "probable", description: "ベクトルDBです。", links: [] },
+    { status: "unresolved", description: "音声認識の表記から〜", links: [] },
+  );
+  assert.equal(merged.status, "unresolved");
+  assert.equal(merged.description, "音声認識の表記から〜");
+});
+
+test("probable → confirmed の昇格も通す", () => {
+  const merged = mergeCardUpdate(
+    { term: "Qdrant", status: "probable", description: "旧", links: [] },
+    { status: "confirmed", description: "新", links: [{ title: "公式", url: "https://x.test/" }] },
+  );
+  assert.equal(merged.status, "confirmed");
+  assert.equal(merged.description, "新");
+  assert.equal(merged.links.length, 1);
+});
+
+test("status が無いメッセージで状態を巻き戻さない", () => {
+  // 旧サーバー。undefined を書き込むと cardStatus() が confirmed に倒れる
+  const merged = mergeCardUpdate(
+    { term: "Qdrant", status: "probable", description: "旧", links: [] },
+    { description: "新", links: [] },
+  );
+  assert.equal(merged.status, "probable", "解説だけ更新して状態は保つ");
+  assert.equal(merged.description, "新");
+});
+
+test("引数のカードを書き換えない", () => {
+  const stored = { term: "Qdrant", status: "probable", description: "旧", links: [] };
+  mergeCardUpdate(stored, { status: "confirmed", description: "新", links: [] });
+  assert.equal(stored.status, "probable");
+  assert.equal(stored.description, "旧");
 });

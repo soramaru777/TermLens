@@ -50,3 +50,32 @@ export function cardHeading(card) {
   if (cardStatus(card) !== "unresolved") return card.term;
   return (card.surfaceForms ?? [])[0] ?? card.correctedFrom ?? card.term;
 }
+
+/**
+ * `card_update` を表示中のカードへ畳み込む（#24）。
+ *
+ * **`unresolved` からは戻さない。** 再接続でカードが再抽出されると同じ用語が再び
+ * Stage 2 に回りうるので、昇格を許すと「特定できませんでした」が通常カードに戻り、
+ * 見出しが surface form から term へ切り替わる。
+ *
+ * **状態を据え置くなら解説とリンクも据え置く。** 本文だけ更新すると「特定できませんでした」
+ * の見出しの下に**確定した別用語の断定的な解説**が出て、この Issue が防ごうとした形
+ * そのものになる（リンクは画面には出ないが Markdown エクスポートには出る）。
+ * サーバーは unresolved を検証に回さないのでこの経路は本来来ないが、古いサーバーに
+ * 繋いだときのために表示側でも揃えておく。
+ *
+ * 純関数として切り出してあるのは、この不変条件が **DOM を触らずに固定できる**ため。
+ *
+ * @returns 更新後のカード（引数は変更しない）
+ */
+export function mergeCardUpdate(stored, update) {
+  if (cardStatus(stored) === "unresolved") return { ...stored };
+  return {
+    ...stored,
+    description: update.description,
+    links: update.links,
+    // status が無いメッセージ（旧サーバー）で状態を巻き戻さない。undefined を書き込むと
+    // cardStatus() が confirmed に倒れ、probable のカードが黙って格上げされてしまう。
+    ...(update.status ? { status: update.status } : {}),
+  };
+}

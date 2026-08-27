@@ -6,7 +6,12 @@
 import { TARGET_SAMPLE_RATE } from "./lowpass.js";
 // カードの状態と見出しの導出は card-status.js が唯一の定義箇所(#24)。
 // ここで `card.status` を直接読むと、復元経路（status を持たない旧カード）だけ表示が変わる。
-import { cardHeading, cardStatus, UNRESOLVED_LABEL } from "./card-status.js";
+import {
+  cardHeading,
+  cardStatus,
+  mergeCardUpdate,
+  UNRESOLVED_LABEL,
+} from "./card-status.js";
 import {
   buildTermsMarkdown as buildTermsMarkdownPure,
   escMd,
@@ -720,10 +725,8 @@ function updateCard({ term, status, description, links }) {
   // Stage 2 に回り、今度は裏付けが取れることがある（LLM + web 検索なので非決定的）。
   // 昇格を許すと「特定できませんでした」が通常カードに戻り、見出しが surface form から
   // term に切り替わる。addCard の再送経路にも同じガードがあり、そちらと揃える。
-  const keepStatus = cardStatus(stored) === "unresolved";
-  // status が無いメッセージ（旧サーバー）で状態を巻き戻さない。undefined を書き込むと
-  // cardStatus() が confirmed に倒れ、probable のカードが黙って格上げされてしまう。
-  Object.assign(stored, { description, links }, status && !keepStatus ? { status } : {});
+  // 畳み込みの判断は mergeCardUpdate() に集約する（不変条件を DOM 抜きで固定するため）
+  Object.assign(stored, mergeCardUpdate(stored, { status, description, links }));
   scheduleSessionSave();
   const div = [...cardsEl.children].find((c) => c.dataset.term === term);
   if (!div) return;
@@ -731,7 +734,7 @@ function updateCard({ term, status, description, links }) {
   const card = stored;
   // 検証の結果で見出しが変わりうる（probable → unresolved の降格で surface form になる）
   renderCardHead(div, card);
-  div.querySelector(".desc").textContent = description;
+  div.querySelector(".desc").textContent = card.description;
 
   let linksEl = div.querySelector(".links");
   if (cardStatus(card) === "unresolved") {

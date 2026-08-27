@@ -105,9 +105,11 @@ export function toUserMessage(err: unknown): string {
  * 足した和集合。誤補正が疑わしいのはこの2つで、レア度ランキングが選ぶ集合とは大きく
  * 重なるため、web 検索の呼び出し増は小さい。
  *
- * **`unresolved` も検証に回す(#24)。** 裏付けが取れても `confirmed` へは昇格しない
- * (改名の経路が無い)が、Stage 2 は「候補のどれも実在しない/文脈に合わない」を
- * 独立した情報源で確かめる唯一の場なので、外すと unresolved が一度も検証されないまま残る。
+ * **`unresolved` は検証に回さない(#24)。** 昇格の経路が無い(`card_update` は term で
+ * 突き合わせるので改名できない)うえ、解説も定型文で固定されるため、**検証結果を
+ * 使える余地が1つも無い**。回すと web 検索の課金だけが増える。
+ * さらに、昇格を防ぎつつ解説だけ更新すると「特定できませんでした」の見出しの下に
+ * 確定した別用語の断定的な解説が出る — この Issue が防ごうとしていた形そのものになる。
  *
  * **補正のないカードは Stage 2 を通さない。** そもそも速報は従来どおり即時表示で、
  * Stage 2 は非同期の `card_update` なので、表示までの時間はどちらにせよ変わらない。
@@ -123,22 +125,25 @@ export function selectVerifyTargets<
     correctedFrom: string | null;
   },
 >(cards: T[]): Set<string> {
-  // レア度上位の約半数。同レア度なら誤認識疑い(confirmed でないもの)を先に詰める。
-  // **この並べ替えは対象を広げるためではなく、狭く保つためにある。** 非 confirmed は
+  // **`unresolved` は最初に除く。** 検証結果を使える余地が無いので、レア度ランキング
+  // 経由でも入れない(除かないと上位半数の枠まで食う)。
+  const targetable = cards.filter((c) => c.status !== "unresolved");
+  // レア度上位の約半数。同レア度なら誤認識疑い(probable)を先に詰める。
+  // **この並べ替えは対象を広げるためではなく、狭く保つためにある。** probable は
   // 下のループでどのみち全部入るので、上位半数の枠を先に食わせておくと和集合の増分が
   // 小さくなる(枠が空くと補正なし・confirmed のカードが余分に入る)。
   const rarityRank = { rare: 2, uncommon: 1, common: 0 };
-  const ranked = [...cards].sort(
+  const ranked = [...targetable].sort(
     (a, b) =>
       rarityRank[b.rarity] - rarityRank[a.rarity] ||
-      (a.status !== "confirmed" ? -1 : 0) - (b.status !== "confirmed" ? -1 : 0),
+      (a.status === "probable" ? -1 : 0) - (b.status === "probable" ? -1 : 0),
   );
+  // 分母は元のカード数のまま。unresolved が多い回に枠まで縮むと、検証すべき
+  // probable が漏れる
   const targets = new Set(ranked.slice(0, Math.ceil(cards.length / 2)).map((c) => c.term));
-  // 誤補正が疑わしいカードはレア度に関係なく必ず検証する。
-  // `!== "confirmed"` と書くのは probable と unresolved の両方を拾うため(#24)。
-  // 値を列挙すると、将来 status が増えたときに黙って対象から漏れる。
-  for (const card of cards) {
-    if (card.correctedFrom !== null || card.status !== "confirmed") targets.add(card.term);
+  // 誤補正が疑わしいカードはレア度に関係なく必ず検証する
+  for (const card of targetable) {
+    if (card.correctedFrom !== null || card.status === "probable") targets.add(card.term);
   }
   return targets;
 }

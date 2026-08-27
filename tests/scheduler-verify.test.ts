@@ -48,19 +48,35 @@ test("補正あり・status が confirmed でないカードは必ず検証す�
   assert.ok(!targets.has("F"), "補正なし・confirmed・レア度下位は対象外のまま");
 });
 
-test("unresolved も検証対象に入れる（#24）", () => {
-  // **`status === "probable"` と書いていると unresolved が黙って漏れる。**
-  // 漏れると「特定できない」と言ったカードが一度も独立した情報源で確かめられない。
-  // レア度上位の枠は rare 2枚で埋めておく（枠が空いていると条件を消しても通ってしまう）。
+/**
+ * `unresolved` は検証に回さない（#24 のレビュー指摘）。
+ *
+ * 昇格の経路が無く（`card_update` は term で突き合わせるので改名できない）、解説も
+ * 定型文で固定されるため、**検証結果を使える余地が1つも無い**。回すと web 検索の
+ * 課金だけが増える。昇格を防ぎつつ解説だけ更新すると「特定できませんでした」の見出しの
+ * 下に確定した別用語の断定的な解説が出て、この Issue が防ごうとした形そのものになる。
+ */
+test("unresolved は検証に回さない（#24）", () => {
   const cards = [
-    card("A", { rarity: "rare" }),
-    card("B", { rarity: "rare" }),
-    card("C", { rarity: "common", status: "unresolved" }),
+    card("A", { rarity: "rare", status: "unresolved", correctedFrom: "えー" }),
+    card("B", { rarity: "common", status: "probable" }),
+  ];
+  const targets = selectVerifyTargets(cards);
+  assert.ok(!targets.has("A"), "レア度上位でも補正ありでも回さない");
+  assert.ok(targets.has("B"), "probable は従来どおり回す");
+});
+
+test("unresolved はレア度上位の枠も食わない", () => {
+  // 枠まで食われると、検証すべき probable が漏れる。
+  // 分母は元のカード数（4）のままなので枠は2つ
+  const cards = [
+    card("A", { rarity: "rare", status: "unresolved" }),
+    card("B", { rarity: "rare", status: "unresolved" }),
+    card("C", { rarity: "uncommon" }),
     card("D", { rarity: "common" }),
   ];
   const targets = selectVerifyTargets(cards);
-  assert.ok(targets.has("C"), "unresolved はレア度が下位でも検証する");
-  assert.ok(!targets.has("D"), "補正なし・confirmed は従来どおり対象外になりうる");
+  assert.deepEqual([...targets].sort(), ["C", "D"], "unresolved を除いた中から枠を埋める");
 });
 
 test("補正なし・confirmed のカードは対象外になりうる", () => {
