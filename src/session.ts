@@ -81,8 +81,9 @@ export class Session {
       glossary,
       {
         onCards: (cards) => this.send({ type: "cards", cards }),
-        onCardUpdate: (term, description, links) =>
-          this.send({ type: "card_update", term, description, links }),
+        // status は #24 で追加。検証の結果(confirmed / unresolved)をそのまま通す
+        onCardUpdate: (term, status, description, links) =>
+          this.send({ type: "card_update", term, status, description, links }),
         onExtracting: () => this.send({ type: "status", state: "extracting" }),
         // permanent: 恒久エラーで抽出を打ち切ったときだけ scheduler から真が渡ってくる(#10)
         onError: (message, permanent) => this.send({ type: "error", code: "llm_error", message, permanent }),

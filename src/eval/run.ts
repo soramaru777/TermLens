@@ -230,13 +230,20 @@ async function createVerifier(allowRename: boolean): Promise<{
           correctedFrom: card.correctedFrom,
           context,
         });
-        if (isVerified(card.term, result.chosen)) return card;
+        // **本番の Stage 2 は status を動かす(#24)。** 既定モードはカード集合を変えないが、
+        // status だけは本番と同じに揃える。揃えないと `EVAL_WITH_VERIFY=1` の
+        // probable / unresolved 列が Stage 1 の申告のままになり、検証の効果が数字に出ない。
+        // term は変えないので Recall / 誤補正率 / Precision には影響しない。
+        if (isVerified(card.term, result.chosen)) return { ...card, status: "confirmed" as const };
         if (result.chosen !== null) {
           tally.replaced += 1;
-          return allowRename ? { ...card, term: result.chosen } : card;
+          // 候補#2 の採用は本番では裏付け無し扱い（改名の経路が無い）＝ unresolved へ降格
+          return allowRename
+            ? { ...card, term: result.chosen }
+            : { ...card, status: "unresolved" as const };
         }
         tally.rejected += 1;
-        return allowRename ? null : card;
+        return allowRename ? null : { ...card, status: "unresolved" as const };
       } catch (err) {
         // 抽出の課金は済んでいる。1カードの検証失敗でそのケース1試行を丸ごと捨てない
         // （このファイルの「1本の 429/500 で 30本ぶんの課金を捨てない」と同じ方針）。
@@ -369,12 +376,17 @@ function formatVerifyTally(report: EvalReport): string {
 }
 
 export function formatTable(report: EvalReport): string {
-  const headers = ["ケース", "Recall", "補正", "誤補正", "unresolved", "Precision"];
+  // probable と unresolved は**2列に分ける**(#24)。合算すると「補正はしたが自信がない」と
+  // 「そもそも特定できない」が混ざり、過剰 unresolved（何でも諦める退行）に気づけない。
+  // 旧「unresolved」列は probable に当たる。名前ごと移してあるので、実装前後のレポートを
+  // 同じ列名で比べたときに意味が入れ替わることはない。
+  const headers = ["ケース", "Recall", "補正", "誤補正", "probable", "unresolved", "Precision"];
   const rows = report.perCase.map((p) => [
     p.id,
     pct(p.metrics.recall),
     pct(p.metrics.correction),
     pct(p.metrics.miscorrection),
+    pct(p.metrics.probable),
     pct(p.metrics.unresolved),
     pct(p.metrics.precision),
   ]);
@@ -383,6 +395,7 @@ export function formatTable(report: EvalReport): string {
     pct(report.overall.recall),
     pct(report.overall.correction),
     pct(report.overall.miscorrection),
+    pct(report.overall.probable),
     pct(report.overall.unresolved),
     pct(report.overall.precision),
   ]);

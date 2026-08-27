@@ -70,15 +70,17 @@ import するために要る。
 | `mock-words.test.ts` | `MOCK_SCRIPT` / `buildMockWords()` / `sliceMockWords()` / `MockSttAdapter` | 手書き word 分割の不変条件 `words.map(w => w.punctuated ?? w.word).join("") === text`、句読点を独立 word にしないこと、`start` が**スクリプト一周を通して**単調増加すること、誤認識語だけ低 confidence（`term-cases.json` の `expectCorrection` と**集合一致**）、interim で境界に跨る word を出さず空 transcript も送らないこと、スクリプトを一周すること（所要時間は `MOCK_SCRIPT.length` から算出）、**1 行が複数 final に割れること**と**`UtteranceBuilder` で組み直すと元の行に1文字も違わず戻ること**（この2つはセット。割れていなければ統合を何も検証しないテストになる） |
 | `context-window.test.ts` | `ContextWindow`（`src/extract/context.ts`） | 上限で**古いチャンクから丸ごと捨てる**こと（`" "` の区切りも長さに数える）、1チャンク単独で超えるときだけ `slice(-maxChars)` で頭を削ること、空文字を無視すること、`clear()` |
 | `surface-forms.test.ts` | `filterSurfaceForms()`（`src/extract/extractor.ts`） | `newTranscript` に**実在する表記だけ**が残ること、**空になってもカードは落とさない**こと、他フィールドと入力配列を変えないこと、空文字列（`includes("")` が常に true になる穴） |
+| `normalize-status.test.ts` | `normalizeStatus()`（`src/extract/extractor.ts`） | `unresolved` の `description` が**定型文（`UNRESOLVED_DESCRIPTION`）に差し替わる**こと（空文字で返ってきた場合も埋める）、`confirmed` / `probable` は**オブジェクトごと素通し**すること（`assert.equal(out[0], input[0])` で参照ごと固定）、他フィールドと入力配列を変えないこと、**`extract()` が実際に通していること**（配線。`parse` だけ差し替えて実 API は叩かない） |
+| `card-status.test.ts` | `cardStatus()` / `cardHeading()`（`public/card-status.js`） | **後方互換** — `status` が無い旧カードを `confidence` から導出すること（`low` → `probable`、それ以外 `confirmed`）、`status` を `confidence` より優先すること（降格したカードが復元で戻らない）、どちらも無ければ `confirmed` に倒すこと。**`unresolved` の見出し**が `surfaceForms[0]` → `correctedFrom` → `term` の順に落ちること、`confirmed` / `probable` は `term` のままであること |
 | `candidates.test.ts` | `normalizeCandidates()`（`src/extract/extractor.ts`） | 上限（`MAX_CANDIDATES` = 3）で切ること、**先頭を差し込んだ後に切る**こと（先に切ると `term` 自身が枠から溢れる）、`term` を先頭へ移すこと、候補が空なら `term` 1件を補うこと、**先頭の表記を `card.term` に揃える**こと（不変条件 `candidates[0].term === term` を表記ゆれで条件付きにしない）、正規化キーが同じ候補を畳むこと、空・空白だけの候補を落とすこと、他フィールドと入力配列を変えないこと |
 | `verify-parse.test.ts` | `parseVerifyOutput()` / `isVerified()` / `buildVerifyInput()` / `verifyAndEnrich()` の配線（`src/extract/enrich.ts`） | **候補に無い用語を採らない**こと（採れると検証段が新しい誤補正を作れてしまう）、`chosen` が null/空文字なら棄却、`chosen` の表記ゆれを候補側の表記に揃えること、コードフェンス・前置き越しでも JSON を拾うこと、`description` の引用記法除去と120字クランプ、**解釈できない出力を例外にする**こと（握り潰すと検証が効いていないことに気づけない）、`isVerified()` が候補#2 の採用を裏付け無しとすること、**`tools`（web検索）と `text`（構造化出力）と `include`（検索結果の同梱）を同時に要求している**こと、**後ろに別のオブジェクトや `}` を含む後書きが続いても最初の1件だけを拾う**こと（末尾の `}` まで舐めると巻き込んでパースに失敗する）。`responses.create` だけ差し替えて実 API は叩かない |
-| `scheduler-verify.test.ts` | `selectVerifyTargets()` と検証つき清書の分岐（`src/extract/scheduler.ts`） | 補正あり・`confidence: low` はレア度が最下位でも検証対象になること（**レア度上位の枠を埋めた状態で確かめる**。枠が空いていると従来条件だけで通ってしまい、追加した条件を消しても落ちないテストになる）、検証に回るカード数が選定と一致すること、`willEnrich` が選定と一致すること、補正なし high は対象外になりうること、**`candidates` がクライアント向けカードに含まれない**こと（スプレッドで漏れる）、棄却時も**解説は速報のまま・リンクは空で `card_update` を送る**こと（送らないと「確認中」の表示が畳まれず回り続ける）、速報カードは消さないこと、`console.warn` が `term` と `reason` だけを出し**文字起こし本文を含まない**こと、候補#2 が選ばれた場合も表示を変えないこと |
+| `scheduler-verify.test.ts` | `selectVerifyTargets()` と検証つき清書の分岐（`src/extract/scheduler.ts`） | 補正あり・`status !== "confirmed"` はレア度が最下位でも検証対象になること（**レア度上位の枠を埋めた状態で確かめる**。枠が空いていると従来条件だけで通ってしまい、追加した条件を消しても落ちないテストになる）、**`unresolved` も対象に入ること**（`status === "probable"` と書くと黙って漏れる）、検証に回るカード数が選定と一致すること、`willEnrich` が選定と一致すること、補正なし `confirmed` は対象外になりうること、**`candidates` がクライアント向けカードに含まれない**こと（スプレッドで漏れる）、棄却時に **`status: "unresolved"` が `card_update` で届く**こと（#24 の肝。ここが `confirmed` のままだと裏付けの取れなかったカードが通常カードとして残る）、**裏付けが取れたら `confirmed` が届く**こと、解説は速報のまま・リンクは空であること（送らないと「確認中」の表示が畳まれず回り続ける）、速報カードは消さないこと、`console.warn` が `term` と `reason` だけを出し**文字起こし本文を含まない**こと、候補#2 が選ばれた場合も改名せず `unresolved` に降格すること |
 | `scheduler-context.test.ts` | `ExtractionScheduler` の文脈保持（`src/extract/scheduler.ts`） | 成功したチャンクだけが次回の `contextTranscript` になること、**一時エラーのチャンクは積まれない**こと（回帰テストの本体。戻ってきたチャンクが文脈と新規の両方に出ない）、恒久エラーで文脈も捨てること、**既出用語のデデュープが壊れていない**こと。private の `extract` を差し替えて LLM を呼ばずに回す |
 | `normalize-term.test.ts` | `normalizeTerm()`（`src/extract/normalize.ts`） | NFKC・小文字化・空白除去で表記ゆれが同一キーに畳まれる／別語は衝突しない |
 | `error-classify.test.ts` | `isPermanent()` / `isQuotaExhausted()` / `toUserMessage()` | 400/401/403/404/422/429(quota) は恒久、408/409/429(rate)/5xx/接続エラーは一時。利用者向け文言 |
 | `strip-citations.test.ts` | `stripInlineCitations()` | 除去する記法と、触ってはいけない日本語の記号 |
 | `lowpass.test.ts` | `designLowpass()` | 通過域・阻止域・直流ゲイン・線形位相 |
-| `eval-metrics.test.ts` | `src/eval/metrics.ts` | 5指標の計算そのもの（LLM 抜き） |
+| `eval-metrics.test.ts` | `src/eval/metrics.ts` | 6指標の計算そのもの（LLM 抜き）。**`probable` と `unresolved` を別々の列に数える**こと（#24。合算すると過剰 unresolved に気づけない） |
 | `llm-eval.test.ts` | 用語抽出（LLM） | 既定では **skip**。ケース JSON のスキーマ検証だけ常時実行 |
 
 ### fixture に会話内容を入れない
@@ -186,7 +188,7 @@ npm run eval:llm > /tmp/eval.json          # stdout のリダイレクトでも�
 
 ### ケース（`tests/fixtures/term-cases.json`）
 
-15件。**すべて合成**で、実会議の録音・文字起こしからの抜粋は使っていない
+17件。**すべて合成**で、実会議の録音・文字起こしからの抜粋は使っていない
 （`src/stt/mock-script.ts` と同じ方針）。実会議の情報が混ざる経路を原理的に断つため。
 誤認識カタカナ（クバネテス／グラファナ／ピネコーネ）、略語の読み上げ（オーオース／
 ピーケーシーイー／エヌディーエー）、用語集ブースト、既出用語のデデュープ、
@@ -210,6 +212,19 @@ npm run eval:llm > /tmp/eval.json          # stdout のリダイレクトでも�
 - `lookalike-confluence` — 「コンフルエンス」→ `Confluence`。誤答側は `Confluent`
   （Kafka の企業。カタカナではほぼ同音）。`context` はドキュメントの置き場所の話
 
+#24 で「**そもそも特定できないのが正解**」のケースを2件足した。どちらも `expectTerms` と
+`expectCorrection` は空で、**音韻が近いだけの実在用語を `forbidTerms` に置いてある**。
+測っているのは「断定しないこと」で、指標としては誤補正率に出る。聞き取られた表記そのものは
+`allowLowConfidence` に入れてある（`unresolved` でも `term` は残る＝ Precision の分母に入るため）。
+
+- `unresolved-garbled-product` — 「グラファトス」。誤答側は `Grafana` / `Graphite`。
+  `context` は監視ツールを揃えたいという話で、**文脈が誤答を後押しする向き**に置いてある
+- `unresolved-lookalike-noise` — 「ケルベロッサ」。誤答側は `Kerberos`。
+  `context` は認証の話を**あえて含めていない**（含めると Kerberos が正答になりうる）
+
+> **unresolved 率だけを見て良し悪しを判断しない。** 何でも「特定できません」にすれば
+> この2ケースは通るが、Recall と正しい補正率が落ちる。**セットで読むこと。**
+
 ### 指標
 
 | 指標 | 定義 | 既定の閾値 |
@@ -217,7 +232,8 @@ npm run eval:llm > /tmp/eval.json          # stdout のリダイレクトでも�
 | 用語 Recall | `expectTerms` のうち出力カードの `term` に一致した割合 | ≥ 0.8 |
 | 正しい補正率 | `correctedFrom` が誤表記かつ `term` が正表記のカードが出た割合 | （報告のみ） |
 | 誤補正率 | 禁止語が出た、または誤表記から別の用語に着地したケース ÷ 全ケース | ≤ 0.05 |
-| unresolved 率 | `expectTerms` のうちカードは出たが `confidence === "low"` ÷ `expectTerms` 総数 | （報告のみ） |
+| probable 率 | `expectTerms` のうちカードは出たが `status === "probable"` ÷ `expectTerms` 総数 | （報告のみ） |
+| unresolved 率 | `expectTerms` のうちカードは出たが `status === "unresolved"` ÷ `expectTerms` 総数 | （報告のみ） |
 | カード Precision | 出力カード（**正規化キーで dedupe 後**）のうち `expectTerms ∪ allowLowConfidence` に含まれる割合 | ≥ 0.6 |
 
 - **突き合わせは必ず `normalizeTerm()` を通す**（`src/extract/scheduler.ts` から import）。
@@ -264,8 +280,13 @@ EVAL_NO_CONTEXT=1 npm run eval:llm -- --out /tmp/without-context.json
 検証対象の選定は本番と同じ `selectVerifyTargets()` を呼ぶ。**ここにコピーを置くと、
 本番の選定条件を変えたときに評価だけ古い条件のまま緑になる。**
 
-**裏付けの取れなかったカードは指標から落とす。** 本番の既定は「棄却しても表示は変えない」だが、
+**裏付けの取れなかったカードは指標から落とす**（`EVAL_ALLOW_RENAME=1` のとき）。
 評価で測りたいのは検証の判断そのものなので、判断を反映させる。
+
+> 2026-08-27 追記（#24）: **既定モードでも `status` だけは本番と同じに動かす**
+> （裏付けあり → `confirmed`、棄却・候補#2 → `unresolved`）。揃えないと probable /
+> unresolved の2列が Stage 1 の申告のままになり、検証の効果が数字に出ない。
+> `term` は変えないので Recall / 誤補正率 / Precision には影響せず、合否ゲートは動かない。
 
 > **誤補正率だけを見ると過剰棄却を見逃す。** 何も補正しなくなれば誤補正率は 0 になる。
 > `expectCorrection`（正しい補正率）と**必ずセットで**読むこと。リスクとしてはここが最大。

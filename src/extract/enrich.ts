@@ -292,7 +292,7 @@ function linkRank(url: string, title: string, cited: boolean): number {
  * **1カードあたりの LLM 呼び出しは増えない。** 従来の清書(web検索つき)にそのまま検証を同居させ、
  * 「実在するか」「文脈に合うか」を**独立した情報源**で確かめる。抽出段と同じ推論パスの
  * 中で自己検証しても、誤補正の自己強化は断ち切れないため。
- * ただし**チャンクあたりでは増える** — `selectVerifyTargets()` が「補正あり or confidence low」を
+ * ただし**チャンクあたりでは増える** — `selectVerifyTargets()` が「補正あり or 非 confirmed」を
  * 和集合で足すぶん、対象カードが増えればそのぶん web 検索つきの呼び出しが増える。
  *
  * リンクは「候補を全部集めてから最大3件選ぶ」の2段階で決める。

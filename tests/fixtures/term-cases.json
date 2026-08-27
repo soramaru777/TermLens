@@ -152,5 +152,29 @@
     "expectCorrection": { "コンフルエンス": "Confluence" },
     "forbidTerms": ["Confluent", "コンフルエント", "Apache Kafka", "コンフルエンス"],
     "allowLowConfidence": ["Atlassian", "スペース", "議事録"]
+  },
+  {
+    "id": "unresolved-garbled-product",
+    "transcript": "監視のダッシュボードは、ええと、グラファトスに集約する方向で検討しています。",
+    "context": "サーバーの状態を見るツールがチームごとにばらばらで、まとめたいという話をしていました。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": [],
+    "expectCorrection": {},
+    "forbidTerms": ["Grafana", "グラファナ", "Graphite", "グラファイト", "Kibana"],
+    "expectUnresolved": ["グラファトス"],
+    "allowLowConfidence": ["グラファトス", "ダッシュボード", "監視"]
+  },
+  {
+    "id": "unresolved-lookalike-noise",
+    "transcript": "次の開発サイクルでは、ケルベロッサの導入も検討したいと思います。",
+    "context": "来期にやることを一つずつ棚卸ししていました。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": [],
+    "expectCorrection": {},
+    "forbidTerms": ["Kerberos", "ケルベロス", "Cerberus"],
+    "expectUnresolved": ["ケルベロッサ"],
+    "allowLowConfidence": ["ケルベロッサ", "開発サイクル", "スプリント"]
   }
 ]

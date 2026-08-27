@@ -22,7 +22,7 @@ function card(term: string, surfaceForms: string[]) {
     term,
     reading: "テスト",
     description: "テスト用のカード。",
-    confidence: "high" as const,
+    status: "confirmed" as const,
     rarity: "rare" as const,
     correctedFrom: null,
     surfaceForms,
@@ -51,7 +51,7 @@ test("surfaceForms が空になってもカード自体は残す", () => {
 test("surfaceForms 以外のフィールドは変えない", () => {
   const original = {
     ...card("RAG", ["ラグ", "RAG"]),
-    confidence: "low" as const,
+    status: "probable" as const,
     correctedFrom: "ラグ",
   };
   const out = filterSurfaceForms([original], "ラグの検索精度が課題です。");

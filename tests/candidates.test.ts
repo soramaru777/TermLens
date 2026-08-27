@@ -108,7 +108,7 @@ test("空・空白だけの候補を落とす", () => {
 test("candidates 以外のフィールドは変えない", () => {
   const original = {
     ...card("RAG", [candidate("RAG")]),
-    confidence: "low" as const,
+    status: "probable" as const,
     correctedFrom: "ラグ",
     surfaceForms: ["ラグ"],
   };

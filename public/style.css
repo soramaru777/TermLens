@@ -2,6 +2,9 @@
   --accent: #0e7a6f;
   --bg: #f6f5f2;
   --card-bg: #ffffff;
+  /* 特定できなかったカード(#24)の下地。--card-bg より一段沈ませる。
+     color-mix() を使わないのは iPad Safari での対応が古い端末で読めないため */
+  --card-muted-bg: #f1f0ec;
   --text: #22302e;
   --muted: #7a8683;
   --warn: #b3661b;
@@ -252,6 +255,14 @@ button.primary:disabled { opacity: 0.5; }
   0% { background: #ffe3c2; box-shadow: 0 0 0 2px #e07000; }
   100% { background: var(--card-bg); box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
 }
+/* unresolved は下地が違うので、flash の終端(--card-bg)で塗り潰さない(#24)。
+   文字起こしの語をタップして飛んだ直後が最も見られるタイミングなので、そこで
+   通常カードと同じ見た目になると「特定できなかった」ことが伝わらない。 */
+.card.unresolved.flash { animation-name: cardflash-muted; }
+@keyframes cardflash-muted {
+  0% { background: #ffe3c2; box-shadow: 0 0 0 2px #e07000; }
+  100% { background: var(--card-muted-bg); box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+}
 /* 用語カードの表示切り替えバー(縦積みレイアウトのみ) */
 #card-nav {
   display: flex;
@@ -342,6 +353,25 @@ button.primary:disabled { opacity: 0.5; }
   display: inline-block;
   color: var(--warn);
   border: 1px solid var(--warn);
+  border-radius: 6px;
+  font-size: 0.72rem;
+  padding: 1px 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+/* unresolved(#24): 用語を特定できなかったカード。
+   「もしかして?」(--warn) より一段弱い muted 系で、**通常カードと取り違えられないが
+   警告として目を引きすぎない**ところに置く。見出しは推定した用語ではなく、音声認識が
+   聞き取った表記そのもの。 */
+.card.unresolved {
+  border-left: 3px solid var(--muted);
+  background: var(--card-muted-bg);
+}
+.card.unresolved .term { color: var(--muted); font-weight: 600; }
+.card .unknown {
+  display: inline-block;
+  color: var(--muted);
+  border: 1px dashed var(--muted);
   border-radius: 6px;
   font-size: 0.72rem;
   padding: 1px 6px;
