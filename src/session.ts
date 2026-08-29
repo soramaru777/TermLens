@@ -1,5 +1,5 @@
 import type { WebSocket, RawData } from "ws";
-import type { SttAdapter } from "./stt/types.js";
+import type { SttAdapter, TranscriptEvent } from "./stt/types.js";
 import { MockSttAdapter } from "./stt/mock.js";
 import { DeepgramSttAdapter } from "./stt/deepgram.js";
 import { ExtractionScheduler } from "./extract/scheduler.js";
@@ -31,6 +31,18 @@ export class Session {
   private scheduler: ExtractionScheduler | null = null;
   private builder: UtteranceBuilder | null = null;
   private closed = false;
+  /**
+   * 最後に配った `finalSeq`(#36)。**配る番号は 1 から**で、0 は「まだ1件も配っていない」
+   * ことを表す初期値でしかない(クライアントに 0 は届かない)。1つの Deepgram Results を
+   * 話者で分割したイベントには同じ番号を配り、クライアントの jitter 補正がそれを
+   * 手掛かりに再結合する。
+   *
+   * このフィールドは WS 1本の生存期間を通じて持ち、**同じ接続で stop → start しても
+   * 0 に戻さない**(戻すと停止前後の final に同じ番号が付き、別発話が結合されうる)。
+   * 再接続で WS ごと張り直された場合は 1 から振り直しになるが、クライアントは
+   * 再接続の境界で必ずグループを切るので衝突しない。
+   */
+  private lastFinalSeq = 0;
 
   constructor(private ws: WebSocket) {
     ws.on("message", (data, isBinary) => this.onMessage(data, isBinary));
@@ -105,7 +117,16 @@ export class Session {
     const stt = createSttAdapter();
     this.stt = stt;
     stt.onTranscript((e) => {
-      this.send({ type: "transcript", text: e.text, isFinal: e.isFinal, speaker: e.speaker ?? null });
+      this.send({
+        type: "transcript",
+        text: e.text,
+        isFinal: e.isFinal,
+        speaker: e.speaker ?? null,
+        // 分割された final に同じ番号を配るのがここの仕事(#36)。採番を
+        // buildFinalEvents() 側に持たせるとグローバルカウンタになり、純関数として
+        // テストできなくなる
+        finalSeq: e.isFinal ? this.assignFinalSeq(e) : undefined,
+      });
       if (e.isFinal) builder.addFinal(e);
     });
     stt.onUtteranceEnd(() => builder.utteranceEnd());
@@ -125,6 +146,18 @@ export class Session {
       this.stt = null;
       this.send({ type: "error", code: "stt_error", message: (err as Error).message });
     }
+  }
+
+  /**
+   * この final に配る `finalSeq` を決めて返す(進めた後の現在値)。
+   *
+   * **カウンタを進めるのは Results の先頭(`segIndex === 0`)だけ。** 話者で分割された
+   * 2件目以降は先頭と同じ番号を受け取る。`segIndex` を持たないアダプタ(将来の実装)は
+   * undefined で来るので、その場合は1件ごとに進める＝分割なしと同じ扱いになる。
+   */
+  private assignFinalSeq(e: TranscriptEvent): number {
+    if (e.segIndex === undefined || e.segIndex === 0) this.lastFinalSeq++;
+    return this.lastFinalSeq;
   }
 
   private async stopSession(): Promise<void> {

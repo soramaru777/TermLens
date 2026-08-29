@@ -27,6 +27,9 @@ import {
   captureModeLabel,
   normalizeCaptureMode,
 } from "./capture-mode.js";
+// 発話グループの組み立て(話者 jitter の補正 + 同一話者の結合)は utterances.js が唯一の
+// 定義箇所(#36)。ここでまとめ直すと、画面と Markdown エクスポートで補正結果が食い違う。
+import { groupUtterances } from "./utterances.js";
 // 診断の整形も純関数側(diagnostics.js)。getSettings() の採用リストもそこにある。
 import {
   audioStatRows,
@@ -446,7 +449,11 @@ function connectWs(token, glossary) {
         break;
       case "transcript":
         if (msg.isFinal) {
-          finalLines.push({ text: msg.text, speaker: msg.speaker, t: Date.now() });
+          // seq(= サーバーの finalSeq)は「同じ Deepgram の final 由来か」の印。
+          // 1つの final が話者で分割されると同じ seq の行が複数並ぶので、
+          // utterances.js の jitter 補正がそれを手掛かりに再結合する(#36)。
+          // 旧サーバーからは届かないので undefined のまま積む(復元経路と同じ扱い)
+          finalLines.push({ text: msg.text, speaker: msg.speaker, t: Date.now(), seq: msg.finalSeq });
           renderTranscript();
           interimText.textContent = "";
           scheduleSessionSave();
@@ -625,29 +632,11 @@ function speakerLabel(speaker) {
   return "話者" + String.fromCharCode(65 + (speaker % 26)); // 話者A, 話者B, …
 }
 
-// 連続する同一話者の発言を1つの段落にまとめる。描画とエクスポートで共有する。
-// finalLines には通常の発話行のほかに { type: "reconnect" } という区切り印が混じる。
-// 区切りはそれ自身で1グループとし、直後の発話が直前の話者と同じでも絶対にまとめない
-// (再接続後は話者番号が振り直しなので、同じ番号でも別人の可能性がある)。
-function groupUtterances() {
-  const groups = [];
-  for (const line of finalLines) {
-    if (line.type === "reconnect") {
-      groups.push({ type: "reconnect", t: line.t });
-      continue;
-    }
-    const last = groups[groups.length - 1];
-    if (last && last.type !== "reconnect" && last.speaker === line.speaker) last.texts.push(line.text);
-    else groups.push({ speaker: line.speaker, t: line.t, texts: [line.text] });
-  }
-  return groups;
-}
-
 // 文字起こし全体を再描画する。話者が変わったら新しい段落+話者チップを付ける。
 // カード追加時のハイライト反映も兼ねる。
 function renderTranscript() {
   finalText.textContent = "";
-  for (const group of groupUtterances()) {
+  for (const group of groupUtterances(finalLines)) {
     if (group.type === "reconnect") {
       finalText.append(el("div", "reconnect-marker", "― 再接続(以降の話者ラベルは振り直し)―"));
       continue;
@@ -890,7 +879,7 @@ function buildTranscriptMarkdown() {
     "---",
     "",
   ];
-  for (const group of groupUtterances()) {
+  for (const group of groupUtterances(finalLines)) {
     if (group.type === "reconnect") {
       out.push("---", "", "*再接続しました。以降の話者ラベルは振り直しです。*", "");
       continue;

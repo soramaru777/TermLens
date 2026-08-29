@@ -81,6 +81,45 @@ test("Markdown エクスポートは純関数に委譲する", () => {
   );
 });
 
+// ---- 発話グループ（#36） ----
+
+/**
+ * **画面と Markdown エクスポートは同じ `groupUtterances()` を通る。**
+ *
+ * 片方が自前で `finalLines` をまとめ直すと、jitter 補正の効いた画面と効かない
+ * エクスポートに割れる（AC「画面表示と Markdown export で同じ補正結果になる」が
+ * 静かに落ちる。純関数のテストは全部緑のまま）。
+ */
+test("表示とエクスポートは同じ groupUtterances() を通す", () => {
+  assert.match(APP, /from "\.\/utterances\.js"/, "utterances.js を import していない");
+  // 呼び出しは描画（renderTranscript）とエクスポート（buildTranscriptMarkdown）の2箇所だけ
+  const calls = CODE.match(/groupUtterances\(/g) ?? [];
+  assert.equal(calls.length, 2, `groupUtterances の呼び出しが ${calls.length} 箇所ある`);
+  const render = CODE.slice(CODE.indexOf("function renderTranscript"), CODE.indexOf("function el("));
+  assert.match(render, /groupUtterances\(finalLines\)/, "描画がグループ化を通していない");
+  const md = CODE.slice(
+    CODE.indexOf("function buildTranscriptMarkdown"),
+    CODE.indexOf("function buildTranscriptMarkdown") + 1500,
+  );
+  assert.match(md, /groupUtterances\(finalLines\)/, "エクスポートがグループ化を通していない");
+  // app.js 側に定義が残っていると、import した純関数が使われないまま古い挙動で動く
+  assert.doesNotMatch(CODE, /function groupUtterances\(/, "app.js に定義が残っている");
+});
+
+/**
+ * **`finalSeq` を積まないと jitter 補正が時間窓へ落ちる。**
+ *
+ * 落ちても例外は出ず、補正の精度が静かに下がるだけなので気づけない
+ * （`seq` が無い＝復元した旧セッションと同じ扱いになる）。
+ */
+test("受信した final には finalSeq を seq として積む", () => {
+  assert.match(
+    CODE,
+    /finalLines\.push\(\{ text: msg\.text, speaker: msg\.speaker, t: Date\.now\(\), seq: msg\.finalSeq \}\)/,
+    "final の行に seq を積んでいない",
+  );
+});
+
 // ---- 収音モードと診断（#26） ----
 
 test("getUserMedia の constraints は capture-mode.js から取る", () => {

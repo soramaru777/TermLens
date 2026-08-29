@@ -30,6 +30,24 @@ export interface TranscriptEvent {
    */
   words?: TranscriptWord[];
   /**
+   * 1つの Results を話者で分割したときの通し番号（0 起点）。
+   *
+   * **分割の事実だけを載せ、採番はしない。** `buildFinalEvents()` は純関数なので
+   * グローバルカウンタを持たせるとテストの決定性が壊れる。`src/session.ts` が
+   * `segIndex === 0`（または undefined）を「新しい Results の先頭」と読んでカウンタを進め、
+   * その値を `ServerMessage.finalSeq` としてクライアントへ送る。
+   * クライアントはそれを使って話者ラベルの揺れを再結合する（#36）。
+   *
+   * 分割されなかった final も `segIndex: 0` を通るので、必ず1つ採番される。
+   * interim には付かない（分割しないため）。
+   *
+   * **分割数は載せない。** 採番に要るのは「先頭かどうか」だけで、件数を持たせても
+   * 読み手がいない。`words` / `speechFinal` と同じくサーバー内部用で、
+   * `ServerMessage.transcript` には `segIndex` 自体を載せない（載せるのは採番結果の
+   * `finalSeq` だけ）。
+   */
+  segIndex?: number;
+  /**
    * Deepgram の `speech_final`。無音検出（`endpointing`）による発話終端。
    *
    * interim では立たない。1つの Results を話者で複数に分割した場合、

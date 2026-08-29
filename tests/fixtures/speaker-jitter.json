@@ -1,0 +1,110 @@
+[
+  {
+    "id": "island-same-final",
+    "speakers": [0, 1, 0],
+    "lengths": ["long", "short", "long"],
+    "seqs": [7, 7, 7],
+    "expect": [{ "speaker": 0, "count": 3 }]
+  },
+  {
+    "id": "island-cascade",
+    "speakers": [0, 1, 0, 2, 0],
+    "lengths": ["long", "short", "long", "short", "long"],
+    "seqs": [7, 7, 7, 7, 7],
+    "expect": [{ "speaker": 0, "count": 5 }]
+  },
+  {
+    "id": "alternating-cascade",
+    "speakers": [0, 1, 0, 1],
+    "lengths": ["short", "short", "short", "short"],
+    "seqs": [7, 7, 7, 7],
+    "expect": [
+      { "speaker": 0, "count": 3 },
+      { "speaker": 1, "count": 1 }
+    ]
+  },
+  {
+    "id": "backchannel-other-final",
+    "speakers": [0, 1, 0],
+    "lengths": ["long", "short", "long"],
+    "seqs": [1, 2, 3],
+    "expect": [
+      { "speaker": 0, "count": 1 },
+      { "speaker": 1, "count": 1 },
+      { "speaker": 0, "count": 1 }
+    ]
+  },
+  {
+    "id": "boundary-seq-at-head",
+    "speakers": [0, 1, 0],
+    "lengths": ["long", "short", "long"],
+    "seqs": [7, 7, 8],
+    "expect": [
+      { "speaker": 0, "count": 1 },
+      { "speaker": 1, "count": 1 },
+      { "speaker": 0, "count": 1 }
+    ]
+  },
+  {
+    "id": "boundary-seq-at-tail",
+    "speakers": [0, 1, 0],
+    "lengths": ["long", "short", "long"],
+    "seqs": [7, 8, 8],
+    "expect": [
+      { "speaker": 0, "count": 1 },
+      { "speaker": 1, "count": 1 },
+      { "speaker": 0, "count": 1 }
+    ]
+  },
+  {
+    "id": "long-middle",
+    "speakers": [0, 1, 0],
+    "lengths": ["long", "long", "long"],
+    "seqs": [7, 7, 7],
+    "expect": [
+      { "speaker": 0, "count": 1 },
+      { "speaker": 1, "count": 1 },
+      { "speaker": 0, "count": 1 }
+    ]
+  },
+  {
+    "id": "different-neighbors",
+    "speakers": [0, 1, 2],
+    "lengths": ["long", "short", "long"],
+    "seqs": [7, 7, 7],
+    "expect": [
+      { "speaker": 0, "count": 1 },
+      { "speaker": 1, "count": 1 },
+      { "speaker": 2, "count": 1 }
+    ]
+  },
+  {
+    "id": "short-at-both-edges",
+    "speakers": [1, 0, 1],
+    "lengths": ["short", "long", "short"],
+    "seqs": [7, 7, 7],
+    "expect": [
+      { "speaker": 1, "count": 1 },
+      { "speaker": 0, "count": 1 },
+      { "speaker": 1, "count": 1 }
+    ]
+  },
+  {
+    "id": "unknown-neighbors",
+    "speakers": [null, 0, null],
+    "lengths": ["long", "short", "long"],
+    "seqs": [7, 7, 7],
+    "expect": [
+      { "speaker": null, "count": 1 },
+      { "speaker": 0, "count": 1 },
+      { "speaker": null, "count": 1 }
+    ]
+  },
+  {
+    "id": "unknown-middle",
+    "speakers": [0, null, 0],
+    "lengths": ["long", "short", "long"],
+    "seqs": [7, 7, 7],
+    "expect": [{ "speaker": 0, "count": 3 }]
+  }
+]

@@ -7,7 +7,7 @@ sources:
   - README.md
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]]
 confidence: high
-updated: 2026-08-13
+updated: 2026-08-29
 ---
 
 # TermLens アーキテクチャ
@@ -54,9 +54,13 @@ WebSocket 1本の中で、**音声はバイナリフレーム、制御メッセ�
 | `src/extract/enrich.ts` | 清書（web search、リンク収集、前置き除去） |
 | `src/extract/scheduler.ts` | トリガー判定・デデュープ・清書対象の選定 |
 | `public/app.js` | UI 全般（話者段落、用語ハイライト、カードジャンプ） |
+| `public/utterances.js` | 表示・エクスポート用の発話グループ化（話者ラベルの揺れの補正 + 同一話者の結合、#36） |
 
 ## 設計上の選択
 
 - **STT をアダプタ層で抽象化**した。Deepgram / mock を差し替えられ、キーなしで全パイプラインを検証できる（[[termlens-stt-pipeline]]）
 - **用語解説を二段構え**にした。速報を即返して体感速度を確保し、web 検索結果で後から上書きする（[[termlens-term-extraction]]）
+- **話者ラベルの揺れは表示側の後処理で直す。** STT の分割規則（`splitBySpeaker()`）は変えず、
+  `public/utterances.js` がコピーの上で `speaker` だけを補正する。raw の文字起こしと用語抽出の
+  経路は無変更で、**テキストは一切削除しない**（[[termlens-stt-pipeline]]）
 - **状態をサーバーに永続化していない。** ブラウザメモリのみのため、リロードで全消失する（[[termlens-open-issues]] の弱点4）
