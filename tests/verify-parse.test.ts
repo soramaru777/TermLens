@@ -102,7 +102,7 @@ test("候補に無い用語は採らず、棄却して理由に残す", () => {
 
 test("chosen の表記ゆれは候補側の表記に揃える", () => {
   const decision = parseVerifyOutput(output({ chosen: "qdrant " }), CANDIDATES);
-  assert.equal(decision.chosen, "Qdrant", "card_update の term 突き合わせを表記に振らせない");
+  assert.equal(decision.chosen, "Qdrant", "isVerified() の突き合わせを表記に振らせない");
 });
 
 test("コードフェンスや前置きに包まれていても拾う", () => {
@@ -222,7 +222,7 @@ test("normalizeVerification: すでに棄却なら理由を書き換えない", 
 
 /**
  * `isVerified()`。候補の2番目が選ばれた場合は「表示中のカードの裏付け」にはならない。
- * `card_update` は term でカードを突き合わせるので、改名する経路が無いため。
+ * #38 で `card_update` は cardId ベースになったが、term を差し替える経路はまだ無いため。
  */
 test("裏付けの判定は表示中の用語に対して行う", () => {
   assert.equal(isVerified("Qdrant", "Qdrant"), true);

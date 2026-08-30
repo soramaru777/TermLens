@@ -109,9 +109,9 @@ export function toUserMessage(err: unknown): string {
  * 足した和集合。誤補正が疑わしいのはこの2つで、レア度ランキングが選ぶ集合とは大きく
  * 重なるため、web 検索の呼び出し増は小さい。
  *
- * **`unresolved` は検証に回さない(#24)。** 昇格の経路が無い(`card_update` は term で
- * 突き合わせるので改名できない)うえ、解説も定型文で固定されるため、**検証結果を
- * 使える余地が1つも無い**。回すと web 検索の課金だけが増える。
+ * **`unresolved` は検証に回さない(#24)。** 昇格の経路が無い(#38 で `card_update` は
+ * cardId ベースになったが、**改名の経路自体はまだ無い**)うえ、解説も定型文で固定される
+ * ため、**検証結果を使える余地が1つも無い**。回すと web 検索の課金だけが増える。
  * さらに、昇格を防ぎつつ解説だけ更新すると「特定できませんでした」の見出しの下に
  * 確定した別用語の断定的な解説が出る — この Issue が防ごうとしていた形そのものになる。
  *
@@ -120,6 +120,10 @@ export function toUserMessage(err: unknown): string {
  *
  * 純関数として export してあるのは、評価ハーネス(`src/eval/run.ts`)が
  * `EVAL_WITH_VERIFY=1` のときに**本番と同じ選定**で回すため。コピーすると drift する。
+ *
+ * **戻り値は term の集合のままにしてある**(#38 で cardId を入れた後も変えない)。ここは
+ * 「どのカードを検証に回すか」の**選定**であって識別ではなく、評価ハーネスと共用の純関数
+ * だから。cardId を持ち込むと評価側にサーバーの採番を持たせることになり、本番と drift する。
  */
 export function selectVerifyTargets<
   T extends {
@@ -166,8 +170,11 @@ export function selectVerifyTargets<
  * 増えるたび黙って漏れる。明示的に書けば、増えたフィールドは何もしなければ漏れず、
  * `TermCard` 側が増えたときは**型エラーで気づける**。
  */
-function toClientCard(card: ExtractedCard, willEnrich: boolean): TermCard {
+function toClientCard(card: ExtractedCard, willEnrich: boolean, cardId: string): TermCard {
   return {
+    // 採番は呼び出し元(`run()`)が持つ。ここで採ると `enrichCard()` へ同じ ID を
+    // 引き回せず、`card_update` が当たらないカードができる
+    cardId,
     term: card.term,
     reading: card.reading,
     description: card.description,
@@ -201,6 +208,14 @@ export class ExtractionScheduler {
   private consecutiveFailures = 0;
   private shownTerms: string[] = [];
   private shownSet = new Set<string>();
+  /**
+   * カード ID の採番カウンタ(#38)。`c1`, `c2`, … を1セッション(= WS 1本)の間だけ配る。
+   *
+   * **再接続で 0 から振り直しになる**が、クライアントは受信 ID を自分のローカル ID へ
+   * 写像して持つので衝突しない(`public/app.js` の `incomingCardId`)。サーバー側で
+   * 永続的に一意な ID を作る必要はここには無い。
+   */
+  private nextCardId = 0;
   private timer: NodeJS.Timeout;
   private extract: ReturnType<typeof createExtractor>;
   /**
@@ -218,9 +233,13 @@ export class ExtractionScheduler {
       /**
        * 清書(検証)の結果をクライアントへ届ける。`status` は #24 で追加した。
        * 裏付けが取れれば `confirmed`、棄却なら `unresolved` に**降格**する。
+       *
+       * 第1引数は #38 から **cardId**(term ではない)。速報で送ったカードと同じ ID を
+       * 渡すこと。`onCardUpdate` を呼ぶ経路は3つ(裏付けあり / 棄却 / 例外時の
+       * フォールバック)あり、**どれか1つでも別の値を渡すと更新が迷子になる**。
        */
       onCardUpdate: (
-        term: string,
+        cardId: string,
         status: TermStatus,
         description: string,
         links: TermLink[],
@@ -296,6 +315,12 @@ export class ExtractionScheduler {
     clearInterval(this.timer);
   }
 
+  /** 次のカード ID を採る(#38)。`c1` から始まる連番。 */
+  private newCardId(): string {
+    this.nextCardId += 1;
+    return `c${this.nextCardId}`;
+  }
+
   private maybeRun(): void {
     if (this.running || this.stopped || this.disabled || this.buffer.length === 0) return;
     const waited = Date.now() - this.lastRunAt;
@@ -342,11 +367,18 @@ export class ExtractionScheduler {
         const enrichTargets = this.verifyDisabled
           ? new Set<string>()
           : selectVerifyTargets(fresh);
+        // **ID は速報を組み立てる前に配り切る**(#38)。`toClientCard()` の中で採ると
+        // 下の `enrichCard()` へ同じ ID を渡せず、`card_update` が当たらなくなる。
+        const withIds = fresh.map((c) => ({ card: c, cardId: this.newCardId() }));
         // 速報: LLMの知識ベースのドラフト解説で即表示
-        this.callbacks.onCards(fresh.map((c) => toClientCard(c, enrichTargets.has(c.term))));
+        this.callbacks.onCards(
+          withIds.map(({ card, cardId }) =>
+            toClientCard(card, enrichTargets.has(card.term), cardId),
+          ),
+        );
         // 清書: 選ばれた用語だけweb検索で候補を検証し、要約+関連リンクで更新
-        for (const card of fresh) {
-          if (enrichTargets.has(card.term)) void this.enrichCard(card, chunk);
+        for (const { card, cardId } of withIds) {
+          if (enrichTargets.has(card.term)) void this.enrichCard(card, chunk, cardId);
         }
       }
     } catch (err) {
@@ -387,7 +419,16 @@ export class ExtractionScheduler {
     }
   }
 
-  private async enrichCard(card: ExtractedCard, context: string): Promise<void> {
+  /**
+   * `cardId` は速報で送ったカードの ID(#38)。**下の3つの `onCardUpdate` すべてに
+   * 同じ値を渡すこと。** ログ(`console.warn` / `console.error`)は人が読むものなので
+   * 従来どおり term を出す。
+   */
+  private async enrichCard(
+    card: ExtractedCard,
+    context: string,
+    cardId: string,
+  ): Promise<void> {
     try {
       const result = await verifyAndEnrich({
         candidates: card.candidates,
@@ -434,7 +475,7 @@ export class ExtractionScheduler {
       // 素通しにすると方針が非対称になり、AC「架空/別用語の説明を生成しない」が破れる。
       // 停止後でも flush 済みカードの更新は届けてよい(送信可否は session 側が判定する)
       this.callbacks.onCardUpdate(
-        card.term,
+        cardId,
         verified ? "confirmed" : "unresolved",
         verified ? result.description : UNRESOLVED_DESCRIPTION,
         verified ? result.links : [],
@@ -459,7 +500,7 @@ export class ExtractionScheduler {
       // 黙るとクライアントの「確認中」が会議の終わりまで回り続け、localStorage にも
       // その状態で保存されるので復元しても消えない(#23 で棄却時に踏んだのと同じ穴)。
       // 検証できなかっただけなので**速報の status と解説はそのまま**、リンクだけ空で送る。
-      this.callbacks.onCardUpdate(card.term, card.status, card.description, []);
+      this.callbacks.onCardUpdate(cardId, card.status, card.description, []);
     }
   }
 }

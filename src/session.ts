@@ -93,9 +93,10 @@ export class Session {
       glossary,
       {
         onCards: (cards) => this.send({ type: "cards", cards }),
-        // status は #24 で追加。検証の結果(confirmed / unresolved)をそのまま通す
-        onCardUpdate: (term, status, description, links) =>
-          this.send({ type: "card_update", term, status, description, links }),
+        // status は #24 で追加。検証の結果(confirmed / unresolved)をそのまま通す。
+        // 突き合わせは #38 から cardId(scheduler が採番した通番)をそのまま中継する
+        onCardUpdate: (cardId, status, description, links) =>
+          this.send({ type: "card_update", cardId, status, description, links }),
         onExtracting: () => this.send({ type: "status", state: "extracting" }),
         // permanent: 恒久エラーで抽出を打ち切ったときだけ scheduler から真が渡ってくる(#10)
         onError: (message, permanent) => this.send({ type: "error", code: "llm_error", message, permanent }),

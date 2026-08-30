@@ -52,8 +52,8 @@ test("補正あり・status が confirmed でないカードは必ず検証す�
 /**
  * `unresolved` は検証に回さない（#24 のレビュー指摘）。
  *
- * 昇格の経路が無く（`card_update` は term で突き合わせるので改名できない）、解説も
- * 定型文で固定されるため、**検証結果を使える余地が1つも無い**。回すと web 検索の
+ * 昇格の経路が無く（#38 で `card_update` は cardId ベースになったが、**改名の経路自体は
+ * まだ無い**）、解説も定型文で固定されるため、**検証結果を使える余地が1つも無い**。回すと web 検索の
  * 課金だけが増える。昇格を防ぎつつ解説だけ更新すると「特定できませんでした」の見出しの
  * 下に確定した別用語の断定的な解説が出て、この Issue が防ごうとした形そのものになる。
  */
@@ -98,7 +98,8 @@ test("空配列なら対象も空", () => {
 
 interface Harness {
   emitted: TermCard[][];
-  updates: Array<{ term: string; status: TermStatus; description: string; links: TermLink[] }>;
+  /** `card_update` として届いた更新。第1要素は #38 から cardId（term ではない） */
+  updates: Array<{ cardId: string; status: TermStatus; description: string; links: TermLink[] }>;
   warnings: string[];
   /** `onError` で利用者へ届いた通知（メッセージと permanent の対） */
   errors: Array<{ message: string; permanent: boolean | undefined }>;
@@ -128,8 +129,12 @@ function harness(
   glossary: string[] = [],
 ): Harness {
   const emitted: TermCard[][] = [];
-  const updates: Array<{ term: string; status: TermStatus; description: string; links: TermLink[] }> =
-    [];
+  const updates: Array<{
+    cardId: string;
+    status: TermStatus;
+    description: string;
+    links: TermLink[];
+  }> = [];
   const warnings: string[] = [];
   const errors: Array<{ message: string; permanent: boolean | undefined }> = [];
   const verifyInputs: string[] = [];
@@ -165,8 +170,8 @@ function harness(
 
   const scheduler = new ExtractionScheduler(glossary, {
     onCards: (c) => emitted.push(c),
-    onCardUpdate: (term, status, description, links) =>
-      updates.push({ term, status, description, links }),
+    onCardUpdate: (cardId, status, description, links) =>
+      updates.push({ cardId, status, description, links }),
     onExtracting: () => {},
     onError: (message, permanent) => errors.push({ message, permanent }),
   });
@@ -194,6 +199,74 @@ function harness(
     },
   };
 }
+
+// --- カード ID の採番（#38） ---------------------------------------------
+
+/**
+ * **カードの識別子はサーバーが配る**（#38）。
+ *
+ * `term` を主キーにしていた頃は、同じ term のカードを2枚区別できず、term を後から
+ * 差し替える余地も無かった。採番が壊れても例外は出ない — `card_update` が
+ * 当たらなくなり、「確認中」が会議の終わりまで回り続けるだけなので気づけない。
+ */
+test("速報カードには一意の cardId が付く", async (t) => {
+  const h = harness(t, () => "Kubernetes");
+  await h.send(utterance("A"), [
+    card("Kubernetes", { correctedFrom: "クバネテス" }),
+    card("Grafana", { rarity: "common" }),
+  ]);
+  await h.send(utterance("B"), [card("Qdrant", { rarity: "common" })]);
+
+  const ids = h.emitted.flat().map((c) => c.cardId);
+  assert.deepEqual(ids, ["c1", "c2", "c3"], "セッション内の通番で採番する");
+  // チャンクをまたいでカウンタを持ち越さないと、2チャンク目が c1 から振り直しになり
+  // **前のチャンクのカードへ更新が当たる**
+  assert.equal(new Set(ids).size, ids.length, "チャンクをまたいでも重複しない");
+});
+
+/**
+ * **速報と清書で同じ cardId を使う。**
+ *
+ * `toClientCard()` の中で採番すると `enrichCard()` へ同じ ID を渡せず、更新が
+ * どのカードにも当たらない（あるいは別のカードに当たる）。検証に回らないカードを
+ * 先に並べてあるのは、**採番がずれたときに ID がちょうど隣のカードへ滑る**形にして
+ * 「たまたま合っている」で通らないようにするため。
+ */
+test("card_update の cardId は検証したカードのものと一致する", async (t) => {
+  const h = harness(t, () => "Kubernetes");
+  await h.send(utterance("A"), [
+    // 補正なし・common なので検証対象外（selectVerifyTargets が落とす）
+    card("Grafana", { rarity: "common" }),
+    card("Kubernetes", { correctedFrom: "クバネテス" }),
+  ]);
+
+  assert.deepEqual(
+    h.emitted.at(-1)!.map((c) => [c.term, c.cardId]),
+    [
+      ["Grafana", "c1"],
+      ["Kubernetes", "c2"],
+    ],
+  );
+  assert.equal(h.verifyInputs.length, 1, "検証に回るのは1枚だけ");
+  assert.deepEqual(h.updates.map((u) => u.cardId), ["c2"], "更新は検証したカードに当たる");
+});
+
+/**
+ * 例外パスも同じ cardId を使う（#38）。
+ *
+ * `onCardUpdate` を呼ぶ経路は3つ（裏付けあり / 棄却 / 例外時のフォールバック）ある。
+ * **1つでも取り違えると、そのカードだけ「確認中」が残り続ける。**
+ */
+test("検証が例外で落ちた経路も速報と同じ cardId で更新する", async (t) => {
+  const h = harness(t, () => "Kubernetes");
+  h.failVerify(new Error("boom"));
+  await h.send(utterance("A"), [
+    card("Grafana", { rarity: "common" }),
+    card("Kubernetes", { correctedFrom: "クバネテス" }),
+  ]);
+
+  assert.deepEqual(h.updates.map((u) => u.cardId), ["c2"]);
+});
 
 test("candidates はクライアント向けカードに含めない", async (t) => {
   const h = harness(t, () => "Kubernetes");
@@ -234,9 +307,11 @@ test("裏付けが取れたら card_update で差し替え、status は confirme
     card("Kubernetes", { correctedFrom: "クバネテス", status: "probable" }),
   ]);
 
+  // **突き合わせは cardId**（#38）。速報で配った ID がそのまま更新に載る
   assert.deepEqual(h.updates, [
-    { term: "Kubernetes", status: "confirmed", description: "検証後の解説。", links: [] },
+    { cardId: "c1", status: "confirmed", description: "検証後の解説。", links: [] },
   ]);
+  assert.equal(h.emitted.at(-1)![0]!.cardId, "c1", "速報と更新で同じ cardId を使う");
   assert.equal(h.warnings.length, 0);
   assert.ok(
     h.verifyInputs[0]!.includes("クバネテス"),
@@ -282,7 +357,7 @@ test("棄却は status: unresolved として届き、term と reason だけを�
   // 方針が非対称になる）。リンクは空でクライアントは確認中の表示を畳む。
   assert.deepEqual(h.updates, [
     {
-      term: "クーベルタン",
+      cardId: "c1",
       status: "unresolved",
       description: UNRESOLVED_DESCRIPTION,
       links: [],
@@ -310,11 +385,12 @@ test("候補#2 が選ばれても term は改名しない（protocol に経路�
   });
   await h.send(utterance("A"), [drafted]);
 
-  // card_update は term でカードを突き合わせるので、表示中のカードを別の用語へ
-  // 改名できない。解説だけ差し込むと表示が食い違うため裏付け無しと同じ扱いにする。
+  // #38 で card_update は cardId ベースになったが、**term を差し替える経路はまだ無い**
+  // （#38 は識別子の分離だけで挙動を変えない）。解説だけ差し込むと表示が食い違うため、
+  // 裏付け無しと同じ扱いにする。
   assert.deepEqual(h.updates, [
     {
-      term: "クアドラント",
+      cardId: "c1",
       status: "unresolved",
       description: UNRESOLVED_DESCRIPTION,
       links: [],
@@ -347,7 +423,7 @@ test("検証が例外で落ちても card_update を送り、速報の status �
 
   assert.deepEqual(h.updates, [
     {
-      term: "Kubernetes",
+      cardId: "c1",
       status: "probable",
       description: drafted.description,
       links: [],

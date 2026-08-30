@@ -7,7 +7,7 @@ sources:
   - README.md
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]]
 confidence: high
-updated: 2026-08-29
+updated: 2026-08-30
 ---
 
 # TermLens アーキテクチャ
@@ -30,6 +30,24 @@ updated: 2026-08-29
 ```
 
 WebSocket 1本の中で、**音声はバイナリフレーム、制御メッセージは JSON** という使い分けをしている。
+
+## プロトコル（`src/protocol.ts`）
+
+型定義は `src/protocol.ts` が唯一の場所。要点だけ:
+
+| メッセージ | 向き | 覚えておくこと |
+|---|---|---|
+| `start` | C→S | `glossary` と `shownTerms`（再接続時のデデュープ、#8）。**`shownTerms` は term の一覧**であってカードの ID ではない（#38） |
+| `transcript` | S→C | `finalSeq` は「同じ Deepgram の final 由来か」の印（#36）。話者で分割されたイベントには同じ番号が付く |
+| `cards` | S→C | 速報カード。`TermCard.cardId` はサーバーがセッション内通番（`c1`, `c2`, …）で配る**不変の識別子**（#38） |
+| `card_update` | S→C | 清書（検証）の結果。**更新対象は `cardId` で指定する**（#38 以前は `term`）。`status` は optional にしない（#24） |
+
+> 2026-08-30 変更（#38）: `TermCard` に `cardId` を追加し、`card_update` から `term` を
+> 落とした。**`term` は識別子ではなくなり、「意味上の同一性」（デデュープ）だけに使う。**
+> クライアントは受信 ID を自分のローカル ID（`k1`, `k2`, …）へ写像して持つので、
+> 再接続でサーバーの採番が `c1` から振り直されても更新が迷子にならない。
+> 詳細は [[termlens-term-extraction]]。**この変更で挙動は変えていない**（term の後編集も
+> `unresolved` の再評価も入れていない）。
 
 ## 技術スタック
 
@@ -63,4 +81,7 @@ WebSocket 1本の中で、**音声はバイナリフレーム、制御メッセ�
 - **話者ラベルの揺れは表示側の後処理で直す。** STT の分割規則（`splitBySpeaker()`）は変えず、
   `public/utterances.js` がコピーの上で `speaker` だけを補正する。raw の文字起こしと用語抽出の
   経路は無変更で、**テキストは一切削除しない**（[[termlens-stt-pipeline]]）
+- **カードの識別子と用語名を分けた**（#38）。`cardId` が識別・更新・UI 参照を担い、`term` は
+  デデュープだけに使う。`term` が主キーだった頃は、同じ用語のカードを2枚持てず、用語名を
+  後から直す余地も無かった（[[termlens-term-extraction]]）
 - **状態をサーバーに永続化していない。** ブラウザメモリのみのため、リロードで全消失する（[[termlens-open-issues]] の弱点4）

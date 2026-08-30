@@ -218,3 +218,50 @@ test("links が未定義でも落ちない", () => {
   // localStorage から復元した壊れたカード
   assert.equal(shouldApplyResend({ status: "confirmed" }), true);
 });
+
+// --- cardId は畳み込みで動かない（#38） ----------------------------------
+
+/**
+ * **`card_update` はカードの識別子を書き換えない。**
+ *
+ * `cardId` はカードの不変の主キー（#38）で、DOM・`cardData`・受信 ID の写像がすべて
+ * これで揃っている。畳み込みで動くと更新が2度目から迷子になり、**例外は出ずに
+ * 「確認中」が回り続ける**。`update` 側に紛れ込んだ余計なフィールドを
+ * `mergeCardUpdate()` が素通しにしないことも併せて固定する。
+ */
+test("mergeCardUpdate は cardId を書き換えない", () => {
+  const stored = {
+    cardId: "k1",
+    term: "Qdrant",
+    status: "probable",
+    description: "速報の解説。",
+    links: [],
+  };
+  const merged = mergeCardUpdate(stored, {
+    status: "confirmed",
+    description: "検証後の解説。",
+    links: [],
+    cardId: "c9",
+  });
+  assert.equal(merged.cardId, "k1", "更新のペイロードでカードの主キーが動いた");
+  assert.equal(merged.description, "検証後の解説。", "本文の更新まで止めない");
+});
+
+test("据え置き（unresolved）でも cardId は保たれる", () => {
+  const stored = {
+    cardId: "k3",
+    term: "クーベルタン",
+    status: "unresolved",
+    description: "特定できませんでした。",
+    links: [],
+  };
+  const merged = mergeCardUpdate(stored, {
+    status: "confirmed",
+    description: "断定的な解説。",
+    links: [],
+    cardId: "c9",
+  });
+  assert.equal(merged.cardId, "k3");
+  assert.equal(merged.status, "unresolved", "unresolved からは戻さない（#24）");
+  assert.equal(merged.description, "特定できませんでした。", "解説も据え置く");
+});
