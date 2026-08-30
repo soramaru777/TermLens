@@ -49,7 +49,19 @@ export type ClientMessage =
 
 export type ServerMessage =
   | { type: "ready" }
-  | { type: "transcript"; text: string; isFinal: boolean; speaker: number | null }
+  // finalSeq: final 1件ごとの連番(#36)。1つの Deepgram Results を話者で分割した
+  // イベントには**同じ番号**が付く。クライアントはこれを「本来1発話だったもの」の印として
+  // 使い、話者ラベルの短時間の揺れ(speaker jitter)で細切れになった行を再結合する
+  // (public/utterances.js)。interim には付かない。
+  //
+  // **optional は後方互換のため。** 旧サーバーから届く transcript には無く、
+  // #36 以前に localStorage へ保存された行にも無い。クライアントはその場合、
+  // 受信時刻の窓によるフォールバック判定へ落ちる。
+  //
+  // **配る番号は 1 から**(0 はサーバー側カウンタの初期値で、クライアントには届かない)。
+  // 再接続でサーバー側セッションが張り直されると 1 から振り直しになるが、クライアントは
+  // 再接続の境界で必ずグループを切るので衝突しない。
+  | { type: "transcript"; text: string; isFinal: boolean; speaker: number | null; finalSeq?: number }
   | { type: "cards"; cards: TermCard[] }
   // status は optional にしない。送り側(scheduler)では検証の結果として必ず決まるので、
   // 省略できる形にすると受け側が「変化なし」と「未指定」を区別できなくなる(#24)。

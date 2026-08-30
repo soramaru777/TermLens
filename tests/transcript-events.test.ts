@@ -44,7 +44,9 @@ test("buildTranscriptEvents: 単一話者の final は transcript を素通し�
 test("buildTranscriptEvents: words が無い final も transcript を素通しする", () => {
   const events = buildTranscriptEvents(altFrom("words なし"), true);
   assert.deepEqual(events, [
-    { text: "words なし", isFinal: true, speaker: undefined, words: undefined },
+    // segIndex は分割しなかった final にも必ず付く（#36 の採番が
+    // 「1つの Results につき1回」になるのはこれが前提）
+    { text: "words なし", isFinal: true, speaker: undefined, words: undefined, segIndex: 0 },
   ]);
 });
 

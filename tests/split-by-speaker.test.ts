@@ -149,7 +149,7 @@ test("buildFinalEvents: text が空なら何も返さない", () => {
 test("buildFinalEvents: words が無ければ text を素通しし speaker は undefined", () => {
   const events = buildFinalEvents("words なし");
   assert.deepEqual(events, [
-    { text: "words なし", isFinal: true, speaker: undefined, words: undefined },
+    { text: "words なし", isFinal: true, speaker: undefined, words: undefined, segIndex: 0 },
   ]);
 });
 
@@ -258,5 +258,63 @@ test("buildFinalEvents: punctuatedWord が無ければ word を使って切り�
   assert.deepEqual(
     buildFinalEvents("あいうえ", words).map((e) => e.text),
     ["あい", "うえ"],
+  );
+});
+
+// ---- segIndex（#36） ----
+//
+// クライアントの jitter 補正は「同じ final 由来か」を `finalSeq` で判定する。その採番は
+// `session.ts` が `segIndex === 0` を見て行うので、**ここで印が正しく付かないと
+// 別々の final が1発話として結合されうる**（テキストは消えないが話者が混ざる）。
+
+test("buildFinalEvents: 分割しない final にも segIndex 0 が付く", () => {
+  // ここが欠けると session.ts の採番規則（segIndex === 0 で進める）が
+  // 「undefined でも進める」側の枝でしか通らなくなり、分割時との整合が崩れる
+  const events = buildFinalEvents("そのまま", wordsFrom([0, 0]));
+  assert.deepEqual(
+    events.map((e) => e.segIndex),
+    [0],
+  );
+});
+
+test("buildFinalEvents: 分割した final には 0 起点の連番が付く", () => {
+  const events = buildFinalEvents(
+    "あいうえお",
+    wordsOf([
+      ["あ", 0],
+      ["い", 1],
+      ["う", 0],
+      ["え", 1],
+      ["お", 0],
+    ]),
+  );
+  assert.deepEqual(
+    events.map((e) => e.segIndex),
+    [0, 1, 2, 3, 4],
+  );
+});
+
+/**
+ * **空の text を捨てた「後」に採番する。**
+ *
+ * 捨てる前に振ると、先頭のセグメントが落ちたときに `segIndex === 0` のイベントが
+ * 1件も出ず、`session.ts` のカウンタが進まない。直前の final と同じ `finalSeq` になり、
+ * 別々の final がクライアント側で1発話として結合されうる（#36）。
+ */
+test("buildFinalEvents: 空の text を捨てても segIndex は 0 から連番になる", () => {
+  const events = buildFinalEvents(
+    "別の文字列",
+    wordsOf([
+      ["", 0],
+      ["い", 1],
+      ["う", 0],
+    ]),
+  );
+  assert.deepEqual(
+    events.map((e) => ({ text: e.text, segIndex: e.segIndex })),
+    [
+      { text: "い", segIndex: 0 },
+      { text: "う", segIndex: 1 },
+    ],
   );
 });

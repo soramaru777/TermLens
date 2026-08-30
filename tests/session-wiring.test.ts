@@ -202,3 +202,82 @@ test("stop したとき、閉じる発話が無ければ何も渡さない", asy
     h.restore();
   }
 });
+
+// ---- finalSeq の採番（#36） ----
+//
+// クライアントは「同じ final 由来か」を `finalSeq` だけで判定し、話者ラベルの揺れで
+// 細切れになった行を再結合する（`public/utterances.js`）。**採番がずれても例外は出ない** —
+// 別々の final に同じ番号が付けば違う発話が1段落に混ざり、逆に分割されたイベントに
+// 違う番号が付けば補正がまったく効かなくなる。どちらも黙って表示だけが変わる。
+
+/** 話者で N 分割された final のイベント列。`segIndex` は split.ts が付ける。 */
+function split(texts: string[]): TranscriptEvent[] {
+  return texts.map((text, i) => ({
+    text,
+    isFinal: true,
+    speaker: i % 2,
+    segIndex: i,
+  }));
+}
+
+/** 送信済み transcript の finalSeq 列。 */
+function seqs(ws: FakeWs): Array<number | undefined> {
+  return ws.sent
+    .filter((m) => m.type === "transcript")
+    .map((m) => (m as { finalSeq?: number }).finalSeq);
+}
+
+test("話者で分割された final には同じ finalSeq が付く", async () => {
+  const h = await harness();
+  try {
+    for (const e of split(["いち", "に", "さん"])) h.transcript(e);
+    assert.deepEqual(seqs(h.ws), [1, 1, 1], "分割されたイベントごとに採番している");
+  } finally {
+    h.restore();
+  }
+});
+
+test("別の final には別の finalSeq が付く", async () => {
+  const h = await harness();
+  try {
+    for (const e of split(["いち", "に"])) h.transcript(e);
+    for (const e of split(["さん", "よん"])) h.transcript(e);
+    assert.deepEqual(seqs(h.ws), [1, 1, 2, 2], "Results の先頭で採番が進んでいない");
+  } finally {
+    h.restore();
+  }
+});
+
+test("分割されなかった final（segIndex 0）も1つずつ採番する", async () => {
+  const h = await harness();
+  try {
+    h.transcript({ text: "いち", isFinal: true, speaker: 0, segIndex: 0 });
+    h.transcript({ text: "に", isFinal: true, speaker: 0, segIndex: 0 });
+    assert.deepEqual(seqs(h.ws), [1, 2]);
+  } finally {
+    h.restore();
+  }
+});
+
+/** `segIndex` を持たないアダプタ（将来の実装）は「分割なし」と同じ扱いにする。 */
+test("segIndex を持たない final は1件ごとに採番する", async () => {
+  const h = await harness();
+  try {
+    h.transcript(fin("いち", 0));
+    h.transcript(fin("に", 1));
+    assert.deepEqual(seqs(h.ws), [1, 2]);
+  } finally {
+    h.restore();
+  }
+});
+
+test("interim には finalSeq を付けず、採番も進めない", async () => {
+  const h = await harness();
+  try {
+    h.transcript({ text: "とちゅう", isFinal: false, speaker: undefined });
+    h.transcript(fin("かくてい", 0));
+    assert.deepEqual(seqs(h.ws), [undefined, 1], "interim が採番を進めている");
+  } finally {
+    h.restore();
+  }
+});

@@ -98,19 +98,36 @@ function sliceFromTranscript(
  * セグメントが1つ以下なら `text` を**素通し**する。words から組み直すと
  * 句読点・数値表記などで Deepgram の出力と1文字でも違ったときに、
  * 既存の表示と用語抽出が静かに変わるため。分割が必要なときだけ切り出し・再構成を行う。
+ *
+ * 各イベントには `segIndex` を付ける。**採番はここではしない** —
+ * 純関数にグローバルカウンタを持たせるとテストの決定性が壊れるため、分割の事実だけを
+ * 載せて `session.ts` に採番させる（`TranscriptEvent.segIndex` のコメント、#36）。
  */
 export function buildFinalEvents(text: string, words?: TranscriptWord[]): TranscriptEvent[] {
   if (text.length === 0) return [];
   const segments = words ? splitBySpeaker(words) : [];
   if (segments.length <= 1) {
-    return [{ text, isFinal: true, speaker: segments[0]?.speaker, words: segments[0]?.words ?? words }];
+    return [
+      {
+        text,
+        isFinal: true,
+        speaker: segments[0]?.speaker,
+        words: segments[0]?.words ?? words,
+        segIndex: 0,
+      },
+    ];
   }
   const texts =
     sliceFromTranscript(text, segments) ??
     segments.map((seg) => seg.words.map(wordSurface).join(""));
-  return segments
+  const kept = segments
     .map((seg, i) => ({ text: texts[i], isFinal: true, speaker: seg.speaker, words: seg.words }))
     // 空の transcript は送らない（app.js の表示中 interim が消えてちらつくため）。
     // 切り出しに失敗して連結へフォールバックしたとき、word が空表記だと起こりうる
     .filter((e) => e.text.length > 0);
+  // **`segIndex` は空を捨てた後に振る。** 捨てる前に振ると、先頭のセグメントが落ちたときに
+  // `segIndex === 0` のイベントが1件も出ず、`session.ts` の採番が進まない。
+  // 直前の final と同じ `finalSeq` になり、別々の final がクライアント側の jitter 補正で
+  // 1発話として結合されうる（#36）。
+  return kept.map((e, i) => ({ ...e, segIndex: i }));
 }

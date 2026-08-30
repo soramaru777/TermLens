@@ -8,7 +8,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-27
+updated: 2026-08-29
 ---
 
 # TermLens の課題と次の優先順位
@@ -60,6 +60,22 @@ updated: 2026-08-27
 > 画面に出る**（`[0,1,0,1]` なら 4 発話）。どの程度細切れになるかは複数話者の実声でしか
 > 測れないため、実機確認（Pixel 9a）と評価基盤での話者誤分類率の比較が必要な状態のまま。
 > 閾値を入れるかどうかはその測定結果を見てから判断する（[[termlens-stt-pipeline]]）。
+
+> 2026-08-29 追記（Issue #36）: **細切れの実測が取れ、表示側の補正を入れた。** Android 実機の
+> 約 49 分・複数話者セッションで、補正なしの `groupUtterances()` は 642 グループを作り、うち
+> 3 文字以下が 255 件（約 39.7%）。その約 78% が同一秒内に複数 speaker が切り替わる箇所に
+> 含まれていた。`splitBySpeaker()` は変えず、`public/utterances.js` が表示・エクスポート用の
+> コピーの上で `speaker` ラベルだけを補正する（**テキストは 1 文字も消さない**。
+> [[termlens-stt-pipeline]]）。
+>
+> **未検証1（Deepgram 自身のクラスタリング精度）はそのまま残る。** 補正は「揺れが表示に露出する」
+> ことへの対処であって、話者の割り当てが正しいかは何も測れていない。加えて **#36 で 2 つ増えた**:
+>
+> - **閾値の妥当性が未検証** — `JITTER_CHAR_LIMIT` = 4 / `JITTER_WINDOW_MS` = 500 は上記の分布から
+>   置いた暫定値。実機での前後比較（同じ会議の補正あり/なしを人が読み比べる）はまだ行っていない。
+>   外したときの害は「短い発話が隣の話者の段落に混ざる」ことで、発言の消失ではない
+> - **本物の相槌を吸収してしまう頻度が未計測** — 別 final の相槌は `seq` の不一致で構造的に守られるが、
+>   1 つの final の中に相槌ごと入っている場合は区別できない。どれくらいあるかは実声でしか測れない
 
 > 2026-08-26 追記: **Issue #21 で発話の切れ目を Deepgram のシグナルに委ねたため、
 > 未検証の範囲がさらに広がった。** `speech_final`（無音検出）と `UtteranceEnd`（word ギャップ）
