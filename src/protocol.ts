@@ -19,12 +19,24 @@ export interface TermLink {
  * - `unresolved` — 音声認識の表記から正しい用語を特定できなかった。
  *   **UI は推定した term を見せず、聞き取られた表記そのものを見出しにする**
  *
- * `unresolved` から上へは戻さない。`card_update` は `term` でカードを突き合わせる仕様で
- * 改名の経路が無く(#23)、解説だけ差し替えると表示が食い違うため。
+ * `unresolved` から上へは戻さない。**`card_update` は #38 から `cardId` で突き合わせる**が、
+ * 改名の経路そのものは**まだ作っていない**(#38 は識別子の分離だけで挙動は変えない)。
+ * term を後から差し替える手段が無い以上、解説だけ差し替えると表示が食い違うため
+ * この方針は #24 のまま維持する。
  */
 export type TermStatus = "confirmed" | "probable" | "unresolved";
 
 export interface TermCard {
+  /**
+   * カードの不変の識別子(#38)。サーバーがセッション内の通番(`c1`, `c2`, …)で採番する。
+   *
+   * **`term` は識別子ではない。** `card_update` の突き合わせ・クライアントの主キー・
+   * DOM 参照はすべてこちらを使い、`term` は「意味上の同一性」(デデュープ)だけに使う。
+   *
+   * 採番は WS 1本ごとに 1 から振り直しになる。クライアントは受信 ID を自分のローカル ID へ
+   * 写像して持つので、再接続で同じ用語が別 ID で再送されても写像を貼り替えるだけで済む。
+   */
+  cardId: string;
   term: string;
   reading: string;
   description: string;
@@ -65,7 +77,10 @@ export type ServerMessage =
   | { type: "cards"; cards: TermCard[] }
   // status は optional にしない。送り側(scheduler)では検証の結果として必ず決まるので、
   // 省略できる形にすると受け側が「変化なし」と「未指定」を区別できなくなる(#24)。
-  | { type: "card_update"; term: string; status: TermStatus; description: string; links: TermLink[] }
+  //
+  // **更新対象は `cardId` で指定する**(#38)。以前は `term` を主キーにしていたが、
+  // 同じ term のカードが2枚あると区別できず、term を後編集する余地も無かった。
+  | { type: "card_update"; cardId: string; status: TermStatus; description: string; links: TermLink[] }
   | { type: "status"; state: "stt_connecting" | "stt_open" | "stt_closed" | "extracting" }
   | {
       type: "error";

@@ -39,8 +39,8 @@ export function cardStatus(card) {
  *
  * `unresolved` のときだけ **推定した term ではなく、音声認識が実際に聞き取った表記**を
  * 見出しにする。特定できていない用語名を見せる意味がないため。
- * `term` は DOM の `dataset.term` とデデュープのキーとして**そのまま残る**
- * （`card_update` は term で突き合わせるので、改名すると更新が届かなくなる）。
+ * `term` はデデュープのキーとして**そのまま残る**（識別は #38 で `cardId` に移ったので、
+ * 見出しが変わってもカードの identity は動かない）。
  *
  * 優先順は surfaceForms[0] → correctedFrom → term。surfaceForms は
  * `filterSurfaceForms()` が「文字起こしに実在する表記」だけに絞った後のものなので、

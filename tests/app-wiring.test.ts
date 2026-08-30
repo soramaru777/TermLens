@@ -29,6 +29,20 @@ const APP = readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
 const CODE = APP.replace(/^\s*(\/\/|\*|\/\*).*$/gm, "");
 const HTML = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
 
+/**
+ * `CODE` から関数1本の本文を切り出す。`app.js` にネストした関数定義は無いので、
+ * 次のトップレベル `function` までを本文とみなす。
+ *
+ * **範囲を絞るのが要点。** ファイル全体を対象にすると、たとえば「`updateCard` が
+ * term を見ていない」ことを確かめたいのに、無関係な `addCard` 側の記述で通ってしまう。
+ */
+function fnBody(name: string): string {
+  const start = CODE.indexOf(`function ${name}(`);
+  assert.ok(start >= 0, `${name} が見つからない`);
+  const end = CODE.indexOf("\nfunction ", start + 1);
+  return CODE.slice(start, end < 0 ? undefined : end);
+}
+
 test("card_update の畳み込みは mergeCardUpdate() を通す", () => {
   // 素の Object.assign に戻すと「unresolved の見出しの下に断定的な解説」が復活する
   assert.match(
@@ -247,4 +261,205 @@ test("診断の状態は代入1箇所で組み立てる", () => {
 test("診断のエクスポートは純関数に委譲する", () => {
   assert.match(HTML, /id="dl-diagnostics"/, "診断のエクスポートボタンがない");
   assert.match(APP, /buildDiagnosticsMarkdown\(\{/, "app.js が診断の Markdown を自前で組んでいる");
+});
+
+// ---- カードの識別子（#38） ----
+//
+// **`term` を主キーにしていた頃の形へ戻っても、例外は1つも出ない。**
+// `card_update` がどのカードにも当たらなくなり「確認中」が回り続ける、再接続後に
+// カードが二重化する、といった形で**静かに**壊れる。app.js は Node から import
+// できないので（このファイル冒頭の理由）、配線の形をソース文字列で固定する。
+
+test("カードは識別・意味上の同一性・受信 ID の写像を別々の Map で持つ", () => {
+  // 3本のどれかへ寄せると #38 の分離そのものが消える。
+  // `cardData` を term キーへ戻す ＝ 同じ term のカードを2枚持てない状態に逆戻り
+  for (const decl of [
+    "const cardData = new Map()",
+    "const termToCardId = new Map()",
+    "const incomingCardId = new Map()",
+  ]) {
+    assert.ok(CODE.includes(decl), `${decl} が無い`);
+  }
+});
+
+test("カードのデデュープは term ベースのまま（#8 を壊さない）", () => {
+  const add = fnBody("addCard");
+  // 生の term 文字列で引く。正規化を挟むとデデュープの当たり方が変わる
+  assert.match(add, /termToCardId\.get\(card\.term\)/, "再送判定が term ベースでない");
+  assert.match(add, /termToCardId\.set\(card\.term, localId\)/, "term → ローカル ID を登録していない");
+  // 冪等化（#8）: 既知の term では DOM を新規に作らない
+  assert.match(add, /if \(shouldApplyResend\(existing\)\)/);
+  const resend = add.slice(0, add.indexOf("const localId = adoptLocalCardId"));
+  assert.doesNotMatch(resend, /el\("div", "card"\)/, "再送で DOM を新規に作っている");
+});
+
+/**
+ * **R1**: 再接続でサーバーの採番は `c1` から振り直される。同じ用語が別の cardId で
+ * 再送されたとき、写像を貼り替えないと後続の `card_update` が既存カードに当たらない。
+ *
+ * 貼り替えを `shouldApplyResend()` の分岐**の中**に入れるのがいちばんありがちな壊し方
+ * （清書済みカードは畳み込まないので、そこだけ写像が古いまま残る）。**分岐より前**に
+ * あることまで見る。
+ */
+test("再送された速報でも受信 cardId の写像を貼り替える", () => {
+  const add = fnBody("addCard");
+  const beforeBranch = add.slice(0, add.indexOf("if (shouldApplyResend("));
+  assert.ok(beforeBranch.length > 0, "addCard の再送分岐が見つからない");
+  assert.match(
+    beforeBranch,
+    /registerIncoming\(card\.cardId, existingId\)/,
+    "再送時の写像の貼り替えが無い／畳み込みの分岐の中に入っている",
+  );
+  // 再送分岐は既存のローカル ID を返す。`return;` に戻すと、再送で増えた surfaceForms の
+  // 持ち主が undefined になり、その表記だけタップしても飛ばないハイライトになる
+  assert.match(beforeBranch + add.slice(add.indexOf("if (shouldApplyResend(")), /return existingId;/,
+    "再送分岐が既存のローカル ID を返していない");
+});
+
+/**
+ * **写像は新規・再送の両方で貼る。** 片方でも漏らすと `card_update` が
+ * `incomingCardId.get()` で undefined を引き、**例外も出さずに更新を捨てる**。
+ * 新規側が漏れると、検証に回った全カードが「確認中」のまま固まる（画面は無傷なので気づけない）。
+ *
+ * 呼び出しを `registerIncoming()` に括ってあるのは、この「2回そろっているか」を
+ * 数えられるようにするため。`incomingCardId.set()` を直に書くと、片方だけ消えても
+ * 通ってしまうテストしか書けない。
+ */
+test("受信 cardId の写像は新規・再送の両方で貼る", () => {
+  const add = fnBody("addCard");
+  const calls = add.match(/registerIncoming\(/g) ?? [];
+  assert.equal(calls.length, 2, `registerIncoming の呼び出しが ${calls.length} 箇所（新規と再送で2箇所）`);
+  assert.match(add, /registerIncoming\(card\.cardId, localId\)/, "新規カードの写像を貼っていない");
+  assert.match(
+    fnBody("registerIncoming"),
+    /incomingCardId\.set\(serverCardId, localId\)/,
+    "registerIncoming が写像を貼っていない",
+  );
+});
+
+/**
+ * **R2**: `shownTerms` にローカル ID を送ると、サーバーの `normalizeTerm()` を通って
+ * `shownSet` に `k1` などが積まれ、**デデュープが丸ごと無効化される**（再接続後に
+ * 既出カードが全部再表示される ＝ #8 の回帰）。cardData のキーを ID にした以上、
+ * ここを直し忘れるのが最も起きやすい壊し方。
+ */
+test("再接続時の shownTerms は cardId ではなく term を送る", () => {
+  assert.match(
+    CODE,
+    /shownTerms: \[\.\.\.cardData\.values\(\)\]\.map\(\(c\) => c\.term\)/,
+    "shownTerms が term の配列になっていない",
+  );
+  assert.doesNotMatch(
+    CODE,
+    /shownTerms: \[\.\.\.cardData\.keys\(\)\]/,
+    "shownTerms にローカル ID を送っている",
+  );
+});
+
+/**
+ * `card_update` は受信 ID を**写像してから**引く。ここで term を見ると、
+ * 同じ term のカードが2枚あるときに取り違える（#38 が分離した意味が消える）。
+ */
+test("card_update は cardId から引き当てる（term では引かない）", () => {
+  assert.match(
+    CODE,
+    /function updateCard\(\{ cardId, status, description, links \}\)/,
+    "updateCard がまだ term を受け取っている",
+  );
+  const update = fnBody("updateCard");
+  assert.match(update, /incomingCardId\.get\(cardId\)/, "受信 ID を写像していない");
+  assert.doesNotMatch(update, /termToCardId/, "更新経路が term を見ている");
+  assert.doesNotMatch(update, /\.term\b/, "更新経路が term を見ている");
+});
+
+test("カード DOM の参照は cardId ベースで、検索は findCardEl に集約する", () => {
+  assert.doesNotMatch(CODE, /dataset\.term/, "dataset.term が残っている");
+  assert.match(CODE, /function findCardEl\(cardId\)/, "検索ヘルパが無い");
+  assert.match(CODE, /div\.dataset\.cardId = localId/, "カード要素に cardId を書いていない");
+  // 直接検索を書き散らすと、識別子を変えるたびに置換漏れが出る（漏れても例外は出ない）
+  const finds = CODE.match(/\[\.\.\.cardsEl\.children\]\.find\(/g) ?? [];
+  assert.equal(finds.length, 1, `カード DOM の直接検索が ${finds.length} 箇所ある`);
+  // **渡す値まで見る。** 集約しただけでは `findCardEl(card.term)` を防げない。
+  // term はローカル ID ではないので必ず undefined を返し、再送で cardData だけが更新されて
+  // DOM が古いまま残る ＝ **画面と Markdown エクスポートが食い違う**（例外は出ない）
+  for (const arg of CODE.match(/findCardEl\(([^)]*)\)/g) ?? []) {
+    assert.match(
+      arg,
+      /findCardEl\((cardId|localId|existingId)\)/,
+      `findCardEl にローカル ID 以外を渡している: ${arg}`,
+    );
+  }
+  // 追従/固定・ハイライトの持ち主も識別子で持つ
+  assert.doesNotMatch(CODE, /\bactiveTerm\b/, "active カードを term で持っている");
+  assert.doesNotMatch(CODE, /\bpinnedToTerm\b/, "固定中のカードを term で持っている");
+  assert.match(CODE, /if \(owner\) span\.dataset\.cardId = owner/, "ハイライトの持ち主が cardId でない");
+});
+
+/**
+ * ハイライトの持ち主は **`addCard()` が決めたローカル ID**。
+ * `card.cardId`（サーバーの採番）を渡すと、再送で写像だけ貼り替えた場合に
+ * 実在しないカードを指し、タップしても飛ばなくなる。
+ */
+test("ハイライトの持ち主は addCard の戻り値を使う", () => {
+  for (const call of [
+    "addHighlightTerm(card.term, id)",
+    "addHighlightTerm(card.correctedFrom, id)",
+    "addHighlightTerm(form, id)",
+  ]) {
+    // 受信経路（cards）と復元経路の2箇所
+    assert.equal(
+      CODE.split(call).length - 1,
+      2,
+      `${call} が2箇所そろっていない（受信と復元で片方だけ直っている）`,
+    );
+  }
+  assert.match(fnBody("addCard"), /return localId;/, "addCard がローカル ID を返していない");
+});
+
+/**
+ * 保存/復元で cardId が維持される（AC）。スナップショットの `cardId` は保存時点の
+ * ローカル ID なので、`k\d+` はそのまま採用する。**採番カウンタを追い越させないと、
+ * 復元後に新しく出たカードが復元済みカードと同じ ID を取る**（更新が別のカードに当たる）。
+ * cardId を持たない #38 以前の保存データは新しく採る。
+ */
+test("復元は保存データの cardId を維持し、旧データには採番する", () => {
+  assert.match(CODE, /const LOCAL_CARD_ID_RE = \/\^k\\d\+\$\//, "ローカル ID の判定が無い");
+  const adopt = fnBody("adoptLocalCardId");
+  assert.match(adopt, /LOCAL_CARD_ID_RE\.test\(incoming\)/);
+  assert.match(adopt, /return incoming;/, "一致した cardId をそのまま採用していない");
+  assert.match(
+    adopt,
+    /nextLocalCardId = Math\.max\(nextLocalCardId, Number\(incoming\.slice\(1\)\)\)/,
+    "採番カウンタを追い越させていない（復元後に ID が衝突する）",
+  );
+  assert.match(adopt, /return newLocalCardId\(\);/, "cardId の無い旧保存データを採番できない");
+  // localStorage は信頼境界の外。「cardId 無し」と「cardId: k1」が混じった壊れた
+  // スナップショットでは、前者が採った k1 を後者が上書きして**カードが1枚黙って消える**
+  assert.match(
+    adopt,
+    /!cardData\.has\(incoming\)/,
+    "すでに使われているローカル ID を採用してしまう（復元でカードが消える）",
+  );
+  // 保持するカードの cardId はローカル ID に差し替える（次回の保存でそのまま出る）
+  assert.match(
+    fnBody("addCard"),
+    /cardData\.set\(localId, \{ \.\.\.card, cardId: localId \}\)/,
+    "保持するカードの cardId をローカル ID に揃えていない",
+  );
+  // 復元は addCard を通す（分岐を復元経路にコピーしない）
+  assert.match(CODE, /for \(const \[, card\] of session\.cardData\) \{\s*const id = addCard\(card\);/);
+});
+
+test("セッション初期化で識別用の Map を3本ともクリアする", () => {
+  // 1本でも残ると、新しいセッションの cardId が前回のカードへ写像される
+  const clear = fnBody("clearSessionContent");
+  for (const stmt of [
+    "cardData.clear()",
+    "termToCardId.clear()",
+    "incomingCardId.clear()",
+    "nextLocalCardId = 0",
+  ]) {
+    assert.ok(clear.includes(stmt), `${stmt} が clearSessionContent に無い`);
+  }
+  assert.match(fnBody("resetSessionState"), /clearSessionContent\(\)/);
 });

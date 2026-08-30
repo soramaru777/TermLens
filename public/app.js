@@ -280,11 +280,16 @@ document.addEventListener("visibilitychange", () => {
 // デデュープで弾かれてカード化されない。DOM にも前回の残骸が並ぶ。
 function clearSessionContent() {
   finalLines.length = 0;
+  // カードの識別に関わる Map は**3本まとめて**空にする(#38)。1本でも残ると、
+  // 新しいセッションの cardId が前回のカードへ写像されて更新が迷子になる
   cardData.clear();
+  termToCardId.clear();
+  incomingCardId.clear();
+  nextLocalCardId = 0;
   highlightOwner.clear();
   highlightRe = null;
-  activeTerm = null;
-  pinnedToTerm = false;
+  activeCardId = null;
+  pinnedToCard = false;
   finalText.textContent = "";
   interimText.textContent = "";
   cardsEl.textContent = ""; // エラーバナーもここで消えるので参照を落とす
@@ -421,7 +426,17 @@ function connectWs(token, glossary) {
     // shownTerms: 再接続時、既に表示済みのカードの term を渡す。サーバーは WS 1本ごとに
     // ExtractionScheduler を作り直すためデデュープ状態が空から始まり、渡さないと同じ用語の
     // カードが再送されカードが二重化する(#8)
-    sock.send(JSON.stringify({ type: "start", glossary, shownTerms: [...cardData.keys()] }));
+    //
+    // **値から term を取り出す。キーはローカル ID なので送ってはいけない(#38 / R2)。**
+    // ID を送ると normalizeTerm() を通って shownSet に `k1` などが積まれ、デデュープが
+    // 丸ごと無効化される（再接続後に既出カードが全部再表示される ＝ #8 の回帰）。
+    sock.send(
+      JSON.stringify({
+        type: "start",
+        glossary,
+        shownTerms: [...cardData.values()].map((c) => c.term),
+      }),
+    );
   });
 
   sock.addEventListener("message", (e) => {
@@ -464,10 +479,12 @@ function connectWs(token, glossary) {
         break;
       case "cards":
         for (const card of msg.cards) {
-          addCard(card);
-          addHighlightTerm(card.term, card.term);
-          addHighlightTerm(card.correctedFrom, card.term);
-          for (const form of card.surfaceForms ?? []) addHighlightTerm(form, card.term);
+          // ハイライトの持ち主は addCard が決めたローカル ID(#38)。
+          // ここで card.cardId を使うと、再送で写像だけ貼り替えた場合に食い違う
+          const id = addCard(card);
+          addHighlightTerm(card.term, id);
+          addHighlightTerm(card.correctedFrom, id);
+          for (const form of card.surfaceForms ?? []) addHighlightTerm(form, id);
         }
         renderTranscript();
         setStatus("聞き取り中");
@@ -535,14 +552,74 @@ const spokenLines = () => finalLines.filter((l) => l.type !== "reconnect");
 
 // カードの元データ。DOM は新しい順に prepend するが、こちらは挿入順(古い順)を保つ。
 // エクスポートは登場順の方が読みやすいため、この Map を正とする。
-const cardData = new Map(); // term → TermCard
-const highlightOwner = new Map(); // 表記(小文字) → 対応するカードの term
+//
+// **3本に分けてあるのが #38 の目的そのもの。** 片方へ寄せると分離が消える。
+// - `cardData`       … 識別。表示・エクスポート・DOM 参照の正。キーはローカル ID
+// - `termToCardId`   … 意味上の同一性。デデュープと再送判定だけに使う
+// - `incomingCardId` … サーバーが採番した cardId をローカル ID へ写像する
+const cardData = new Map(); // localCardId → TermCard
+// **キーは生の term 文字列**(正規化しない)。#38 以前の `cardData.get(card.term)` と
+// 完全に同じ突き合わせにするため。ここに正規化を入れるとデデュープの挙動が変わる。
+const termToCardId = new Map(); // term → localCardId
+const incomingCardId = new Map(); // serverCardId → localCardId
+const highlightOwner = new Map(); // 表記(小文字) → 対応するカードの localCardId
 let highlightRe = null;
 
-function addHighlightTerm(form, cardTerm) {
+// ローカル ID の採番(#38)。サーバー由来の `c\d+` と混ざらないよう `k` を前置する。
+let nextLocalCardId = 0;
+function newLocalCardId() {
+  nextLocalCardId += 1;
+  return `k${nextLocalCardId}`;
+}
+
+const LOCAL_CARD_ID_RE = /^k\d+$/;
+
+/**
+ * 新規カードのローカル ID を決める(#38)。
+ *
+ * 保存データの `cardId` は**保存時点のローカル ID**なので、`k\d+` ならそのまま採用して
+ * 採番カウンタを追い越させる（復元しても ID が変わらない ＝ AC「保存/復元で cardId が
+ * 維持される」）。サーバー由来の `c\d+` と、#38 以前の保存データ（cardId なし）は新しく採る。
+ *
+ * **すでに使われている ID なら採用しない。** localStorage は改変・破損しうる信頼境界の外で、
+ * 「cardId 無しのカード」と「cardId: k1 のカード」が混じったスナップショットを食わせると、
+ * 前者が採った k1 を後者が上書きして**カードが1枚黙って消える**（DOM には data-card-id が
+ * 重複したまま残る）。壊れた値をここで無害化するのは `cardStatus()` と同じ方針。
+ */
+function adoptLocalCardId(incoming) {
+  if (typeof incoming === "string" && LOCAL_CARD_ID_RE.test(incoming) && !cardData.has(incoming)) {
+    nextLocalCardId = Math.max(nextLocalCardId, Number(incoming.slice(1)));
+    return incoming;
+  }
+  return newLocalCardId();
+}
+
+/**
+ * 受信 ID(`c\d+`) → ローカル ID の写像を貼る(#38)。
+ *
+ * **新規・再送の両方から呼ぶ。** 片方でも漏らすと `card_update` が
+ * `incomingCardId.get()` で undefined を引き、**例外も出さずに更新を捨てる**
+ * （検証に回ったカードが「確認中」のまま会議の終わりまで回り続ける）。
+ * 1関数に括ってあるのは、呼び忘れをテストで数えられるようにするため。
+ */
+function registerIncoming(serverCardId, localId) {
+  if (serverCardId) incomingCardId.set(serverCardId, localId);
+}
+
+/**
+ * ローカル ID から DOM のカード要素を引く(#38)。
+ *
+ * **検索をここ1箇所に集約する。** 各所で `[...cardsEl.children].find(...)` を書くと、
+ * 識別子を変えるたびに置換漏れが出る（漏れても例外は出ず、更新が静かに届かなくなる）。
+ */
+function findCardEl(cardId) {
+  return [...cardsEl.children].find((c) => c.dataset.cardId === cardId);
+}
+
+function addHighlightTerm(form, cardId) {
   if (!form || !form.trim()) return;
   const key = form.trim().toLowerCase();
-  if (!highlightOwner.has(key)) highlightOwner.set(key, cardTerm);
+  if (!highlightOwner.has(key)) highlightOwner.set(key, cardId);
   // 長い語を優先マッチさせるため、長さ降順で正規表現を組み直す
   const patterns = [...highlightOwner.keys()]
     .sort((a, b) => b.length - a.length)
@@ -562,7 +639,10 @@ function renderLine(text) {
   while ((m = highlightRe.exec(text)) !== null) {
     if (m.index > last) line.append(text.slice(last, m.index));
     const span = el("span", "hl", m[0]);
-    span.dataset.term = highlightOwner.get(m[0].toLowerCase()) ?? m[0];
+    // 持ち主はカードのローカル ID(#38)。正規表現は highlightOwner のキーから組むので
+    // 通常は必ず引けるが、引けなかったときは属性を付けない（タップしても何も起きない）
+    const owner = highlightOwner.get(m[0].toLowerCase());
+    if (owner) span.dataset.cardId = owner;
     line.append(span);
     last = m.index + m[0].length;
   }
@@ -573,54 +653,57 @@ function renderLine(text) {
 // ハイライト語のタップ → 該当カードへスクロールして一瞬光らせる
 $("transcript").addEventListener("click", (e) => {
   const hl = e.target.closest(".hl");
-  if (hl) jumpToCard(hl.dataset.term);
+  if (hl?.dataset.cardId) jumpToCard(hl.dataset.cardId);
 });
 
 // ---- 表示するカードの選択 ----
 // 縦積みレイアウト(スマホ)では .active の1枚だけを CSS で表示する。
 // 既定は「最新に追従」。会話中の用語をタップするとその語に固定し、「最新」で追従に戻す。
 // 横並びレイアウトでは全カードが見えるので、この状態は表示に影響しない。
-let activeTerm = null;
-let pinnedToTerm = false;
+// 追従/固定の対象は **カードのローカル ID**(#38)。同じ term のカードが増えても
+// 取り違えないよう、term ではなく識別子で指す。
+let activeCardId = null;
+let pinnedToCard = false;
 // style.css の @media (max-width: 899px) と対になっている。片方だけ変えないこと
 const stackedLayout = window.matchMedia("(max-width: 899px)");
 
-function setActiveCard(term) {
-  activeTerm = term;
+function setActiveCard(cardId) {
+  activeCardId = cardId;
   for (const card of cardsEl.children) {
-    card.classList.toggle("active", card.dataset.term === term);
+    card.classList.toggle("active", card.dataset.cardId === cardId);
   }
   renderCardNav();
 }
 
 function renderCardNav() {
-  const terms = [...cardData.keys()];
-  if (terms.length === 0) {
+  // cardData のキーはローカル ID。挿入順 = 登場順なので、並びの意味は #38 前と同じ
+  const ids = [...cardData.keys()];
+  if (ids.length === 0) {
     cardNav.hidden = true;
     return;
   }
   cardNav.hidden = false;
-  const index = terms.indexOf(activeTerm);
-  const newer = index < 0 ? 0 : terms.length - 1 - index; // 表示中より後に出たカード数
-  cardPosition.textContent = `${index + 1} / ${terms.length}　${pinnedToTerm ? "固定中" : "最新に追従"}`;
+  const index = ids.indexOf(activeCardId);
+  const newer = index < 0 ? 0 : ids.length - 1 - index; // 表示中より後に出たカード数
+  cardPosition.textContent = `${index + 1} / ${ids.length}　${pinnedToCard ? "固定中" : "最新に追従"}`;
   latestBtn.textContent = newer > 0 ? `最新 +${newer}` : "最新";
-  latestBtn.disabled = !pinnedToTerm;
+  latestBtn.disabled = !pinnedToCard;
 }
 
 latestBtn.addEventListener("click", () => {
-  pinnedToTerm = false;
-  const terms = [...cardData.keys()];
-  setActiveCard(terms[terms.length - 1] ?? null);
+  pinnedToCard = false;
+  const ids = [...cardData.keys()];
+  setActiveCard(ids[ids.length - 1] ?? null);
 });
 
-function jumpToCard(term) {
-  const card = [...cardsEl.children].find((c) => c.dataset.term === term);
+function jumpToCard(cardId) {
+  const card = findCardEl(cardId);
   if (!card) return;
   // 縦積みのときだけ、タップした語に固定する(以後、新しいカードが出ても表示は変わらない)。
   // 横並びでは全カードが見えており、固定する意味がないうえ回転時に古いカードが残るため。
   if (stackedLayout.matches) {
-    pinnedToTerm = true;
-    setActiveCard(term);
+    pinnedToCard = true;
+    setActiveCard(cardId);
   }
   card.scrollIntoView({ behavior: "smooth", block: "nearest" });
   card.classList.remove("flash");
@@ -742,9 +825,24 @@ function renderCardHead(div, card) {
   }
 }
 
+/**
+ * カードを1枚受け取り、**そのカードのローカル ID を返す**（#38）。
+ *
+ * 戻り値を返すのは、呼び出し側（`cards` 受信・セッション復元）が続けて
+ * `addHighlightTerm()` にカードの持ち主を渡すため。ここで採番したローカル ID は
+ * 呼び出し側からは他に知りようがない。
+ */
 function addCard(card) {
-  const existing = cardData.get(card.term);
+  // 突き合わせは **term**（意味上の同一性）。cardId で引くと、再接続でサーバーの採番が
+  // c1 から振り直されたときに同じ用語がもう1枚生えて #8 の重複が復活する
+  const existingId = termToCardId.get(card.term);
+  const existing = existingId === undefined ? undefined : cardData.get(existingId);
   if (existing) {
+    // **受信 ID の写像は畳み込みの可否に関わらず必ず貼り替える(#38 / R1)。**
+    // 再接続でサーバーは c1 から採番し直すので、同じ用語が別の cardId で再送される。
+    // ここで貼り替えないと、後続の card_update が**どのカードにも当たらない**
+    // （`incomingCardId.get()` が undefined になり、静かに無視される）。
+    registerIncoming(card.cardId, existingId);
     // 同じ term のカードが再送されても DOM を新規に作らない(冪等化, #8)。
     // 再接続直後はサーバー側のデデュープ状態が空から始まるため、既出用語が再びカードとして
     // 届きうる。清書済み(既存 links がある)ならドラフト(links: [])で
@@ -754,7 +852,7 @@ function addCard(card) {
       existing.description = card.description;
       existing.willEnrich = card.willEnrich;
       // status は上書きしない。「unresolved から上へは戻さない」は再接続の経路でも守る
-      const div = [...cardsEl.children].find((c) => c.dataset.term === card.term);
+      const div = findCardEl(existingId);
       if (div) {
         div.querySelector(".desc").textContent = card.description;
         const linksEl = div.querySelector(".links");
@@ -766,14 +864,20 @@ function addCard(card) {
       }
       scheduleSessionSave();
     }
-    return;
+    return existingId;
   }
 
-  cardData.set(card.term, { ...card });
+  // 新規カード。ローカル ID を決めてから3本の Map をそろえて更新する
+  const localId = adoptLocalCardId(card.cardId);
+  registerIncoming(card.cardId, localId);
+  // **保持するカードの cardId はローカル ID に差し替える。** 保存/復元でそのまま
+  // 使い回せるようにするため（スナップショットの cardId ＝ 保存時点のローカル ID）
+  cardData.set(localId, { ...card, cardId: localId });
+  termToCardId.set(card.term, localId);
   const div = el("div", "card");
-  // **dataset.term は term のまま。** 見出しが surface form になっても改名はしない(#24)。
-  // card_update・cardData・highlightOwner がすべて term で突き合わせているため。
-  div.dataset.term = card.term;
+  // **DOM の識別子はローカル ID(#38)。** 見出しが surface form になっても
+  // カードの identity は動かない（#24 の「改名しない」はそのまま維持される）。
+  div.dataset.cardId = localId;
   renderCardHead(div, card);
   div.append(el("div", "desc", card.description));
   // リンクは renderCardLinks で描画する(updateCard と共通)。清書済み(links がある)なら
@@ -799,13 +903,23 @@ function addCard(card) {
   // バナーがあればその直後に挿入し、バナーを常に先頭に保つ
   cardsEl.insertBefore(div, errorBanner ? errorBanner.nextSibling : cardsEl.firstChild);
   // 追従中なら新しいカードに切り替える。固定中は表示を動かさず件数だけ更新する
-  if (pinnedToTerm) renderCardNav();
-  else setActiveCard(card.term);
+  if (pinnedToCard) renderCardNav();
+  else setActiveCard(localId);
   scheduleSessionSave();
+  return localId;
 }
 
-function updateCard({ term, status, description, links }) {
-  const stored = cardData.get(term);
+function updateCard({ cardId, status, description, links }) {
+  // 受信 ID はサーバーの採番(`c\d+`)。ローカル ID へ写像してから引く(#38)。
+  // 写像に無い ID は、このクライアントが持っていないカードへの更新なので黙って捨てる
+  //
+  // **旧サーバー（`term` だけを送る）との互換は取らない。** `mergeCardUpdate()` が
+  // 「status を持たない旧サーバー」を考慮しているのと非対称に見えるが、あちらは
+  // **localStorage から復元した古いカード**が相手で、こちらは**同時に動いている
+  // 旧サーバー**が相手。前者は消えずに残り続けるのに対し、後者はデプロイで揃うので
+  // 二重経路を残す価値がない（デプロイ跨ぎのタブはリロードで回復する）。
+  const localId = incomingCardId.get(cardId);
+  const stored = localId === undefined ? undefined : cardData.get(localId);
   // 表示の材料は cardData が正。stored が無ければ描く根拠が無いので何もしない
   // （合成すると surfaceForms が空になり、unresolved の見出しが**推定した term** に
   // 落ちる — 特定できていない用語名をバッジ付きで断定してしまう）。
@@ -817,7 +931,7 @@ function updateCard({ term, status, description, links }) {
   // 畳み込みの判断は mergeCardUpdate() に集約する（不変条件を DOM 抜きで固定するため）
   Object.assign(stored, mergeCardUpdate(stored, { status, description, links }));
   scheduleSessionSave();
-  const div = [...cardsEl.children].find((c) => c.dataset.term === term);
+  const div = findCardEl(localId);
   if (!div) return;
   // 状態の判定はカード全体を渡して cardStatus() に任せる（`status` を直接読まない）
   const card = stored;
@@ -1026,7 +1140,10 @@ function buildSessionSnapshot() {
     savedAt: Date.now(),
     sessionStartedAt: sessionStartedAt ? sessionStartedAt.getTime() : null,
     finalLines,
-    cardData: [...cardData], // Map は JSON化できないため [term, card] の配列に落とす
+    // Map は JSON化できないため配列に落とす。要素は [localCardId, card](#38)。
+    // キーとカード側の `cardId` は常に同値だが、**復元が読むのは card.cardId のほう**
+    // （キーは捨てる）。形を変えないのは #38 以前の保存データと同じ構造で読めるようにするため
+    cardData: [...cardData],
   };
 }
 
@@ -1151,12 +1268,14 @@ restoreBtn.addEventListener("click", () => {
     sessionEndedAt = new Date(session.savedAt); // 会議の「終了」ではなく最後に保存できた時刻
     finalLines.push(...session.finalLines);
     for (const [, card] of session.cardData) {
-      addCard(card);
+      // addCard の新規分岐が cardId の維持（`k\d+` はそのまま採用）と、
+      // #38 以前の保存データ（cardId なし）への採番の両方を吸収する
+      const id = addCard(card);
       // カードを描き直すだけでは会話中の用語がオレンジ表示にならないため、
       // "cards" 受信時(connectWs 内)と同じくハイライトも復元する
-      addHighlightTerm(card.term, card.term);
-      addHighlightTerm(card.correctedFrom, card.term);
-      for (const form of card.surfaceForms ?? []) addHighlightTerm(form, card.term);
+      addHighlightTerm(card.term, id);
+      addHighlightTerm(card.correctedFrom, id);
+      for (const form of card.surfaceForms ?? []) addHighlightTerm(form, id);
     }
     renderTranscript();
     finished = true;

@@ -50,8 +50,13 @@ class FakeWs {
 /** マイクロタスクを一巡させる（Session.start が await を挟むため）。 */
 const settle = () => new Promise((r) => setImmediate(r));
 
+/** `ExtractionScheduler` のコンストラクタ第2引数（Session が渡す配線）。 */
+type SchedulerCallbacks = ConstructorParameters<typeof ExtractionScheduler>[1];
+
 interface Harness {
   ws: FakeWs;
+  /** `Session` が組み立てた `ExtractionScheduler` に渡したコールバック（#38 の中継確認用） */
+  callbacks: SchedulerCallbacks;
   /** STT が transcript を出したことにする */
   transcript: (e: TranscriptEvent) => void;
   /** STT が UtteranceEnd を受けたことにする */
@@ -90,14 +95,20 @@ async function harness(): Promise<Harness> {
   );
 
   const ws = new FakeWs();
-  new Session(ws as never);
+  const session = new Session(ws as never);
   ws.clientSend({ type: "start", glossary: [] });
   await settle();
   assert.ok(transcriptCb, "onTranscript が登録されていない");
   assert.ok(utteranceEndCb, "onUtteranceEnd が登録されていない");
+  // Session が scheduler へ渡した配線をそのまま掴む。`card_update` の中継は
+  // scheduler を動かさずにこのコールバックを叩けば確かめられる（#38）
+  const scheduler = (session as unknown as { scheduler: ExtractionScheduler }).scheduler;
+  const callbacks = (scheduler as unknown as { callbacks: SchedulerCallbacks }).callbacks;
+  assert.ok(callbacks, "scheduler の配線を取り出せない");
 
   return {
     ws,
+    callbacks,
     utterances,
     transcript: (e) => transcriptCb!(e),
     utteranceEnd: () => utteranceEndCb!(),
@@ -277,6 +288,36 @@ test("interim には finalSeq を付けず、採番も進めない", async () =>
     h.transcript({ text: "とちゅう", isFinal: false, speaker: undefined });
     h.transcript(fin("かくてい", 0));
     assert.deepEqual(seqs(h.ws), [undefined, 1], "interim が採番を進めている");
+  } finally {
+    h.restore();
+  }
+});
+
+// ---- card_update の中継（#38） ----
+
+/**
+ * **更新対象の指定は `cardId`。**
+ *
+ * `term` を送っていた頃の形が残ると、クライアントは `incomingCardId` を引けず
+ * `card_update` を黙って捨てる（例外は出ない。「確認中」が回り続けるだけ）。
+ * Session は scheduler の第1引数をそのまま中継するだけの層なので、
+ * ここが term を読んでいないことを1本で固定しておく。
+ */
+test("card_update は scheduler の cardId をそのまま中継する", async () => {
+  const h = await harness();
+  try {
+    h.callbacks.onCardUpdate("c7", "confirmed", "検証後の解説。", [
+      { title: "公式", url: "https://example.com/" },
+    ]);
+    const update = h.ws.sent.at(-1)!;
+    assert.deepEqual(update, {
+      type: "card_update",
+      cardId: "c7",
+      status: "confirmed",
+      description: "検証後の解説。",
+      links: [{ title: "公式", url: "https://example.com/" }],
+    });
+    assert.ok(!("term" in update), "term を載せると主キーが2本になる");
   } finally {
     h.restore();
   }

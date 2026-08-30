@@ -9,7 +9,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-architecture]], [[termlens-stt-pipeline]], [[termlens-open-issues]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-27
+updated: 2026-08-30
 ---
 
 # TermLens 用語抽出と解説カード生成
@@ -196,10 +196,10 @@ Stage 1 の出力トークン（`candidates` 配列ぶん）。
 > （誤補正率の変化）を先に作り、表示の変更は unresolved 状態の Issue でまとめて入れるほうが、
 > 悪化したときの切り分けが効くという判断。
 
-**候補の2番目以降が選ばれた場合も改名はしない。** `card_update` は `term` でカードを
-突き合わせる仕様なので、**表示中のカードを別の用語に改名する経路が無い**。#24 以降、
-この場合も棄却と同じく `unresolved` へ降格する（見出しは当てにならないと伝えるほうが正確）。
-改名そのものは引き続き別 Issue。
+**候補の2番目以降が選ばれた場合も改名はしない。** #38 で `card_update` の突き合わせは
+`cardId` になったが、**term を差し替える経路そのものはまだ作っていない**（#38 は識別子の
+分離だけで挙動を変えない）。#24 以降、この場合も棄却と同じく `unresolved` へ降格する
+（見出しは当てにならないと伝えるほうが正確）。改名そのものは引き続き別 Issue。
 
 **清書側でも恒久エラー（残高切れを含む）を見る。** 抽出は `disableExtraction()` で1回止まるのに
 検証が素通しだと、選ばれたカードごとに web 検索つきの呼び出しを投げ続け、誰にも通知されない
@@ -211,8 +211,9 @@ Stage 1 の出力トークン（`candidates` 配列ぶん）。
 何も返さないと**誤補正が最も疑わしいカードにだけ**回り続けるスピナーが残る。
 解説は速報のまま・リンクは空で送る（#24 以降は `status: "unresolved"` も載る）。
 
-**現行の protocol では Stage 2 は term ベースの指標を動かさない。** 改名できず、棄却しても
-速報カードは残るので、`term` から算出される Recall / Precision / 誤補正率はどれも変わらない。
+**現行の実装では Stage 2 は term ベースの指標を動かさない。** 改名の経路が無く（#38 で
+`card_update` は `cardId` ベースになったが改名はまだ入れていない）、棄却しても速報カードは
+残るので、`term` から算出される Recall / Precision / 誤補正率はどれも変わらない。
 したがって**評価ハーネス（`src/eval/run.ts`）の既定も本番と同じくカード集合を変えない**。
 （#24 で `status` だけは動かすようになった。本番が `confirmed` / `unresolved` を送る以上、
 評価も同じにしないと `EVAL_WITH_VERIFY=1` の probable / unresolved 列が Stage 1 の申告の
@@ -265,8 +266,9 @@ LLM が `high` かつ `unresolved` のような矛盾した組を返したとき
 ため、**検証結果を使える余地が1つも無い**（回すと web 検索の課金だけが増える）。
 `selectVerifyTargets()` は最初に `unresolved` を除くので、レア度ランキング経由でも入らない。
 
-**`unresolved` から上へは戻さない。** Stage 2 が別候補を選んでも `card_update` は `term` で
-突き合わせるため改名できず、解説だけ差し替えると表示が食い違う（#23 で確定済みの制約）。
+**`unresolved` から上へは戻さない。** Stage 2 が別候補を選んでも term を差し替える経路が
+無いため改名できず、解説だけ差し替えると表示が食い違う（#23 で確定済みの制約。#38 で
+識別子は `cardId` に移ったが、**改名の経路を作らない**という点は変えていない）。
 再接続でカードが再送されたときも `status` は上書きしない（速報の判断で格上げしないため）。
 **降格したカードへ更新が届く経路は2つある** — `card_update`（Stage 2）と `cards` の再送
 （再接続で Stage 1 が再抽出する。サーバー側のデデュープ状態が空から始まるため）。
@@ -280,10 +282,16 @@ LLM が `high` かつ `unresolved` のような矛盾した組を返したとき
 
 ### 改名はしない。降ろすのは「表示の主役」だけ
 
-`term` は **DOM の `dataset.term`・`cardData` のキー・デデュープのキー**として残したまま、
-`unresolved` のときだけ**見出しを `surfaceForms[0] ?? correctedFrom ?? term`**（音声認識が
-実際に聞き取った表記）にする。特定できていない用語名を見せる意味がないため。
-再キー（`highlightOwner`・サーバー側の `shownSet` を含む）は別 Issue のまま。
+`term` は残したまま、`unresolved` のときだけ**見出しを
+`surfaceForms[0] ?? correctedFrom ?? term`**（音声認識が実際に聞き取った表記）にする。
+特定できていない用語名を見せる意味がないため。
+
+> 2026-08-30 更新（#38）: **カードの識別は `term` から `cardId` へ移した**（下記）。
+> それでも「改名しない」方針は変わらない — 識別子を分離しただけで、term を後から
+> 差し替える経路はこの Issue では作っていない。
+>
+> 〜#38 まで: `term` が **DOM の `dataset.term`・`cardData` のキー・デデュープのキー**を
+> 兼ねており、改名するとそのすべてが同時に外れるので不可能だった。
 
 ### サーバー側でも整合させる
 
@@ -576,6 +584,69 @@ Issue 本文も「glossary由来の関連語（**必要最小限**）」とし�
 > 再試行する対象なので、ステータスだけで判定すると**残高切れを永久に再試行し、
 > 弱点12 と同じ壊れ方をする**。`isQuotaExhausted()` で `insufficient_quota` /
 > `billing_hard_limit_reached` を見て、429 のうち残高切れだけを恒久扱いにしている。
+
+## カードの識別子 `cardId`（#38）
+
+**`term` は識別子ではなくなった。** カードの識別・更新・UI 参照は不変の `cardId` で行い、
+`term` は「意味上の同一性」（デデュープと再送判定）だけに使う。この Issue は挙動を変えない
+土台づくりで、term の後編集も unresolved の再評価も行っていない。
+
+### サーバーはセッション内通番で採番する（案A）
+
+`ExtractionScheduler` が `c1`, `c2`, … を配る（`nextCardId`）。**採番は速報カードを
+組み立てる前に配り切り**、`toClientCard()` と `enrichCard()` の両方へ同じ ID を渡す。
+`toClientCard()` の中で採ると清書側へ同じ ID を渡せず、`card_update` がどのカードにも
+当たらない（例外は出ず「確認中」が回り続けるだけなので気づけない）。
+`onCardUpdate` を呼ぶ経路は **裏付けあり / 棄却 / 例外時のフォールバックの3つ**で、
+全部で同じ ID を渡す。
+
+`console.warn` / `console.error` のログは従来どおり `term` を出す（人が読むため）。
+
+**`selectVerifyTargets()` は term ベースのまま。** あれは「どのカードを検証に回すか」の
+**選定**であって識別ではなく、評価ハーネス（`src/eval/run.ts`）と共用の純関数なので、
+cardId を持ち込むと本番と評価が drift する。
+
+### クライアントは受信 ID をローカル ID へ写像する
+
+`public/app.js` は Map を **3本** 持つ。**この分離が #38 の目的そのもの**で、
+どれかへ寄せると意味が消える。
+
+| Map | キー → 値 | 役割 |
+|---|---|---|
+| `cardData` | localCardId → TermCard | **識別**。表示・エクスポート・DOM 参照の正。挿入順 = 登場順 |
+| `termToCardId` | term → localCardId | **意味上の同一性**。デデュープ・再送判定（#8） |
+| `incomingCardId` | serverCardId → localCardId | 受信 ID の**写像** |
+
+ローカル ID は `k1`, `k2`, …（サーバーの `c\d+` と見分けが付く形にしてある）。
+DOM は `dataset.cardId`、検索は **`findCardEl(cardId)` 1箇所に集約**する
+（各所で `[...cardsEl.children].find(...)` を書くと、識別子を変えるたびに置換漏れが出る）。
+`activeCardId` / `pinnedToCard` / `highlightOwner` の値もローカル ID。
+
+**`termToCardId` のキーは生の term 文字列で、正規化を挟まない。** #38 以前の
+`cardData.get(card.term)` と完全に同じ突き合わせにするため（正規化を入れると
+デデュープの当たり方が変わる）。
+
+### 再接続で採番が振り直されても更新が届く
+
+サーバーの採番は WS 1本ごとに `c1` から始まる。再接続後、同じ用語が**別の `cardId`**で
+再送されるので、`addCard()` は **畳み込みの可否に関わらず `incomingCardId` を貼り替える**。
+貼り替えを `shouldApplyResend()` の分岐の中に入れると、清書済みカードだけ写像が古いまま
+残り、後続の `card_update` が当たらなくなる。
+
+**`shownTerms` は `cardData` の値から term を取り出して送る。** キー（ローカル ID）を
+送ると、サーバーの `normalizeTerm()` を通って `shownSet` に `k1` などが積まれ、
+**デデュープが丸ごと無効化される**（再接続後に既出カードが全部再表示される＝ #8 の回帰）。
+`cardData` のキーを ID にした以上、ここが最も起きやすい壊し方。
+
+### 保存/復元
+
+スナップショットの `cardData` は `[localCardId, card]` の配列で、カード側の `cardId` も
+同じローカル ID。復元は従来どおり `addCard()` を通し、**`k\d+` の cardId はそのまま採用**
+して採番カウンタを追い越させる（追い越さないと、復元後に出た新しいカードが復元済みカードと
+同じ ID を取る）。cardId を持たない #38 以前の保存データは新しく採番する。
+`clearSessionContent()` は **3本とも**クリアし `nextLocalCardId` を 0 に戻す。
+
+**Markdown エクスポートに `cardId` は出さない。** 内部の識別子で、読む人には意味が無い。
 
 ## デデュープ
 

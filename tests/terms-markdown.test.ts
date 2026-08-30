@@ -11,6 +11,8 @@ import { buildTermsMarkdown } from "../public/terms-markdown.js";
  */
 
 interface Card {
+  /** #38 で TermCard に入った識別子。**エクスポートには出さない** */
+  cardId?: string;
   term: string;
   reading?: string;
   description?: string;
@@ -93,4 +95,28 @@ test("Markdown の記号を含む用語をエスケープする", () => {
   const out = md([{ term: "C*_[x]", description: "記号を含む解説 #1" }]);
   assert.ok(out.includes("C\\*\\_\\[x\\]"), out);
   assert.ok(out.includes("\\#1"));
+});
+
+/**
+ * **cardId はエクスポートに出さない（#38 / R6）。**
+ *
+ * `cardId` は画面のカードを指すための内部の識別子で、持ち出した Markdown を読む人には
+ * 何の意味も無い。しかも値はセッションごとの通番なので、載せると別の会議の Markdown と
+ * 見た目が衝突する。**出しても例外は出ない**ので、固定しておかないと気づけない。
+ */
+test("cardId は Markdown に現れない", () => {
+  const out = md([
+    { cardId: "k1", term: "Kubernetes", reading: "クバネティス", description: "コンテナ基盤。" },
+    {
+      cardId: "k2",
+      term: "Qdrant",
+      status: "unresolved",
+      surfaceForms: ["クドラント"],
+      description: "特定できませんでした。",
+      links: [{ title: "公式", url: "https://example.com/" }],
+    },
+  ]);
+  assert.ok(!out.includes("k1"), "cardId がエクスポートに漏れている");
+  assert.ok(!out.includes("k2"), "cardId がエクスポートに漏れている");
+  assert.ok(!/cardId/i.test(out), "cardId のラベルが出ている");
 });

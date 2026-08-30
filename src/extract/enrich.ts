@@ -400,7 +400,7 @@ export function parseVerifyOutput(
     };
   }
   // 表記は候補側を正典とする。モデルが返した表記ゆれをそのまま採ると、
-  // 呼び出し元の `isVerified()` や card_update の term 突き合わせが表記に振られる。
+  // 呼び出し元の `isVerified()`（表示中の用語との突き合わせ）が表記に振られる。
   //
   // **最後に `normalizeVerification()` を通す**(#25)。候補の中から採ったうえで、
   // モデル自身が「実在しない」「文脈に合わない」と言っている採用を棄却へ倒す。
@@ -418,9 +418,9 @@ export function parseVerifyOutput(
 /**
  * 検証が「表示中の用語」を裏付けたか。
  *
- * 候補の2番目以降が選ばれた場合は裏付け無しとして扱う。`card_update` は term で
- * カードを突き合わせる仕様なので、**表示中のカードを別の用語に改名する経路が無い**
- * (改名は unresolved 状態の Issue でまとめて入れる)。
+ * 候補の2番目以降が選ばれた場合は裏付け無しとして扱う。#38 で `card_update` は cardId
+ * ベースになったが、**term を差し替える経路そのものはまだ無い**（#38 は識別子の分離だけで
+ * 挙動を変えない）。改名は後続の Issue でまとめて入れる。
  */
 export function isVerified(term: string, chosen: string | null): boolean {
   return chosen !== null && normalizeTerm(chosen) === normalizeTerm(term);
