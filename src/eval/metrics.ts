@@ -54,7 +54,36 @@ export interface CaseScore {
   missing: string[];
   /** 期待にも許容にも入っていないカード（レポート用。dedupe 後） */
   extra: string[];
+  // --- unresolved カードの再評価(#40) ---------------------------------------
+  //
+  // **unresolved 率だけを下げることを成功条件にしない。** 誤って何でも確定すれば
+  // unresolved 率は下がるので、昇格の数と**そのうち間違っていた数**を必ず対にして数える。
+  /** 再評価を試みた回数（web 検証まで回したもの） */
+  rematchAttempts: number;
+  /** 再評価で昇格（改名）した数 */
+  rematchPromoted: number;
+  /** 昇格のうち `expectRematch` と一致した数 */
+  rematchCorrect: number;
+  /** 昇格したが期待と違った数。**これが増えるなら閾値を締める** */
+  rematchMiscorrected: number;
+  /** 再評価の内訳（レポート用）。`聞き取られた表記 → 確定した用語` の並び */
+  rematches: string[];
 }
+
+/**
+ * 1ケース・1試行で再評価が実際に何をしたか。`scoreCase()` の入力。
+ *
+ * **カード集合からは復元できない。** 昇格したカードは普通の confirmed カードとして
+ * 出てくるので、「もともと unresolved だったが再評価で直った」ことは、再評価を回した
+ * 側が記録しておくしかない。
+ */
+export interface RematchOutcome {
+  attempts: number;
+  /** 実際に起きた改名。`from` は unresolved のときに聞き取られていた表記 */
+  renames: Array<{ from: string; to: string }>;
+}
+
+const NO_REMATCH: RematchOutcome = { attempts: 0, renames: [] };
 
 export interface Metrics {
   /** 用語 Recall */
@@ -71,6 +100,15 @@ export interface Metrics {
   unresolvedRecall: number;
   /** カード Precision */
   precision: number;
+  /** 再評価の昇格成功率（昇格 ÷ 試行）(#40) */
+  rematchPromotion: number;
+  /**
+   * **再評価による誤補正率**（期待と違った昇格 ÷ 昇格）(#40)。
+   *
+   * 全体の `miscorrection` とは**別に持つ**。合算すると、再評価が悪さをしていても
+   * 抽出段の誤補正に埋もれて見えない。unresolved 率と必ずセットで読むこと。
+   */
+  rematchMiscorrection: number;
 }
 
 export interface Totals {
@@ -86,6 +124,10 @@ export interface Totals {
   unresolvedTotal: number;
   precisionHit: number;
   precisionTotal: number;
+  rematchAttempts: number;
+  rematchPromoted: number;
+  rematchCorrect: number;
+  rematchMiscorrected: number;
 }
 
 /**
@@ -104,7 +146,12 @@ function ratio(hit: number, total: number): number {
  * 用語の突き合わせは必ず `normalizeTerm()` を通す。本番のデデュープと同じ土俵に揃え、
  * 「全角/半角・大文字小文字・空白だけ違う」ものを取りこぼさないため。
  */
-export function scoreCase(c: TermCase, cards: EvaluatedCard[], run = 0): CaseScore {
+export function scoreCase(
+  c: TermCase,
+  cards: EvaluatedCard[],
+  run = 0,
+  rematch: RematchOutcome = NO_REMATCH,
+): CaseScore {
   const byTerm = new Map<string, EvaluatedCard>();
   for (const card of cards) {
     const key = normalizeTerm(card.term);
@@ -182,6 +229,20 @@ export function scoreCase(c: TermCase, cards: EvaluatedCard[], run = 0): CaseSco
     else extra.push(card.term);
   }
 
+  // --- 再評価による正しい補正 / 誤補正(#40) ---------------------------------
+  // **`from` と `to` の両方が一致して初めて正解。** `to` だけを見ると、別の未解決語が
+  // たまたま期待した用語に着地した場合も加点され、誤補正率が過小に出る
+  // （`expectCorrection` の採点が correctedFrom と term の両方を見るのと同じ理由）。
+  let rematchCorrect = 0;
+  for (const rename of rematch.renames) {
+    const fromKey = normalizeTerm(rename.from);
+    const toKey = normalizeTerm(rename.to);
+    const expected = c.expectRematch.some(
+      (e) => normalizeTerm(e.from) === fromKey && normalizeTerm(e.to) === toKey,
+    );
+    if (expected) rematchCorrect += 1;
+  }
+
   return {
     id: c.id,
     run,
@@ -201,6 +262,11 @@ export function scoreCase(c: TermCase, cards: EvaluatedCard[], run = 0): CaseSco
     precisionTotal: byTerm.size,
     missing,
     extra,
+    rematchAttempts: rematch.attempts,
+    rematchPromoted: rematch.renames.length,
+    rematchCorrect,
+    rematchMiscorrected: rematch.renames.length - rematchCorrect,
+    rematches: rematch.renames.map((r) => `${r.from} → ${r.to}`),
   };
 }
 
@@ -218,6 +284,10 @@ export function sumTotals(scores: CaseScore[]): Totals {
     unresolvedTotal: 0,
     precisionHit: 0,
     precisionTotal: 0,
+    rematchAttempts: 0,
+    rematchPromoted: 0,
+    rematchCorrect: 0,
+    rematchMiscorrected: 0,
   };
   for (const s of scores) {
     totals.recallHit += s.recallHit;
@@ -230,6 +300,10 @@ export function sumTotals(scores: CaseScore[]): Totals {
     totals.unresolvedTotal += s.unresolvedTotal;
     totals.precisionHit += s.precisionHit;
     totals.precisionTotal += s.precisionTotal;
+    totals.rematchAttempts += s.rematchAttempts;
+    totals.rematchPromoted += s.rematchPromoted;
+    totals.rematchCorrect += s.rematchCorrect;
+    totals.rematchMiscorrected += s.rematchMiscorrected;
     if (s.miscorrected) totals.miscorrectedCases += 1;
   }
   return totals;
@@ -247,6 +321,13 @@ export function toMetrics(totals: Totals): Metrics {
     // 分母 0（期待が無い）は減点しない。ratio() と同じ扱い
     unresolvedRecall: ratio(totals.unresolvedHit, totals.unresolvedTotal),
     precision: ratio(totals.precisionHit, totals.precisionTotal),
+    // 分母 0（再評価が一度も走らなかった）は 0。ratio() の「分母 0 は減点しない＝1」を
+    // 使うと、**再評価が一度も発火していないランが「昇格率 100%」に見える**
+    rematchPromotion:
+      totals.rematchAttempts === 0 ? 0 : totals.rematchPromoted / totals.rematchAttempts,
+    // 誤補正率は `miscorrection` と同じく「無ければ 0（良い）」の向き
+    rematchMiscorrection:
+      totals.rematchPromoted === 0 ? 0 : totals.rematchMiscorrected / totals.rematchPromoted,
   };
 }
 

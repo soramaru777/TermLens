@@ -3,7 +3,7 @@ import test, { mock, type TestContext } from "node:test";
 import { client as extractClient } from "../src/extract/extractor.js";
 import { client as enrichClient, type Verification } from "../src/extract/enrich.js";
 import type { ExtractedCard } from "../src/extract/schema.js";
-import { card } from "./helpers/cards.js";
+import { card, candidate } from "./helpers/cards.js";
 import { verifyOutput } from "./helpers/verify.js";
 import { TermCaseSchema } from "../src/eval/cases.js";
 import { formatTable, runEval, type EvalReport, type VerifyTally } from "../src/eval/run.js";
@@ -191,6 +191,9 @@ test("formatTable が検索回数と棄却の内訳を出す", async (t) => {
     replaced: 0,
     failed: 1,
     searches: 10,
+    rematchChecked: 0,
+    rematchSearches: 0,
+    rematchFailed: 0,
   };
   const report: EvalReport = { ...base, verifyTally: tally };
 
@@ -203,4 +206,67 @@ test("formatTable が検索回数と棄却の内訳を出す", async (t) => {
   // **そのランの上限も出す。** 上限がいくつだったか分からない平均は読めない
   // （`model` を実効値で残しているのと同じ理由）
   assert.ok(/上限(なし|\d+)/.test(table), "そのランで効いていた上限をレポートに残す");
+});
+
+/**
+ * **再評価(#40)の数字は Stage 2 と混ぜない。**
+ *
+ * `searches` を `checked` で割った値が `MAX_WEB_SEARCHES` を決めるための「1カードあたり
+ * 平均検索回数」で、再評価の検索を足すと**分母に対応しない回数が入って水増しされる**。
+ * `failed` も同様で、あちらは「Stage 2 の呼び出しが失敗し判断保留にしたカード数」という
+ * 定義。混ぜると意味が2つになり、どちらの数字なのか読めなくなる。
+ *
+ * 再評価を発火させるため、崩れた表記の unresolved カードと、それと音で対応する確定
+ * カードを1ケースに置く（表記はすべて匿名化した合成データ）。
+ */
+test("再評価の検索回数と失敗は Stage 2 の集計に混ぜない", async (t) => {
+  const unresolved = card("エービ", {
+    status: "unresolved",
+    surfaceForms: ["えーび"],
+    correctedFrom: "えーび",
+    candidates: [candidate("エービ"), candidate("AB")],
+  });
+  // **`surfaceForms` は当てにできない。** `filterSurfaceForms()` が「文字起こしに実在する
+  // 表記」だけに絞るので、合成ケースの短い transcript では空になる。音で対応する手がかりは
+  // `correctedFrom`（＝ 音声認識が崩した元の表記）から届く
+  const hint = card("AB Studio", { status: "confirmed", correctedFrom: "エービー" });
+  const report = await runWith(t, [unresolved, hint], {
+    // 再評価の入力（元の表記が「えーび」）には AB を返して昇格させる
+    えーび: { verification: EXISTS_AND_FITS, chosen: "AB", searches: 4 },
+    // 清書（Stage 2）はそのまま通す
+    "AB Studio": { verification: EXISTS_AND_FITS, chosen: "AB Studio", searches: 1 },
+  });
+
+  const t2 = report.verifyTally!;
+  assert.ok(t2.rematchChecked > 0, "再評価が発火していない（テストの前提が崩れている）");
+  assert.equal(t2.rematchSearches, 4, "再評価の検索を別に数えていない");
+  assert.equal(
+    t2.searches,
+    1,
+    "再評価の検索が searches に混ざっている（1カードあたり平均が水増しされる）",
+  );
+});
+
+/**
+ * **再評価の母集団は本番の `pendingUnresolved` に合わせる。**
+ *
+ * 本番で積まれるのは抽出段が `unresolved` にしたカードだけで、Stage 2 が降格させた
+ * カードは積まれない。評価だけ降格後のカードまで再検証すると、**直前に棄却された
+ * カードをほぼ同じ候補で問い直す**ことになり、本番に存在しない母集団の数字が
+ * `rematchChecked` と誤補正率に混ざる（人が閾値と増分コストを決める前提が崩れる）。
+ */
+test("Stage 2 が降格させたカードは再評価の対象にしない", async (t) => {
+  // 抽出段は probable。Stage 2 が棄却して unresolved に落とす
+  const demoted = extractedCard("エービ", "えーび");
+  const hint = card("AB Studio", { status: "confirmed", correctedFrom: "エービー" });
+  const report = await runWith(t, [demoted, hint], {
+    えーび: { verification: { exists: false, fitsContext: false, evidence: "該当なし" }, chosen: null, searches: 2 },
+    "AB Studio": { verification: EXISTS_AND_FITS, chosen: "AB Studio", searches: 1 },
+  });
+
+  assert.equal(
+    report.verifyTally!.rematchChecked,
+    0,
+    "Stage 2 で降格したカードを再評価に回している（本番には無い母集団）",
+  );
 });

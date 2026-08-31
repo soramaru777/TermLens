@@ -44,6 +44,21 @@ export const TermCaseSchema = z.object({
    */
   expectUnresolved: z.array(z.string()).default([]),
   /**
+   * 再評価で直ってほしい改名（#40）。`from` は**音声認識が聞き取った表記**、
+   * `to` は最終的に確定してほしい用語。
+   *
+   * **`expectCorrection` とは別物。** あちらは「抽出段が1回で正しく補正できたか」で、
+   * こちらは「1度 unresolved にしたものを、後続の文脈で正しく直せたか」。同じ欄に
+   * まとめると、**再評価による誤補正が抽出段の誤補正に埋もれて見えなくなる**
+   * （unresolved 率だけを下げて誤補正が増えても気づけない）。
+   *
+   * `from` と `to` の**両方**が一致して初めて正解に数える。`to` だけを見ると、
+   * 別の未解決語がたまたま期待した用語に着地した場合まで加点される。
+   */
+  expectRematch: z
+    .array(z.object({ from: z.string(), to: z.string() }))
+    .default([]),
+  /**
    * 出ても減点しない用語（表記ゆれ・関連語）。Precision の分子に算入する。
    *
    * **名前は `confidence` 時代のままだが、判定に status は使っていない**（#24）。

@@ -8,7 +8,8 @@ import {
 } from "openai";
 // パッケージのルートからは再エクスポートされていないのでサブパスから取る
 import { LengthFinishReasonError } from "openai/error";
-import type { TermCard, TermLink, TermStatus } from "../protocol.js";
+import type { CardRename, TermCard, TermLink, TermStatus } from "../protocol.js";
+import { config } from "../config.js";
 import { ContextWindow } from "./context.js";
 import { createExtractor, UNRESOLVED_DESCRIPTION } from "./extractor.js";
 import { isVerified, verifyAndEnrich } from "./enrich.js";
@@ -17,7 +18,16 @@ import { isVerified, verifyAndEnrich } from "./enrich.js";
 import { REJECTION_LABEL } from "./rejection.js";
 import { buildGlossaryIndex, type GlossaryIndex, relatedGlossary } from "./glossary.js";
 import { normalizeTerm } from "./normalize.js";
-import type { ExtractedCard } from "./schema.js";
+import {
+  hintForms,
+  isRelated,
+  isRename,
+  isResolved,
+  mergeCandidates,
+  pickCandidate,
+  REMATCH_RATIONALE,
+} from "./rematch.js";
+import type { Candidate, ExtractedCard } from "./schema.js";
 
 const MIN_CHARS = 120;
 const MAX_WAIT_MS = 10_000;
@@ -26,6 +36,67 @@ const SHOWN_TERMS_LIMIT = 50;
 const MAX_CONSECUTIVE_FAILURES = 3;
 // 未処理バッファの上限。会議は流れ続けるので、古い未処理チャンクを保持する価値は低い。
 const MAX_BUFFER_CHARS = 2_000;
+
+// --- unresolved カードの再評価(#40) -----------------------------------------
+//
+// **コスト制御は5段。** どれか1つでも外すと「会話が進むたびに全 unresolved を
+// web 検索つきで投げ直す」形に戻る。値はすべて暫定で、決め方は `config.ts` の
+// 該当ノブのコメントに一本化してある(`REMATCH_MIN_SIMILARITY=0` で分布を測ってから
+// 人が決める)。
+//
+// 1. ローカル判定(`isRelated()`)         … LLM を呼ぶ前に絞る
+// 2. `MAX_REMATCH_ATTEMPTS`               … 同じカードを無制限に再評価しない
+// 3. `REMATCH_COOLDOWN_MS`                … 短時間の連打を防ぐ
+// 4. `MAX_REMATCH_PER_RUN`                … 確定カードが大量に出た回でも爆発しない
+// 5. `MAX_PENDING_UNRESOLVED`             … メモリと候補走査の上限
+
+/**
+ * 再評価のために保持する unresolved カードの上限。超えたら**古いほうから捨てる**
+ * (`ContextWindow` と同じ割り切り。会議は流れ続けるので、古い未解決を抱え続ける
+ * 価値は低い)。
+ */
+const MAX_PENDING_UNRESOLVED = 20;
+
+/**
+ * 1回の `run()` で発火させる再評価の上限。
+ *
+ * 1チャンクで確定カードが5枚出て、保持中の unresolved がその全部に関連しうる、という
+ * 回に上限が無いと **web 検索つきの呼び出しが一気に十数本飛ぶ**。
+ *
+ * **溢れた分は「次の回に同じ手がかりで拾える」わけではない。** 手がかりになるのは
+ * `fresh`(= `shownSet` でデデュープ済み)のカードなので、ある用語が手がかりとして現れる
+ * のは**その run 1回きり**。次の run には別の手がかりしか来ないため、ここで溢れたペアは
+ * その組み合わせでは二度と評価されない。上限を上げれば取りこぼしは減るが課金が増える
+ * ——どちらに寄せるかは人が計測してから決める(`docs/wiki/termlens-open-issues.md`)。
+ */
+const MAX_REMATCH_PER_RUN = 2;
+
+/**
+ * 再評価待ちの unresolved カード(#40)。**セッション内・件数上限つきなので永続化しない。**
+ *
+ * 会話全文をカードごとに複製して持たない。`context` は unresolved が出た**そのチャンク
+ * だけ**で、再評価時は「保存した抜粋 + 直近の文脈」を渡す(#25 のプライバシー原則)。
+ */
+interface PendingUnresolved {
+  cardId: string;
+  /** 抽出段が推定した term。デデュープキー(`shownSet`)と対応する */
+  term: string;
+  surfaceForms: string[];
+  correctedFrom: string | null;
+  /**
+   * 抽出段が挙げた候補。**#40 以前は `enrichCard()` に渡した後で捨てていた。**
+   * 再評価はこれを土台に候補を組み直すので、ここで掴んでおかないと材料が無くなる。
+   */
+  candidates: Candidate[];
+  /** unresolved が出たチャンク。会話全文ではない */
+  context: string;
+  attempts: number;
+  /** 最後に再評価を**試みた**時刻。cooldown の起点。0 は「まだ一度も試していない」 */
+  lastAttemptAt: number;
+}
+
+// 表記の集め方は `rematch.ts` の `hintForms()` 1本に寄せてある。手がかり側と
+// 未解決側で式を分けていた頃は、片方だけ変えても評価ハーネスが緑のままだった。
 
 /** SDK 自身が再試行するステータス。分類を SDK の方針と一致させる。 */
 const SDK_RETRYABLE_STATUSES = new Set([408, 409, 429]);
@@ -109,11 +180,16 @@ export function toUserMessage(err: unknown): string {
  * 足した和集合。誤補正が疑わしいのはこの2つで、レア度ランキングが選ぶ集合とは大きく
  * 重なるため、web 検索の呼び出し増は小さい。
  *
- * **`unresolved` は検証に回さない(#24)。** 昇格の経路が無い(#38 で `card_update` は
- * cardId ベースになったが、**改名の経路自体はまだ無い**)うえ、解説も定型文で固定される
- * ため、**検証結果を使える余地が1つも無い**。回すと web 検索の課金だけが増える。
- * さらに、昇格を防ぎつつ解説だけ更新すると「特定できませんでした」の見出しの下に
- * 確定した別用語の断定的な解説が出る — この Issue が防ごうとしていた形そのものになる。
+ * **`unresolved` はここでは検証に回さない(#24)。** そのチャンクの中だけでは材料が
+ * 増えていないので、同じ入力で検証を回しても結果は変わらず web 検索の課金だけが増える。
+ * 昇格を防ぎつつ解説だけ更新すると「特定できませんでした」の見出しの下に確定した別用語の
+ * 断定的な解説が出る — #24 が防ごうとしていた形そのものになる。
+ *
+ * **#40 の再評価はこの関数を通らない。** あちらは「後続の会話で新しい材料が出た」ことを
+ * トリガにする別経路(`maybeRematch()`)で、材料が増えたときだけ `verifyAndEnrich()` を
+ * 呼ぶ。ここを緩めて unresolved を毎チャンク回す形にすると、**「材料が増えたときだけ」
+ * という前提ごと消える**ので、この関数は #24 のまま触らない。
+ * 評価ハーネス(`src/eval/run.ts`)と共用の純関数でもあるので、なおさら分ける。
  *
  * **補正のないカードは Stage 2 を通さない。** そもそも速報は従来どおり即時表示で、
  * Stage 2 は非同期の `card_update` なので、表示までの時間はどちらにせよ変わらない。
@@ -216,6 +292,13 @@ export class ExtractionScheduler {
    * 永続的に一意な ID を作る必要はここには無い。
    */
   private nextCardId = 0;
+  /**
+   * 再評価待ちの unresolved カード(#40)。**登場順(古い順)で保つ。**
+   *
+   * 上限を超えたら先頭(＝最も古いもの)から捨てる。配列にしてあるのは順序が意味を持つ
+   * ためで、件数は `MAX_PENDING_UNRESOLVED` で頭打ちなので線形走査で足りる。
+   */
+  private pendingUnresolved: PendingUnresolved[] = [];
   private timer: NodeJS.Timeout;
   private extract: ReturnType<typeof createExtractor>;
   /**
@@ -235,14 +318,18 @@ export class ExtractionScheduler {
        * 裏付けが取れれば `confirmed`、棄却なら `unresolved` に**降格**する。
        *
        * 第1引数は #38 から **cardId**(term ではない)。速報で送ったカードと同じ ID を
-       * 渡すこと。`onCardUpdate` を呼ぶ経路は3つ(裏付けあり / 棄却 / 例外時の
-       * フォールバック)あり、**どれか1つでも別の値を渡すと更新が迷子になる**。
+       * 渡すこと。`onCardUpdate` を呼ぶ経路は4つ(裏付けあり / 棄却 / 例外時の
+       * フォールバック / #40 の再評価)あり、**どれか1つでも別の値を渡すと更新が迷子になる**。
+       *
+       * `rename` は #40 の再評価だけが渡す。**既存の3経路は渡さない** — 渡さないかぎり
+       * クライアント側の #24 のガード(unresolved から戻さない)がそのまま効く。
        */
       onCardUpdate: (
         cardId: string,
         status: TermStatus,
         description: string,
         links: TermLink[],
+        rename?: CardRename,
       ) => void;
       onExtracting: () => void;
       /** permanent: 恒久エラーで抽出を打ち切ったときだけ true(#10)。一時エラーは省略/false。 */
@@ -380,6 +467,25 @@ export class ExtractionScheduler {
         for (const { card, cardId } of withIds) {
           if (enrichTargets.has(card.term)) void this.enrichCard(card, chunk, cardId);
         }
+
+        // 再評価(#40): 新しく確定したカードを手がかりに、**過去の** unresolved を見直す。
+        //
+        // **積むより先にトリガを引く。** 順序を逆にすると、unresolved が出るたびに
+        // 同じチャンクの確定カードで必ず1本 web 検索つきの呼び出しが増える。抽出段は
+        // 両方を同時に見たうえで片方を unresolved にしているので、その回に限れば
+        // 手がかりとしての価値は低い。
+        //
+        // **ただしこれは取りこぼしでもある。** 手がかりは `fresh` なので同じ用語が
+        // 手がかりになるのはその run 1回きり。同じチャンクに未解決とその手がかりが
+        // 揃ったペアは、**以後どの回でも評価されない**。抽出段が見ているとはいえ
+        // web 検証はしていないので「新しい材料が無い」と言い切れるわけではない。
+        // 発火率とコストのどちらに寄せるかは人が計測してから決める。
+        this.maybeRematch(
+          withIds.filter(({ card }) => card.status !== "unresolved").map(({ card }) => card),
+        );
+        for (const { card, cardId } of withIds) {
+          if (card.status === "unresolved") this.rememberUnresolved(card, cardId, chunk);
+        }
       }
     } catch (err) {
       console.error("[scheduler] extraction failed:", err);
@@ -501,6 +607,170 @@ export class ExtractionScheduler {
       // その状態で保存されるので復元しても消えない(#23 で棄却時に踏んだのと同じ穴)。
       // 検証できなかっただけなので**速報の status と解説はそのまま**、リンクだけ空で送る。
       this.callbacks.onCardUpdate(cardId, card.status, card.description, []);
+    }
+  }
+
+  // --- unresolved カードの再評価(#40) ---------------------------------------
+
+  /**
+   * unresolved カードを再評価待ちとして覚える。
+   *
+   * **`candidates` を掴むのがこのメソッドの主目的。** 抽出結果の候補は
+   * `toClientCard()` が意図的に落としており(クライアントは使わない)、`enrichCard()` に
+   * 渡した後は誰も持っていなかった。再評価は候補を土台に組み直すので、ここで
+   * 保持経路を1本足す。
+   */
+  private rememberUnresolved(card: ExtractedCard, cardId: string, context: string): void {
+    this.pendingUnresolved.push({
+      cardId,
+      term: card.term,
+      surfaceForms: card.surfaceForms,
+      correctedFrom: card.correctedFrom,
+      candidates: card.candidates,
+      context,
+      attempts: 0,
+      lastAttemptAt: 0,
+    });
+    // 古いほうから捨てる。上限を件数で持つのは、走査コストとメモリの両方を同時に
+    // 頭打ちにできるから(`ContextWindow` が文字数で切っているのと同じ発想)
+    while (this.pendingUnresolved.length > MAX_PENDING_UNRESOLVED) this.pendingUnresolved.shift();
+  }
+
+  /**
+   * 新しく確定したカードを手がかりに、再評価する unresolved を選んで発火する(#40)。
+   *
+   * **ここでは LLM を呼ばない。** 絞り込みはすべてローカル判定(`isRelated()`)で、
+   * 関連しそうなものだけが `rematchCard()` 経由で web 検証に回る。
+   *
+   * **`verifyDisabled` が立っていたら何もしない。** 残高切れ・恒久エラーで検証を
+   * 打ち切った後に再評価だけ生きていると、誰にも通知されないまま課金が進む
+   * (`enrichCard()` の catch が `verifyDisabled` を立てるのと対)。
+   */
+  private maybeRematch(hints: ExtractedCard[]): void {
+    if (this.verifyDisabled || hints.length === 0 || this.pendingUnresolved.length === 0) return;
+    const now = Date.now();
+    let started = 0;
+    // **配列のコピーを走査する。** 昇格すると `rematchCard()` が
+    // `pendingUnresolved` から要素を削るので、元の配列を回すと添字がずれる。
+    for (const pending of [...this.pendingUnresolved]) {
+      if (started >= MAX_REMATCH_PER_RUN) break;
+      // 安い順に見る。試行回数と cooldown は配列の走査だけで判断できるが、
+      // 関連判定は語に割って距離を取るので、先に落とせるものは落とす
+      if (pending.attempts >= config.maxRematchAttempts) continue;
+      if (now - pending.lastAttemptAt < config.rematchCooldownMs) continue;
+      const related = hints.filter((h) =>
+        isRelated(hintForms(pending), hintForms(h), config.rematchMinSimilarity),
+      );
+      if (related.length === 0) continue;
+      // **試行は「投げた時点」で数える。** 結果を待って数えると、検証が遅い間に
+      // 次のチャンクが来て同じカードを何本も投げられる(上限が上限として効かない)。
+      pending.attempts += 1;
+      pending.lastAttemptAt = now;
+      started += 1;
+      void this.rematchCard(pending, related);
+    }
+  }
+
+  /**
+   * 1枚の unresolved カードを既存の Stage 2 で再検証し、裏付けが取れたら改名する(#40)。
+   *
+   * **検証ロジックは複製しない。** `verifyAndEnrich()` をそのまま呼ぶので、#25 の
+   * プライバシー原則(会話全文を渡さない・用語集は絞り込み済みしか渡せない)が
+   * 型のまま継承される。
+   */
+  private async rematchCard(pending: PendingUnresolved, hints: ExtractedCard[]): Promise<void> {
+    // 候補の合成。足すのは**速報段階で `confirmed` / `probable` になったカードの term**で、
+    // 検証段がゼロから作る用語ではない。#23 の「候補外の用語を勝手に確定しない」は
+    // `parseVerifyOutput()` と `isResolved()` の二重で残る。
+    //
+    // **「Stage 2 を通ったカード」ではない点に注意。** `selectVerifyTargets()` が選ぶのは
+    // 一部で、`enrichCard()` は投げっぱなし(`void`)なので結果を待っていない。つまり後で
+    // 棄却されて降格するはずの `probable` が手がかりになることはありうる。それでも
+    // 通しているのは、手がかりは**候補を1つ足すだけ**で、採否は最後に web 検証が決める
+    // から(候補が増えても、裏付けが取れなければ `isResolved()` で落ちる)。
+    const candidates = mergeCandidates(
+      pending.candidates,
+      hints.map((h) => ({ term: h.term, reading: h.reading, rationale: REMATCH_RATIONALE })),
+    );
+    // 改名後も「音声ではこう聞こえた」を残す。unresolved の見出しがこの表記だったので、
+    // 利用者から見ると「あのカードが直った」と分かる手がかりになる
+    const correctedFrom = pending.correctedFrom ?? pending.surfaceForms[0] ?? null;
+    try {
+      const result = await verifyAndEnrich({
+        candidates,
+        correctedFrom,
+        // 保存した抜粋 + 直近の文脈。**会話全文は渡さない**(#25 の原則を維持)。
+        // 抜粋だけだと unresolved になった当時の材料しか無く、再評価の意味が消える
+        context: `${pending.context}\n${this.context.text()}`,
+        // 型が絞り込み済みしか受けないので、ここを素通しにはできない(#25)
+        glossaryHints: relatedGlossary(this.glossaryIndex, candidates),
+      });
+      // **昇格の判定に `isVerified()` は使わない。** あちらは「表示中の term が
+      // 裏付けられたか」で、候補#2 が選ばれたら false を返すのが #24 の降格判断そのもの。
+      // 緩めるのは再評価経路だけにする(`rematch.ts` の `isResolved()` のコメント)
+      if (!isResolved(result.chosen, candidates)) {
+        // 裏付け不足。unresolved のまま据え置き、`card_update` も送らない
+        // (速報は `willEnrich: false` で届いているので「確認中」は残っていない)。
+        // ログに出すのは term と棄却理由の内訳だけで、**文字起こし本文は出さない**
+        const why = REJECTION_LABEL[result.rejection ?? "unspecified"];
+        console.warn(`[scheduler] rematch not resolved "${pending.term}" (${why})`);
+        return;
+      }
+      const chosen = pickCandidate(result.chosen, candidates);
+      // `isResolved()` が true なら必ず引けるが、引けなければ改名しない。
+      // 候補外の表記で改名する経路を型の外に作らない
+      if (!chosen) return;
+      // **改名を伴わない昇格は許さない**(#40 / #24)。合成候補の先頭は
+      // `normalizeCandidates()` の不変条件により抽出段の推定 term 自身なので、検証段が
+      // それを選び直すだけで `isResolved()` は true になる。素通しにすると「音が似た
+      // 確定カードが1枚出た」ことをトリガに、**改名もせず `unresolved` → `confirmed` へ
+      // 格上げ**でき、#24 が「unresolved は Stage 2 に回さない」で塞いだ形が復活する。
+      // クライアントの `mergeCardUpdate()` が `rename` の存在でしか昇格を許さないのと
+      // 同じ線引きを、サーバー側にも引く(片側だけだと逆側の経路から入られる)。
+      if (!isRename(chosen.term, pending.term)) {
+        console.warn(`[scheduler] rematch kept the original term "${pending.term}" — not promoting`);
+        return;
+      }
+
+      // 昇格に成功したら待ち行列から外す。**同じカードを2度昇格させない**
+      this.pendingUnresolved = this.pendingUnresolved.filter((p) => p !== pending);
+      // 特定できた以上、デデュープの枠を空けておく理由が消える(#24 は「特定できなかった
+      // 推定で枠を永久に占有させない」ために `shownTerms` から外していた)。ここで載せて
+      // おかないと、後続のチャンクで**同じ用語のカードがもう1枚出る**
+      const key = normalizeTerm(chosen.term);
+      if (!this.shownSet.has(key)) {
+        this.shownSet.add(key);
+        this.shownTerms.push(chosen.term);
+      }
+      // **状態は `confirmed` 固定。** Issue は「confirmed / probable」と書いているが、
+      // 検証段の戻り値に「確信の度合い」は無く、`chosen !== null` は既に
+      // 「実在する かつ 文脈に合う」の両方を通っている(`normalizeVerification()` が
+      // どちらか false なら null に倒す)。ここで `probable` を選ぶ材料が無い以上、
+      // 勘で書き分けると status の意味が経路ごとにずれる。**両方を通ったものだけが
+      // ここへ来る**という条件のほうを不変にしておく。
+      this.callbacks.onCardUpdate(pending.cardId, "confirmed", result.description, result.links, {
+        term: chosen.term,
+        reading: chosen.reading,
+        correctedFrom,
+        // **古い表記をそのまま渡す。** 文字起こし本文は崩れた表記のまま残るので、
+        // ここを新しい表記に替えると過去の行からカードへ辿れなくなる
+        surfaceForms: pending.surfaceForms,
+      });
+    } catch (err) {
+      // 恒久エラーは検証全体を止める(`enrichCard()` と同じ扱い)。再評価だけ素通しだと、
+      // 会話が進むたびに web 検索つきの呼び出しを投げ続けて課金だけが進む
+      if (isPermanent(err)) {
+        this.verifyDisabled = true;
+        console.error(`[scheduler] verification disabled after rematch "${pending.term}":`, err);
+        this.callbacks.onError(`用語の検証を停止しました。${toUserMessage(err)}`);
+      } else {
+        console.error(`[scheduler] rematch failed for "${pending.term}":`, err);
+      }
+      // **`enrichCard()` と違い、失敗しても `card_update` は送らない。** あちらは
+      // `willEnrich: true` で「後から更新が来る」と予告済みなので黙ると確認中の表示が
+      // 残るが、再評価の対象は予告していない既存カード。送ると据え置きのはずのカードに
+      // 意味のない更新が1本増えるだけになる。
+      // `attempts` は投げた時点で数えてあるので、失敗し続けても上限で止まる
     }
   }
 }

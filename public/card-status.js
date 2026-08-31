@@ -71,9 +71,17 @@ export function cardHeading(card) {
  * @returns 更新後のカード（引数は変更しない）
  */
 export function mergeCardUpdate(stored, update) {
-  if (cardStatus(stored) === "unresolved") return { ...stored };
+  // **`rename` を伴う更新だけが unresolved から戻せる（#40）。** 後続の会話で確定した
+  // 用語を手がかりに web 検証をやり直し、裏付けが取れたときだけサーバーが付けてくる。
+  // #24 のガードは素の `card_update` に対してそのまま残す — 「解説だけ差し替えると
+  // 見出しと本文が食い違う」という理由は、term が同時に来ないかぎり消えない。
+  if (cardStatus(stored) === "unresolved" && !update.rename) return { ...stored };
+  // 改名の中身（term / reading / correctedFrom / surfaceForms）は入れ子ごと展開する。
+  // 平置きのフラグ + term にすると「フラグは立つが term が無い」組が作れてしまう
+  const renamed = update.rename ? { ...update.rename } : {};
   return {
     ...stored,
+    ...renamed,
     description: update.description,
     links: update.links,
     // status が無いメッセージ（旧サーバー）で状態を巻き戻さない。undefined を書き込むと
@@ -99,4 +107,60 @@ export function mergeCardUpdate(stored, update) {
 export function shouldApplyResend(existing) {
   if (existing.links?.length) return false;
   return cardStatus(existing) !== "unresolved";
+}
+
+/**
+ * カードに載せるリンクの上限。サーバー側 `src/extract/enrich.ts` の `MAX_LINKS` と同値。
+ *
+ * 統合で2枚ぶんのリンクを連結すると上限を超えうるので、クライアント側にも同じ数が要る。
+ */
+export const MAX_LINKS = 3;
+
+/**
+ * 改名で同じ用語になった2枚のカードを1枚に統合する（#40）。
+ *
+ * **安易に Map の上書きで片方を消さない。** 消える側にしか無い surfaceForms と links が
+ * 黙って失われると、**過去の行からカードへ辿れなくなる**（ハイライトは表記から引く）。
+ *
+ * 決めるのは3つだけ。
+ * - `cardId` … 残す側のもの。呼び出し側が「登場順が早いほう」を `keep` に渡す（#38 の
+ *   目的は ID の永続性で、人が固定しているかもしれないカードを消さないため）
+ * - `surfaceForms` … 残す側 → 消す側の順で連結して重複除去。登場順を保つ
+ * - `links` … 残す側を優先し、足りない分を消す側から補って `MAX_LINKS` で切る。
+ *   空配列で上書きして情報を失わないため
+ *
+ * **`term` / `reading` / `status` / `description` / `correctedFrom` はここでは決めない。**
+ * 「再評価の結果を正とする」のは呼び出し側の判断で、`keep` に反映させてから渡すこと
+ * （残す cardId と、内容の出どころは別物 — 先に登場したカードの ID を残しつつ、
+ * 中身は web 検証を通ったほうを採る組み合わせがありうる）。
+ *
+ * 純関数として `card-status.js` に置いてあるのは、統合ルールを **DOM 抜きで固定できる**
+ * ため（`mergeCardUpdate()` と同じ理由）。
+ *
+ * @returns 統合後のカード（引数はどちらも変更しない）
+ */
+export function mergeDuplicateCards(keep, drop) {
+  const surfaceForms = [];
+  const seenForm = new Set();
+  for (const form of [...(keep.surfaceForms ?? []), ...(drop.surfaceForms ?? [])]) {
+    // 突き合わせは小文字化した表記。ハイライトのキー（highlightOwner）と同じ土俵に
+    // 揃えておかないと、大文字違いの同じ表記が2つ残って正規表現が無駄に太る
+    const key = String(form ?? "").trim().toLowerCase();
+    if (!key || seenForm.has(key)) continue;
+    seenForm.add(key);
+    surfaceForms.push(form);
+  }
+
+  const links = [];
+  const seenUrl = new Set();
+  for (const link of [...(keep.links ?? []), ...(drop.links ?? [])]) {
+    if (links.length >= MAX_LINKS) break;
+    if (!link?.url || seenUrl.has(link.url)) continue;
+    seenUrl.add(link.url);
+    links.push(link);
+  }
+
+  // `drop` を土台に `keep` で上書きする。残す側に無いフィールド（復元した古いカードには
+  // 欠けていることがある）だけが消える側から埋まり、両方にあるものは必ず残す側が勝つ
+  return { ...drop, ...keep, surfaceForms, links };
 }

@@ -213,3 +213,101 @@ test("unresolved のカードは expectCorrection の取り違えにも数えな
   assert.equal(dropped.correctionHit, 0, "正しい補正でもない");
   assert.equal(dropped.miscorrected, false, "だが誤補正でもない（表示していないため）");
 });
+
+// --- 再評価の指標（#40） --------------------------------------------------
+
+/**
+ * **unresolved 率だけを下げることを成功条件にしない。**
+ *
+ * 誤って何でも確定すれば unresolved 率は下がるので、昇格の数と**そのうち間違って
+ * いた数**を必ず対にして数える。再評価由来の誤補正を全体の `miscorrection` に
+ * 混ぜないのは、抽出段の誤補正に埋もれて見えなくなるため。
+ */
+const rematchCase = makeCase({
+  id: "rematch",
+  transcript: "えーびの話をしています。",
+  expectRematch: [{ from: "えーび", to: "AB" }],
+});
+
+test("再評価: 期待どおりの改名は正しい補正に数える", () => {
+  const score = scoreCase(rematchCase, [card("AB", "えーび")], 0, {
+    attempts: 1,
+    renames: [{ from: "えーび", to: "AB" }],
+  });
+  assert.equal(score.rematchPromoted, 1);
+  assert.equal(score.rematchCorrect, 1);
+  assert.equal(score.rematchMiscorrected, 0);
+  const metrics = aggregate([score]);
+  assert.equal(metrics.rematchPromotion, 1);
+  assert.equal(metrics.rematchMiscorrection, 0);
+});
+
+test("再評価: 期待と違う用語に着地したら誤補正に数える", () => {
+  const score = scoreCase(rematchCase, [card("ABC", "えーび")], 0, {
+    attempts: 1,
+    renames: [{ from: "えーび", to: "ABC" }],
+  });
+  assert.equal(score.rematchCorrect, 0);
+  assert.equal(score.rematchMiscorrected, 1);
+  assert.equal(aggregate([score]).rematchMiscorrection, 1);
+});
+
+/**
+ * **`from` と `to` の両方を見る。** `to` だけを見ると、別の未解決語がたまたま期待した
+ * 用語に着地した場合まで加点され、誤補正率が過小に出る（`expectCorrection` の採点が
+ * correctedFrom と term の両方を見るのと同じ理由）。
+ */
+test("再評価: 別の表記から期待どおりの用語に着地しても正解にしない", () => {
+  const score = scoreCase(rematchCase, [card("AB", "しーでぃ")], 0, {
+    attempts: 1,
+    renames: [{ from: "しーでぃ", to: "AB" }],
+  });
+  assert.equal(score.rematchCorrect, 0, "from が違えば別の話");
+  assert.equal(score.rematchMiscorrected, 1);
+});
+
+test("再評価: 突き合わせは normalizeTerm を通す", () => {
+  const score = scoreCase(rematchCase, [card("AB")], 0, {
+    attempts: 1,
+    renames: [{ from: "えーび", to: "ａｂ" }],
+  });
+  assert.equal(score.rematchCorrect, 1, "全角・大文字小文字の違いで取りこぼさない");
+});
+
+test("再評価: 試みたが昇格しなかった場合", () => {
+  const score = scoreCase(rematchCase, [card("エービ", "えーび", "unresolved")], 0, {
+    attempts: 2,
+    renames: [],
+  });
+  assert.equal(score.rematchAttempts, 2);
+  assert.equal(score.rematchPromoted, 0);
+  const metrics = aggregate([score]);
+  assert.equal(metrics.rematchPromotion, 0, "昇格していないので 0");
+  assert.equal(metrics.rematchMiscorrection, 0, "昇格が無ければ誤補正も無い");
+});
+
+/**
+ * **再評価が一度も走らなかったランを「昇格率 100%」にしない。**
+ *
+ * `ratio()` の「分母 0 は減点しない＝1」をそのまま使うと、機能が発火していない
+ * ことが満点として表示される。閾値を決めるための計測でこれをやると判断を誤る。
+ */
+test("再評価: 一度も走らなければ両方 0", () => {
+  const metrics = aggregate([scoreCase(base, [card("Kubernetes"), card("Pod")])]);
+  assert.equal(metrics.rematchPromotion, 0, "発火していないランを満点にしない");
+  assert.equal(metrics.rematchMiscorrection, 0);
+});
+
+test("再評価: 集計は分子分母の合算（ケース平均の平均にしない）", () => {
+  const good = scoreCase(rematchCase, [card("AB")], 0, {
+    attempts: 1,
+    renames: [{ from: "えーび", to: "AB" }],
+  });
+  const bad = scoreCase(rematchCase, [card("ABC")], 1, {
+    attempts: 3,
+    renames: [{ from: "えーび", to: "ABC" }],
+  });
+  const metrics = aggregate([good, bad]);
+  assert.equal(metrics.rematchPromotion, 2 / 4);
+  assert.equal(metrics.rematchMiscorrection, 1 / 2);
+});

@@ -94,9 +94,21 @@ export class Session {
       {
         onCards: (cards) => this.send({ type: "cards", cards }),
         // status は #24 で追加。検証の結果(confirmed / unresolved)をそのまま通す。
-        // 突き合わせは #38 から cardId(scheduler が採番した通番)をそのまま中継する
-        onCardUpdate: (cardId, status, description, links) =>
-          this.send({ type: "card_update", cardId, status, description, links }),
+        // 突き合わせは #38 から cardId(scheduler が採番した通番)をそのまま中継する。
+        //
+        // rename は #40 の再評価だけが渡す。**無いときはキーごと落とす** —
+        // `rename: undefined` を書いても JSON.stringify が消すので線上は同じだが、
+        // 送信メッセージにキーが在ることを前提にした受け手を将来作らせないため、
+        // 「付かない経路では存在しない」を送り側で明示しておく
+        onCardUpdate: (cardId, status, description, links, rename) =>
+          this.send({
+            type: "card_update",
+            cardId,
+            status,
+            description,
+            links,
+            ...(rename ? { rename } : {}),
+          }),
         onExtracting: () => this.send({ type: "status", state: "extracting" }),
         // permanent: 恒久エラーで抽出を打ち切ったときだけ scheduler から真が渡ってくる(#10)
         onError: (message, permanent) => this.send({ type: "error", code: "llm_error", message, permanent }),

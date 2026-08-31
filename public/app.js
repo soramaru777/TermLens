@@ -10,6 +10,7 @@ import {
   cardHeading,
   cardStatus,
   mergeCardUpdate,
+  mergeDuplicateCards,
   shouldApplyResend,
   UNRESOLVED_LABEL,
 } from "./card-status.js";
@@ -607,6 +608,36 @@ function registerIncoming(serverCardId, localId) {
 }
 
 /**
+ * 受信 ID の写像で `fromId` を指すエントリを**すべて** `toId` へ張り替える(#40)。
+ *
+ * **1つだけ直しても足りない。** 再接続でサーバーの採番は c1 から振り直されるので、
+ * 同じカードを指す serverCardId が複数溜まりうる(`addCard` の再送経路が貼り替える)。
+ * 統合で片方の localId が消えるとき、残った写像は**消えたカードを指したまま**になり、
+ * 以降の `card_update` が `cardData.get()` で undefined を引いて静かに捨てられる。
+ */
+function reassignIncomingCardId(fromId, toId) {
+  for (const [serverCardId, localId] of incomingCardId) {
+    if (localId === fromId) incomingCardId.set(serverCardId, toId);
+  }
+}
+
+/**
+ * ハイライトの持ち主で `fromId` を指すキーを**すべて** `toId` へ張り替える(#40)。
+ *
+ * `highlightOwner` は**追加専用**（`addHighlightTerm` は既存キーを上書きしない）で、
+ * 削除も付け替えも API が無かった。統合でカードが1枚消えると、そのカードが持っていた
+ * 表記のハイライトは**タップしても何も起きない**（`jumpToCard` が DOM を引けない）。
+ *
+ * **キーは変えないので正規表現は組み直さない。** 値だけの付け替えなので、
+ * `addHighlightTerm` が行う `highlightRe` の再構築は要らない。
+ */
+function reassignHighlightOwner(fromId, toId) {
+  for (const [form, owner] of highlightOwner) {
+    if (owner === fromId) highlightOwner.set(form, toId);
+  }
+}
+
+/**
  * ローカル ID から DOM のカード要素を引く(#38)。
  *
  * **検索をここ1箇所に集約する。** 各所で `[...cardsEl.children].find(...)` を書くと、
@@ -909,7 +940,58 @@ function addCard(card) {
   return localId;
 }
 
-function updateCard({ cardId, status, description, links }) {
+/**
+ * 改名で新しい term が既存カードと衝突したときの統合(#40)。**残す cardId を返す。**
+ *
+ * 統合ルール（どちらの cardId を残すか・surfaceForms / links をどう連結するか）は
+ * `mergeDuplicateCards()` に置いてある。ここが担うのは**その結果を3本の Map・
+ * ハイライト・選択状態・DOM に行き渡らせること**で、1つでも漏らすと
+ * 「例外は出ないがカードが迷子になる」形で壊れる。
+ *
+ * @param renamedId 改名されたカードのローカル ID（内容はこちらが正）
+ * @param otherId   同じ term を既に持っていたカードのローカル ID
+ */
+function mergeRenamedCard(renamedId, otherId) {
+  // **残すのは登場順が早いほう。** `cardData` は挿入順（＝登場順）を保つ Map なので、
+  // キーの並びがそのまま登場順になる。#38 の目的は ID の永続性で、既に画面に居て
+  // 人が固定しているかもしれないカードを消さない
+  const order = [...cardData.keys()];
+  const keepId = order.indexOf(otherId) < order.indexOf(renamedId) ? otherId : renamedId;
+  const dropId = keepId === renamedId ? otherId : renamedId;
+  const renamed = cardData.get(renamedId);
+  // 内容（term / reading / status / description / correctedFrom）は**再評価の結果**が正。
+  // 残す側が先に居た別カードなら、その ID を保ったまま中身だけ移す。
+  // links を写さないのは統合ルールで「残す側優先」だから（`mergeDuplicateCards`）
+  const keepBase =
+    keepId === renamedId
+      ? renamed
+      : {
+          ...cardData.get(keepId),
+          term: renamed.term,
+          reading: renamed.reading,
+          status: renamed.status,
+          description: renamed.description,
+          correctedFrom: renamed.correctedFrom,
+        };
+  const merged = mergeDuplicateCards(keepBase, cardData.get(dropId));
+  // cardId はカードの主キー。統合後も残す側のものであることを明示しておく
+  merged.cardId = keepId;
+  cardData.set(keepId, merged);
+  cardData.delete(dropId);
+  // 意味上の同一性も残す側へ寄せる。両方のキーを消してから貼り直す
+  termToCardId.set(merged.term, keepId);
+  reassignIncomingCardId(dropId, keepId);
+  reassignHighlightOwner(dropId, keepId);
+  findCardEl(dropId)?.remove();
+  // **固定中でも表示が飛ばないようにする。** `pinnedToCard` は真偽値なので付け替えは
+  // 要らないが、`activeCardId` が消えた DOM を指したままだと縦積みレイアウトで
+  // カードが1枚も表示されない画面になる
+  if (activeCardId === dropId) setActiveCard(keepId);
+  else renderCardNav(); // 件数が1枚減るので位置表示だけ更新する
+  return keepId;
+}
+
+function updateCard({ cardId, status, description, links, rename }) {
   // 受信 ID はサーバーの採番(`c\d+`)。ローカル ID へ写像してから引く(#38)。
   // 写像に無い ID は、このクライアントが持っていないカードへの更新なので黙って捨てる
   //
@@ -928,14 +1010,45 @@ function updateCard({ cardId, status, description, links }) {
   // Stage 2 に回り、今度は裏付けが取れることがある（LLM + web 検索なので非決定的）。
   // 昇格を許すと「特定できませんでした」が通常カードに戻り、見出しが surface form から
   // term に切り替わる。addCard の再送経路にも同じガードがあり、そちらと揃える。
-  // 畳み込みの判断は mergeCardUpdate() に集約する（不変条件を DOM 抜きで固定するため）
-  Object.assign(stored, mergeCardUpdate(stored, { status, description, links }));
+  // **例外は `rename` を伴う再評価だけ**（#40）。term が同時に届くので見出しと本文が
+  // 食い違わない。判断は mergeCardUpdate() に集約する（不変条件を DOM 抜きで固定するため）
+  const previousTerm = stored.term;
+  Object.assign(stored, mergeCardUpdate(stored, { status, description, links, rename }));
+
+  // 改名が実際に効いたときだけ、意味上の同一性とハイライトを張り替える（#40）。
+  // `rename` が来ても `mergeCardUpdate()` が据え置いた（＝term が動かなかった）場合まで
+  // Map を触ると、消したキーを貼り直すだけの無駄な往復になる
+  let targetId = localId;
+  if (stored.term !== previousTerm) {
+    // 旧 term のキーは必ず消す。残すと古い表記でカードが引かれ続け、
+    // 別の用語のカードが後から同じ localId を掴む
+    termToCardId.delete(previousTerm);
+    const otherId = termToCardId.get(stored.term);
+    if (otherId !== undefined && otherId !== localId && cardData.has(otherId)) {
+      // 同じ用語のカードが既にある。2枚並べずに統合する（統合ルールは
+      // mergeDuplicateCards() が持ち、Map / DOM への反映は mergeRenamedCard()）
+      targetId = mergeRenamedCard(localId, otherId);
+    } else {
+      termToCardId.set(stored.term, localId);
+    }
+    // **古い surface form のハイライトは消さない。** 文字起こし本文は崩れた表記のまま
+    // 残る（#40 は raw transcript を書き換えない）ので、消すと過去の行からカードへ
+    // 辿れなくなる。新しい表記を足すだけにする
+    const renamedCard = cardData.get(targetId);
+    addHighlightTerm(renamedCard.term, targetId);
+    addHighlightTerm(renamedCard.correctedFrom, targetId);
+    for (const form of renamedCard.surfaceForms ?? []) addHighlightTerm(form, targetId);
+    renderTranscript();
+  }
+
   scheduleSessionSave();
-  const div = findCardEl(localId);
+  const div = findCardEl(targetId);
   if (!div) return;
-  // 状態の判定はカード全体を渡して cardStatus() に任せる（`status` を直接読まない）
-  const card = stored;
-  // 検証の結果で見出しが変わりうる（probable → unresolved の降格で surface form になる）
+  // 状態の判定はカード全体を渡して cardStatus() に任せる（`status` を直接読まない）。
+  // **統合が起きると描く対象は別のカードになる**ので、message ではなく cardData から引く
+  const card = cardData.get(targetId);
+  // 検証の結果で見出しが変わりうる（probable → unresolved の降格で surface form になる、
+  // #40 の再評価で unresolved から確定した用語へ改名される）
   renderCardHead(div, card);
   div.querySelector(".desc").textContent = card.description;
 
@@ -951,7 +1064,9 @@ function updateCard({ cardId, status, description, links }) {
     div.append(linksEl);
   }
   linksEl.classList.remove("pending");
-  if (renderCardLinks(linksEl, links) === 0) linksEl.remove();
+  // **メッセージの links ではなく畳み込み後のカードから描く。** 統合では残す側の
+  // リンクが優先されるので、引数をそのまま描くと DOM と cardData がずれる
+  if (renderCardLinks(linksEl, card.links) === 0) linksEl.remove();
 }
 
 // ---- Markdown エクスポート ----

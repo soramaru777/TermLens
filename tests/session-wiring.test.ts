@@ -318,6 +318,70 @@ test("card_update は scheduler の cardId をそのまま中継する", async (
       links: [{ title: "公式", url: "https://example.com/" }],
     });
     assert.ok(!("term" in update), "term を載せると主キーが2本になる");
+    // **既存の3経路は `rename` を付けない**（#40）。付かないかぎりクライアントの
+    // #24 のガード（unresolved から戻さない）はそのまま効く
+    assert.ok(!("rename" in update), "改名しない経路に rename が載っている");
+  } finally {
+    h.restore();
+  }
+});
+
+/**
+ * 再評価の改名は WS まで透過する（#40）。
+ *
+ * **Session は中継するだけの層。** ここで落とすと、サーバーが昇格を決めたのに
+ * クライアントは `rename` の無い `card_update` として受け取り、#24 のガードが
+ * 正しく効いて**据え置かれる** — 例外も出ず、カードが直らないだけになる。
+ */
+test("card_update の rename をそのまま中継する", async () => {
+  const h = await harness();
+  try {
+    h.callbacks.onCardUpdate("c7", "confirmed", "検証後の解説。", [], {
+      term: "AB",
+      reading: "エービー",
+      correctedFrom: "えーび",
+      surfaceForms: ["えーび"],
+    });
+    const update = h.ws.sent.at(-1)!;
+    assert.deepEqual(update, {
+      type: "card_update",
+      cardId: "c7",
+      status: "confirmed",
+      description: "検証後の解説。",
+      links: [],
+      rename: {
+        term: "AB",
+        reading: "エービー",
+        correctedFrom: "えーび",
+        surfaceForms: ["えーび"],
+      },
+    });
+  } finally {
+    h.restore();
+  }
+});
+
+/**
+ * **改名は `cardId` を動かさない**（#38 の不変条件）。
+ *
+ * `rename` に cardId を混ぜる形にすると「改名で ID が変わる」経路が作れてしまい、
+ * クライアントの3本の Map が一斉に迷子になる。
+ */
+test("rename に cardId は載らない", async () => {
+  const h = await harness();
+  try {
+    h.callbacks.onCardUpdate("c7", "confirmed", "解説。", [], {
+      term: "AB",
+      reading: "エービー",
+      correctedFrom: null,
+      surfaceForms: [],
+    });
+    const update = h.ws.sent.at(-1) as unknown as {
+      cardId: string;
+      rename: Record<string, unknown>;
+    };
+    assert.equal(update.cardId, "c7", "更新対象の ID はトップレベルのまま");
+    assert.ok(!("cardId" in update.rename), "改名の中に識別子を持ち込まない");
   } finally {
     h.restore();
   }

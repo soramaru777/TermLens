@@ -176,5 +176,18 @@
     "forbidTerms": ["Kerberos", "ケルベロス", "Cerberus"],
     "expectUnresolved": ["ケルベロッサ"],
     "allowLowConfidence": ["ケルベロッサ", "開発サイクル", "スプリント"]
+  },
+  {
+    "id": "rematch-garbled-then-clear",
+    "transcript": "検索の基盤ですが、いらすちっくさぁちの設定を見直したいところです。運用チームは Elasticsearch のインデックス設計から確認したいと言っていました。",
+    "context": "ログの量が増えて検索が遅くなってきた、という話をしていました。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["Elasticsearch"],
+    "expectCorrection": {},
+    "forbidTerms": [],
+    "expectUnresolved": [],
+    "expectRematch": [{ "from": "いらすちっくさぁち", "to": "Elasticsearch" }],
+    "allowLowConfidence": ["いらすちっくさぁち", "インデックス", "全文検索", "検索基盤"]
   }
 ]

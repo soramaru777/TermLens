@@ -120,3 +120,58 @@ test("cardId は Markdown に現れない", () => {
   assert.ok(!out.includes("k2"), "cardId がエクスポートに漏れている");
   assert.ok(!/cardId/i.test(out), "cardId のラベルが出ている");
 });
+
+/**
+ * 再評価で改名したカードは、**改名後の内容**で書き出される（#40 の AC）。
+ *
+ * `mergeCardUpdate()` が畳み込んだカードがそのまま `cardData` に載り、エクスポートは
+ * その配列を読む。ここが古い内容のままだと、画面には直ったカードが出ているのに
+ * **持ち出した Markdown だけ「特定できませんでした」のまま**になる
+ * （画面とエクスポートが食い違う #24 の失敗の再来）。
+ */
+test("再評価で改名したカードは改名後の内容で出る", () => {
+  const out = md([
+    {
+      cardId: "k1",
+      term: "AB",
+      reading: "エービー",
+      status: "confirmed",
+      // 昇格前に聞き取られていた表記はそのまま残る
+      correctedFrom: "えーび",
+      surfaceForms: ["えーび"],
+      description: "検証で裏付けの取れた解説。",
+      links: [{ title: "公式", url: "https://ab.test/" }],
+    },
+  ]);
+  assert.ok(out.includes("## AB（エービー）"), out);
+  assert.ok(!out.includes("※"), "昇格したカードに注記は付かない");
+  assert.ok(
+    out.includes("音声認識では「えーび」と聞き取られた語です。"),
+    "元の表記も残す（どのカードが直ったのか読み手が辿れる）",
+  );
+  assert.ok(out.includes("検証で裏付けの取れた解説。"), "解説も差し替わっている");
+  assert.ok(out.includes("[公式](https://ab.test/)"), "リンクも出る");
+});
+
+/**
+ * 昇格しなかったカードは据え置かれたまま出る。
+ *
+ * 裏付けが取れなければ `card_update` そのものが飛ばないので、カードは
+ * unresolved のまま。エクスポートも「特定できませんでした」のままであるべき
+ * （unresolved 率だけを下げないという方針が、ここでも一貫している）。
+ */
+test("裏付けが取れなかったカードは unresolved の表記のまま出る", () => {
+  const out = md([
+    {
+      cardId: "k1",
+      term: "エービ",
+      reading: "エービ",
+      status: "unresolved",
+      correctedFrom: "えーび",
+      surfaceForms: ["えーび"],
+      description: "音声認識の表記から正しい用語を特定できませんでした。",
+    },
+  ]);
+  assert.ok(out.includes("## えーび ※用語を特定できませんでした"), out);
+  assert.ok(!out.includes("エービ）"), "特定できなかった推定の読みは出さない");
+});
