@@ -158,6 +158,68 @@ test("MAX_CANDIDATES で切る（検証段への入力を小さく保つ）", ()
   );
 });
 
+/**
+ * **手がかりには必ず1枠を空ける。**
+ *
+ * 単純に `[...stored, ...hints]` を上限で切ると、`stored` が上限ぶん埋まっている場合に
+ * 手がかりが1件も入らない。しかも `unresolved` になるのはまさに「抽出段が候補の間で
+ * 決めきれなかった」カードなので、**候補が埋まっている確率が最も高いのが再評価の
+ * 主要ケース**という噛み合わせになる。`parseVerifyOutput()` は候補集合の外から
+ * `chosen` を返さないため、そうなると後続文脈でどれだけ強く裏付けられても
+ * `isResolved()` が真にならず、**昇格経路が例外もログも無しに無効化される**。
+ */
+test("保存済み候補が上限まで埋まっていても、手がかりは必ず入る", () => {
+  const merged = mergeCandidates(
+    [candidate("Alfa"), candidate("Bravo"), candidate("Charlie")],
+    [candidate("Delta")],
+  );
+  assert.equal(merged.length, MAX_CANDIDATES, "上限は超えない");
+  assert.ok(
+    merged.some((c) => c.term === "Delta"),
+    "手がかりが1件も入っていない（再評価が発火しなくなる）",
+  );
+  assert.deepEqual(
+    merged.map((c) => c.term),
+    ["Alfa", "Bravo", "Delta"],
+    "確からしい順の下位を1件譲る（先頭は保つ）",
+  );
+});
+
+/** 空ける枠は1つだけ。手がかりを優先しすぎると抽出段の確からしい候補を押し出す。 */
+test("手がかりが複数でも保存済み候補を押し出しすぎない", () => {
+  const merged = mergeCandidates(
+    [candidate("Alfa"), candidate("Bravo"), candidate("Charlie")],
+    [candidate("Delta"), candidate("Echo")],
+  );
+  assert.deepEqual(
+    merged.map((c) => c.term),
+    ["Alfa", "Bravo", "Delta"],
+    "手がかりに2枠以上を渡していない",
+  );
+});
+
+/** 手がかりが無ければ枠を空けない（余らせると検証の材料が減るだけ）。 */
+test("手がかりが無ければ保存済み候補で上限まで埋める", () => {
+  const merged = mergeCandidates(
+    [candidate("Alfa"), candidate("Bravo"), candidate("Charlie")],
+    [],
+  );
+  assert.deepEqual(merged.map((c) => c.term), ["Alfa", "Bravo", "Charlie"]);
+});
+
+/** 重複で手がかりが消えたなら枠を空ける理由も消える。埋め戻して枠を無駄にしない。 */
+test("手がかりが保存済みと重複したら枠は埋め戻す", () => {
+  const merged = mergeCandidates(
+    [candidate("Alfa"), candidate("Bravo"), candidate("Charlie")],
+    [candidate("ＡＬＦＡ")],
+  );
+  assert.deepEqual(
+    merged.map((c) => c.term),
+    ["Alfa", "Bravo", "Charlie"],
+    "重複で消えた手がかりのために枠を空けたままにしている",
+  );
+});
+
 test("重複は normalizeTerm で落とす（同じ用語が枠を2つ食わない）", () => {
   const merged = mergeCandidates([candidate("Alfa")], [candidate("ＡＬＦＡ"), candidate("Bravo")]);
   assert.deepEqual(merged.map((c) => c.term), ["Alfa", "Bravo"]);

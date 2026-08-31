@@ -119,17 +119,6 @@ export function isRelated(
 }
 
 /**
- * 保存済みの候補に、後から確定した用語を足して検証段への入力を組み立てる(#40)。
- *
- * **足す用語は「既に検証を通ったカードの term」**であって、検証段がゼロから作る用語では
- * ない。#23 の「検証段が候補外の用語を勝手に生成しない」というガードは
- * `parseVerifyOutput()` 側にそのまま残る — あちらは*ここで渡した候補集合*の中からしか
- * `chosen` を返さない。
- *
- * 保存済み候補を**先頭に保つ**のは、抽出段が確からしい順に並べたものだから。
- * 突き合わせは `normalizeTerm()` で、`MAX_CANDIDATES` 件で切る。
- */
-/**
  * 合成した候補に付ける根拠。モデルには「後から確定した用語」であることを伝える。
  *
  * **`mergeCandidates()` と同じファイルに置く。** 本番と評価ハーネスの両方が候補を
@@ -137,18 +126,60 @@ export function isRelated(
  */
 export const REMATCH_RATIONALE = "後続の会話で確定した用語と表記が近い";
 
+/**
+ * 保存済みの候補に、後から確定した用語を足して検証段への入力を組み立てる(#40)。
+ *
+ * **足す用語は「速報段階で確定したカードの term」**であって、検証段がゼロから作る用語では
+ * ない。#23 の「検証段が候補外の用語を勝手に生成しない」というガードは
+ * `parseVerifyOutput()` 側にそのまま残る — あちらは*ここで渡した候補集合*の中からしか
+ * `chosen` を返さない。
+ *
+ * 保存済み候補を**先頭に保つ**のは、抽出段が確からしい順に並べたものだから。
+ * 突き合わせは `normalizeTerm()` で、`MAX_CANDIDATES` 件で切る。
+ *
+ * **ただし手がかりには必ず1枠を空ける。** 単純に `[...stored, ...hints]` を上限で切ると、
+ * `stored` が上限ぶん埋まっている場合に**手がかりが1件も入らない**。しかも
+ * `unresolved` になるのはまさに「抽出段が候補の間で決めきれなかった」カードなので、
+ * **候補が埋まっている確率が最も高いのが再評価の主要ケース**という噛み合わせになる。
+ * `parseVerifyOutput()` は候補集合の外から `chosen` を返さないので、そうなると
+ * 後続文脈でどれだけ強く裏付けられても `isResolved()` が真にならず、
+ * **昇格経路が例外もログも無しに無効化される**。
+ *
+ * 空けるのは1枠だけ。手がかりを優先しすぎると、抽出段が確からしい順に並べた候補
+ * （正解がここに居ることも多い）を押し出してしまう。余った枠は `stored` の残りで
+ * 埋め戻すので、枠は無駄にならない。
+ */
 export function mergeCandidates(
   stored: Candidate[],
   hints: Candidate[],
   limit = MAX_CANDIDATES,
 ): Candidate[] {
-  const merged: Candidate[] = [];
   const seen = new Set<string>();
-  for (const candidate of [...stored, ...hints]) {
+  // 空文字と重複を先に落とす。**stored を先に通す**ので、同じ用語が両方にあれば
+  // 抽出段側の表記が残り、手がかりは枠を消費しない
+  const dedupe = (list: Candidate[]): Candidate[] => {
+    const out: Candidate[] = [];
+    for (const candidate of list) {
+      const key = normalizeTerm(candidate.term);
+      if (key === "" || seen.has(key)) continue;
+      seen.add(key);
+      out.push(candidate);
+    }
+    return out;
+  };
+  const uniqueStored = dedupe(stored);
+  const uniqueHints = dedupe(hints);
+  // 手がかりが1件でもあるなら、その枠を stored から取り上げる
+  const reserve = Math.min(uniqueHints.length, 1);
+  const storedTaken = Math.min(uniqueStored.length, Math.max(0, limit - reserve));
+  const merged = uniqueStored.slice(0, storedTaken);
+  for (const hint of uniqueHints) {
     if (merged.length >= limit) break;
-    const key = normalizeTerm(candidate.term);
-    if (key === "" || seen.has(key)) continue;
-    seen.add(key);
+    merged.push(hint);
+  }
+  // 手がかりが少なくて枠が余ったら stored の残りで埋め戻す
+  for (const candidate of uniqueStored.slice(storedTaken)) {
+    if (merged.length >= limit) break;
     merged.push(candidate);
   }
   return merged;
