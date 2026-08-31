@@ -363,13 +363,192 @@ test("再接続時の shownTerms は cardId ではなく term を送る", () => 
 test("card_update は cardId から引き当てる（term では引かない）", () => {
   assert.match(
     CODE,
-    /function updateCard\(\{ cardId, status, description, links \}\)/,
-    "updateCard がまだ term を受け取っている",
+    /function updateCard\(\{ cardId, status, description, links, rename \}\)/,
+    "updateCard の受け取るペイロードが変わっている（#40 の rename を含む）",
   );
   const update = fnBody("updateCard");
   assert.match(update, /incomingCardId\.get\(cardId\)/, "受信 ID を写像していない");
-  assert.doesNotMatch(update, /termToCardId/, "更新経路が term を見ている");
-  assert.doesNotMatch(update, /\.term\b/, "更新経路が term を見ている");
+  // **カードを引くのは今も cardId だけ。** #40 で term を触るようになったが、それは
+  // 「改名後の意味上の同一性を貼り直す」ためで、**更新対象を探すのには使わない**。
+  // 引き当てに term が混じると、同じ term のカードが2枚あるときに取り違える（#38）
+  assert.doesNotMatch(
+    update,
+    /termToCardId\.get\(\s*(cardId|previousTerm)\b/,
+    "更新対象を term で引いている",
+  );
+  assert.doesNotMatch(update, /cardData\.get\((?!localId|targetId)/, "cardData を ID 以外で引いている");
+});
+
+/**
+ * 改名の適用（#40）。
+ *
+ * **`termToCardId` は delete と set の両方が要る。** 旧 term のキーを消し忘れると、
+ * 古い表記でカードが引かれ続け、後から出た別の用語のカードが同じローカル ID を掴む。
+ * set を忘れると、改名後のカードが**デデュープから外れて2枚目が生える**。
+ * どちらも例外は出ないので、配線として固定しておく。
+ */
+test("改名は termToCardId を旧 term から新 term へ張り替える", () => {
+  const update = fnBody("updateCard");
+  assert.match(update, /termToCardId\.delete\(previousTerm\)/, "旧 term のキーを消していない");
+  assert.match(update, /termToCardId\.set\(stored\.term, localId\)/, "新 term のキーを貼っていない");
+  // 改名が実際に効いたときだけ張り替える（据え置かれた更新で Map を触らない）
+  assert.match(update, /stored\.term !== previousTerm/, "改名の有無を見ていない");
+});
+
+/**
+ * 統合で消える側を指す**すべての**参照を張り替える（#40）。
+ *
+ * `incomingCardId` は再接続のたびにエントリが増えるので、同じカードを指す serverCardId は
+ * 複数ありうる。1つだけ直すと以降の `card_update` が消えたカードを引いて静かに捨てられる。
+ * `highlightOwner` は追加専用で削除 API が無かったため、付け替え関数を新設している。
+ */
+test("統合は受信 ID の写像とハイライトの持ち主を張り替える", () => {
+  const merge = fnBody("mergeRenamedCard");
+  assert.match(merge, /reassignIncomingCardId\(dropId, keepId\)/, "受信 ID を張り替えていない");
+  assert.match(merge, /reassignHighlightOwner\(dropId, keepId\)/, "ハイライトを張り替えていない");
+  // **全件走査であることまで見る。** 1件だけ直す実装に戻しても例外は出ない
+  assert.match(
+    fnBody("reassignIncomingCardId"),
+    /for \(const \[serverCardId, localId\] of incomingCardId\)/,
+    "受信 ID の張り替えが全件走査になっていない",
+  );
+  assert.match(
+    fnBody("reassignHighlightOwner"),
+    /for \(const \[form, owner\] of highlightOwner\)/,
+    "ハイライトの張り替えが全件走査になっていない",
+  );
+});
+
+/**
+ * 統合で表示が飛ばないこと（#40）。
+ *
+ * `activeCardId` が消えた DOM を指したままだと、縦積みレイアウト（`.active` の1枚だけを
+ * CSS で見せる）で**カードが1枚も表示されない画面**になる。固定中（`pinnedToCard`）でも
+ * 同じで、こちらは真偽値なので付け替えは要らないが active を移さないと同じ結末になる。
+ */
+test("統合は active カードと件数表示を引き継ぐ", () => {
+  const merge = fnBody("mergeRenamedCard");
+  assert.match(merge, /activeCardId === dropId/, "消える側を指していないか見ていない");
+  assert.match(merge, /setActiveCard\(keepId\)/, "残す側へ移していない");
+  assert.match(merge, /renderCardNav\(\)/, "件数が減ったことを反映していない");
+  // 消える側の DOM を残すと、同じ用語のカードが2枚並んだままになる
+  assert.match(merge, /findCardEl\(dropId\)\?\.remove\(\)/, "消える側の DOM を除去していない");
+});
+
+/**
+ * **統合を起動する側**を固定する（#40）。
+ *
+ * `mergeRenamedCard()` の中身をいくら固めても、`updateCard()` が呼ばなくなれば統合は
+ * 丸ごと止まる。しかもその壊れ方は**例外もテスト失敗も出さない** — 同じ用語のカードが
+ * 2枚並ぶだけで、画面を見ないと分からない。実際、衝突判定の条件を潰しても
+ * `mergeRenamedCard` の中身を見るテストは全部緑のままだった。
+ *
+ * 固定するのは3つ: (1) 改名が効いたときだけ張り替えに入る (2) 同じ term の別カードを
+ * 探す (3) 見つかったら統合し、その戻り値を以後の対象にする。
+ */
+test("改名で term が衝突したら統合を起動する", () => {
+  const update = fnBody("updateCard");
+  // 改名が効かなかった（据え置かれた）ときに Map を触らない条件
+  assert.match(update, /stored\.term !== previousTerm/, "改名が効いたかを見ていない");
+  // 同じ term を既に持つカードを探す
+  assert.match(
+    update,
+    /const otherId = termToCardId\.get\(stored\.term\)/,
+    "衝突相手を探していない",
+  );
+  // 自分自身・消えたカードを掴まないためのガードごと固定する。
+  // **`if (` から始めて見る。** 部分一致で書くと `if (false && otherId !== ...)` の
+  // ように**条件を丸ごと殺した書き換え**が素通りする（実際に取り逃がした）
+  assert.match(
+    update,
+    /if \(otherId !== undefined && otherId !== localId && cardData\.has\(otherId\)\) \{/,
+    "衝突判定のガードが変わっている（条件が無効化されていないか）",
+  );
+  // 統合を実際に呼び、**戻り値を以後の対象にする**（描画対象が別カードに移るため）
+  assert.match(
+    update,
+    /targetId = mergeRenamedCard\(localId, otherId\)/,
+    "統合を呼んでいない、または戻り値を使っていない",
+  );
+  // 衝突しなかった側の分岐も固定する。ここを消すと新しい term でカードを引けなくなる
+  assert.match(update, /termToCardId\.set\(stored\.term, localId\)/, "新しい term を貼っていない");
+});
+
+/**
+ * **どちらの cardId を残すか**は設計の中心決定なので式ごと固定する（#40）。
+ *
+ * 「登場順が早いほう」を選ぶのは、#38 の目的が ID の永続性だから — 既に画面に居て人が
+ * 固定しているかもしれないカードを消さない。`<` を `>` にしても落ちるテストが無い状態
+ * だったが、逆にすると**人が見ていたカードのほうが消える**。
+ */
+test("統合で残すのは登場順が早いカードの ID", () => {
+  const merge = fnBody("mergeRenamedCard");
+  // 登場順は cardData の挿入順。別の順序（例: term の辞書順）に変えられていないか
+  assert.match(merge, /const order = \[\.\.\.cardData\.keys\(\)\]/, "登場順を挿入順から採っていない");
+  assert.match(
+    merge,
+    /order\.indexOf\(otherId\) < order\.indexOf\(renamedId\) \? otherId : renamedId/,
+    "残す側の選び方が変わっている（早い順ではなくなっている）",
+  );
+  assert.match(
+    merge,
+    /const dropId = keepId === renamedId \? otherId : renamedId/,
+    "消す側が残す側の裏返しになっていない",
+  );
+  // 統合結果を残す側の ID で置き、消す側を落とす。片方だけだとカードが2枚残るか消える
+  assert.match(merge, /cardData\.set\(keepId, merged\)/, "統合結果を残す側へ書いていない");
+  assert.match(merge, /cardData\.delete\(dropId\)/, "消す側を cardData から落としていない");
+  assert.match(
+    merge,
+    /termToCardId\.set\(merged\.term, keepId\)/,
+    "意味上の同一性を残す側へ寄せていない",
+  );
+});
+
+/**
+ * 統合ルールそのものは純関数に委ねる（#40）。
+ *
+ * `mergeDuplicateCards()` を通さずに `cardData.set(keepId, {...})` を手で書くと、
+ * surfaceForms と links の統合ルールが app.js 側に散り、**テストで固定した規則と
+ * 実際の挙動が別になる**（`mergeCardUpdate()` を集約したのと同じ理由）。
+ */
+test("統合の中身は mergeDuplicateCards() に委譲する", () => {
+  assert.match(
+    fnBody("mergeRenamedCard"),
+    /mergeDuplicateCards\(keepBase, cardData\.get\(dropId\)\)/,
+    "統合ルールを app.js に書き下している",
+  );
+  assert.match(APP, /mergeDuplicateCards,/, "card-status.js から import していない");
+});
+
+/**
+ * 古い surface form のハイライトを消さない（#40）。
+ *
+ * 文字起こし本文は崩れた表記のまま残る（この Issue は raw transcript を書き換えない）。
+ * ハイライトを置き換えると、**過去の行からカードへ辿れなくなる**。
+ */
+test("改名は新しい表記を足すだけで、古いハイライトを消さない", () => {
+  const update = fnBody("updateCard");
+  assert.match(update, /addHighlightTerm\(renamedCard\.term, targetId\)/);
+  assert.match(update, /addHighlightTerm\(renamedCard\.correctedFrom, targetId\)/);
+  assert.match(update, /addHighlightTerm\(form, targetId\)/);
+  // 削除・クリアの経路を作らない（highlightOwner は追加と付け替えだけ）
+  assert.doesNotMatch(CODE, /highlightOwner\.delete\(/, "ハイライトを消す経路ができている");
+});
+
+/**
+ * **raw transcript は書き換えない**（#40 の AC）。
+ *
+ * 用語カードを直しても文字起こし本文の ASR 結果には触らない。`finalLines` を書き換える
+ * 経路が増えていないことを、**要素への代入が1箇所も無い**ことで固定する。
+ */
+test("カードの更新経路は finalLines を書き換えない", () => {
+  for (const fn of ["updateCard", "mergeRenamedCard"]) {
+    assert.doesNotMatch(fnBody(fn), /finalLines/, `${fn} が文字起こし本文に触っている`);
+  }
+  // 行のテキストを後から差し替える経路そのものが無い（push と切り詰めだけ）
+  assert.doesNotMatch(CODE, /finalLines\[[^\]]*\]\.text\s*=/, "文字起こし本文を書き換えている");
+  assert.doesNotMatch(CODE, /\.text = .*card\./, "カードの内容を文字起こし本文へ書き戻している");
 });
 
 test("カード DOM の参照は cardId ベースで、検索は findCardEl に集約する", () => {
@@ -385,7 +564,8 @@ test("カード DOM の参照は cardId ベースで、検索は findCardEl に�
   for (const arg of CODE.match(/findCardEl\(([^)]*)\)/g) ?? []) {
     assert.match(
       arg,
-      /findCardEl\((cardId|localId|existingId)\)/,
+      // targetId / dropId は #40 の統合経路。どちらもローカル ID
+      /findCardEl\((cardId|localId|existingId|targetId|dropId)\)/,
       `findCardEl にローカル ID 以外を渡している: ${arg}`,
     );
   }

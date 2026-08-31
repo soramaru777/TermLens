@@ -28,6 +28,39 @@ function intEnv(name: string, fallback: number): number {
   return value;
 }
 
+/**
+ * 0..1 の実数ノブを読む(#40)。
+ *
+ * `intEnv` と分けてあるのは、**類似度の閾値だけは小数でなければ意味が無い**ため
+ * (0.5 を整数に丸めると 0 か 1 にしかならず、絞り込みが「素通し」か「完全一致のみ」の
+ * 二択になる)。範囲を見るのは `intEnv` と同じ理由 — `REMATCH_MIN_SIMILARITY=5` は
+ * どの語も通さない設定として黙って効き、**再評価が一度も発火しないまま静かに死ぬ**。
+ * 0 は「絞り込みなし」として意味を持つので許す(分布計測用。`MAX_WEB_SEARCHES=0` と同じ)。
+ */
+function ratioEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${name} must be a number between 0 and 1, got: ${raw}`);
+  }
+  return value;
+}
+
+/**
+ * 0 以上の整数ノブを読む(#40)。
+ *
+ * `intEnv` と分けてあるのは、**負値が「無効化」として黙って効いてしまう**ノブがあるため。
+ * `REMATCH_COOLDOWN_MS=-1` は `now - lastAttemptAt < -1` が常に false になるので
+ * cooldown が丸ごと外れるが、エラーも警告も出ない。`ratioEnv` だけ範囲を見て
+ * こちらが素通しなのは非対称なので、上限の意味を持つノブは入口で弾く。
+ */
+function nonNegativeIntEnv(name: string, fallback: number): number {
+  const value = intEnv(name, fallback);
+  if (value < 0) throw new Error(`${name} must be 0 or greater, got: ${value}`);
+  return value;
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 8080),
   authToken: process.env.AUTH_TOKEN ?? "",
@@ -39,6 +72,18 @@ export const config = {
   // 1カードの検証で許す web 検索の回数(#25)。0 以下なら上限なし。
   // **値の決め方は `extract/enrich.ts` の `MAX_WEB_SEARCHES` のコメントに一本化**
   maxWebSearches: intEnv("MAX_WEB_SEARCHES", 5),
+  // --- unresolved カードの再評価(#40) ---------------------------------------
+  // **3つとも暫定値で、根拠は「まだ測っていない」。** 決め方は `MAX_WEB_SEARCHES` と
+  // 同じ手順で、`REMATCH_MIN_SIMILARITY=0` の**絞り込みなし**で分布を測ってから人が
+  // 決める(上限を入れたまま測ると、上限値を決めるための分布を上限が壊す)。
+  // 値の意味は `extract/rematch.ts` と `extract/scheduler.ts` のコメントに一本化。
+  //
+  // 再評価に回す候補を絞る類似度の下限。**0 なら絞り込みなし**(分布計測用)
+  rematchMinSimilarity: ratioEnv("REMATCH_MIN_SIMILARITY", 0.5),
+  // 同じ unresolved カードを再評価する最大回数。0 なら再評価しない
+  maxRematchAttempts: nonNegativeIntEnv("MAX_REMATCH_ATTEMPTS", 2),
+  // 同じ unresolved カードを続けて再評価するまでの待ち時間(ミリ秒)。0 なら待たない
+  rematchCooldownMs: nonNegativeIntEnv("REMATCH_COOLDOWN_MS", 30_000),
 };
 
 if (!config.authToken) {

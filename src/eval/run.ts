@@ -7,6 +7,7 @@ import { config as appConfig } from "../config.js";
 import type { ExtractedCard } from "../extract/schema.js";
 // 依存ゼロのモジュール。`enrich.js` から取ると既定モードでも `new OpenAI()` が走る
 import { REJECTION_KINDS, REJECTION_LABEL, type RejectionKind } from "../extract/rejection.js";
+import { normalizeTerm } from "../extract/normalize.js";
 import { loadCases, type TermCase } from "./cases.js";
 import {
   aggregate,
@@ -16,6 +17,7 @@ import {
   type CaseScore,
   type EvaluatedCard,
   type Metrics,
+  type RematchOutcome,
 } from "./metrics.js";
 
 /**
@@ -137,6 +139,8 @@ export interface EvalReport {
   model: string;
   /** そのランで実際に効いていた web 検索の上限(#25)。0 なら上限なし */
   maxWebSearches: number;
+  /** そのランで実際に効いていた再評価の絞り込み閾値(#40)。0 なら絞り込みなし */
+  rematchMinSimilarity: number;
   config: EvalConfig;
   /** 投入したジョブ数（ケース数 × 試行回数） */
   totalJobs: number;
@@ -172,11 +176,23 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
   return results;
 }
 
+/**
+ * 検証パスの結果。カード集合だけでなく**再評価が何をしたか**も返す(#40)。
+ *
+ * 昇格したカードは普通の confirmed カードとして出てくるので、カード集合を見ても
+ * 「もともと unresolved だったが再評価で直った」ことは分からない。回した側が
+ * 記録して渡すしかない。
+ */
+interface VerifyOutcome {
+  cards: ExtractedCard[];
+  rematch: RematchOutcome;
+}
+
 type Verifier = (
   cards: ExtractedCard[],
   context: string,
   glossary: string[],
-) => Promise<ExtractedCard[]>;
+) => Promise<VerifyOutcome>;
 
 /** 検証が何をしたかの内訳。指標だけ見ても過剰棄却か正しい修正かが分からないため別に数える */
 export interface VerifyTally {
@@ -199,10 +215,24 @@ export interface VerifyTally {
   /** 検証の呼び出し自体が失敗し、判断保留にしたカード数 */
   failed: number;
   /**
+   * 再評価(#40)で追加した検証の呼び出し回数。**`checked` とは別に数える。**
+   *
+   * この Issue の運用コストは「現状の Stage 2 呼び出し数に対する増分」で、それは
+   * `checked` に混ぜたら読めない。人が想定（数％〜十数％）と照合するための数字。
+   */
+  rematchChecked: number;
+  /**
    * web 検索の実行回数の合計(#25)。**`MAX_WEB_SEARCHES` の値を人が決めるための材料。**
    * `checked` で割れば1カードあたりの平均になる。
+   *
+   * **再評価(#40)の検索はここに混ぜない。** 混ぜると分母(`checked`)に対応しない回数が
+   * 入り、上限値を決めるための平均が水増しされる。
    */
   searches: number;
+  /** 再評価(#40)で走った web 検索の回数。`rematchChecked` で割れば1件あたりの平均 */
+  rematchSearches: number;
+  /** 再評価(#40)の検証呼び出しが失敗した件数。`failed`(Stage 2 の分)とは別に数える */
+  rematchFailed: number;
 }
 
 /**
@@ -242,6 +272,18 @@ async function createVerifier(allowRename: boolean): Promise<{
   const { isVerified, verifyAndEnrich } = await import("../extract/enrich.js");
   const { selectVerifyTargets } = await import("../extract/scheduler.js");
   const { buildGlossaryIndex, relatedGlossary } = await import("../extract/glossary.js");
+  // 依存ゼロのモジュール。本番と同じ述語を使う（コピーすると評価だけ古い判定で緑になる）。
+  // **`hintForms` もここから採る** — 表記の集め方を書き写していた頃は、本番側から
+  // `correctedFrom` を落としても評価が緑のままだった
+  const {
+    hintForms,
+    isRelated,
+    isRename,
+    isResolved,
+    mergeCandidates,
+    pickCandidate,
+    REMATCH_RATIONALE,
+  } = await import("../extract/rematch.js");
   const tally: VerifyTally = {
     checked: 0,
     rejected: Object.fromEntries(REJECTION_KINDS.map((k) => [k, 0])) as Record<
@@ -251,6 +293,9 @@ async function createVerifier(allowRename: boolean): Promise<{
     replaced: 0,
     failed: 0,
     searches: 0,
+    rematchChecked: 0,
+    rematchSearches: 0,
+    rematchFailed: 0,
   };
 
   const verify: Verifier = async (cards, context, glossary) => {
@@ -297,8 +342,112 @@ async function createVerifier(allowRename: boolean): Promise<{
         return card;
       }
     });
-    return verified.filter((c): c is ExtractedCard => c !== null);
+    const settled = verified.filter((c): c is ExtractedCard => c !== null);
+    // **再評価の対象は「抽出段が unresolved にしたカード」だけ**(#40)。本番の
+    // `pendingUnresolved` に積まれるのは `run()` の抽出結果で、`enrichCard()` が
+    // Stage 2 で降格させたカードは積まれない。`settled`(降格後)を渡すと、**直前に
+    // 棄却されたカードをほぼ同じ候補で再検証する**ことになり、本番に存在しない母集団の
+    // 数字が `rematchChecked` / 昇格率 / 誤補正率に混ざる（人が閾値と増分コストを
+    // 決める前提が崩れる）。eval の課金も無駄に増える。
+    const extractedUnresolved = new Set(
+      cards.filter((c) => c.status === "unresolved").map((c) => normalizeTerm(c.term)),
+    );
+    const rematched = await rematchPass(settled, extractedUnresolved, context, glossaryIndex);
+    return { cards: rematched.cards, rematch: rematched.rematch };
   };
+
+  /**
+   * unresolved に落ちたカードを、同じ回で確定したカードを手がかりに再評価する(#40)。
+   *
+   * **本番と同じ述語（`isRelated` / `mergeCandidates` / `isResolved`）を使う。** ここに
+   * 判定をコピーすると、本番の閾値を変えたときに評価だけ古い条件のまま緑になる。
+   *
+   * **本番と違うのはトリガの時間差だけ。** 本番は「後続のチャンクで確定したカード」を
+   * 手がかりにするのに対し、ハーネスは1ケース＝1チャンクなので同じ回の確定カードを
+   * 手がかりにする。ハーネスの構造上ここは作れない（ケースが持つのは1つの
+   * `transcript` だけ）。したがってここで測れるのは**再評価の判断の質**
+   * （正しく昇格したか / 誤って昇格したか）であって、**発火頻度ではない**。
+   * 実際に会議中に発火するかは実機で見るしかない。
+   *
+   * **母集団は本番に合わせる。** 対象は `extractedUnresolved`（抽出段が unresolved に
+   * したカード）に限る。Stage 2 が降格させたカードまで含めると、本番の
+   * `pendingUnresolved` に存在しないものを測ることになる。
+   *
+   * **本番のコスト上限（1 run あたりの件数・cooldown・試行回数）は掛けない。** あれらは
+   * 会議中の課金を有界にするための仕掛けで、評価は逆に「どれだけ発火しうるか」の分布を
+   * 見るために回す。上限を入れたまま測ると、上限値を決めるための分布を上限が壊す
+   * （`MAX_WEB_SEARCHES` と同じ理由）。`REMATCH_MIN_SIMILARITY=0` にすれば絞り込みも外れる。
+   *
+   * **昇格は本番と同じくカード集合に反映する。** 本番の再評価は `rename` つきの
+   * `card_update` で実際に改名するので、`allowRename`（Stage 2 の探索モード）とは違い
+   * これは本番の挙動そのもの。反映しないと Recall も誤補正率も動かず、
+   * 「再評価を入れて全体の指標がどうなったか」が測れない。
+   */
+  async function rematchPass(
+    cards: ExtractedCard[],
+    extractedUnresolved: Set<string>,
+    context: string,
+    glossaryIndex: ReturnType<typeof buildGlossaryIndex>,
+  ): Promise<{ cards: ExtractedCard[]; rematch: RematchOutcome }> {
+    const hints = cards.filter((c) => c.status !== "unresolved");
+    // 本番の `pendingUnresolved` と同じ母集団に揃える。Stage 2 が降格させたカードは
+    // 本番では積まれないので、ここでも対象にしない
+    const pending = cards.filter(
+      (c) => c.status === "unresolved" && extractedUnresolved.has(normalizeTerm(c.term)),
+    );
+    const rematch: RematchOutcome = { attempts: 0, renames: [] };
+    if (hints.length === 0 || pending.length === 0) return { cards, rematch };
+
+    const promoted = new Map<ExtractedCard, ExtractedCard>();
+    await mapLimit(pending, VERIFY_CONCURRENCY, async (card) => {
+      const related = hints.filter((h) =>
+        isRelated(hintForms(card), hintForms(h), appConfig.rematchMinSimilarity),
+      );
+      if (related.length === 0) return;
+      const candidates = mergeCandidates(
+        card.candidates,
+        related.map((h) => ({ term: h.term, reading: h.reading, rationale: REMATCH_RATIONALE })),
+      );
+      // `from` は本番が `correctedFrom` に載せる表記と同じ優先順で採る。ケース側の
+      // `expectRematch.from`（聞き取られた表記）と同じ土俵に揃えるため
+      const from = card.correctedFrom ?? card.surfaceForms[0] ?? card.term;
+      rematch.attempts += 1;
+      tally.rematchChecked += 1;
+      try {
+        const result = await verifyAndEnrich({
+          candidates,
+          correctedFrom: from,
+          context,
+          glossaryHints: relatedGlossary(glossaryIndex, candidates),
+        });
+        // **`searches` には混ぜない**(#25 の平均を汚さないため)。分母が違う
+        tally.rematchSearches += result.searches;
+        if (!isResolved(result.chosen, candidates)) return;
+        const chosen = pickCandidate(result.chosen, candidates);
+        if (!chosen) return;
+        // 本番と同じく、改名を伴わない昇格は許さない(#24)。合成候補の先頭は
+        // 抽出段の推定 term 自身なので、これが無いと「同じ用語のまま格上げ」が通る
+        if (!isRename(chosen.term, card.term)) return;
+        rematch.renames.push({ from, to: chosen.term });
+        promoted.set(card, {
+          ...card,
+          term: chosen.term,
+          reading: chosen.reading,
+          status: "confirmed" as const,
+          correctedFrom: from,
+        });
+      } catch (err) {
+        // 検証パスと同じ扱い。1枚の失敗でケース1試行を捨てない。
+        // **`failed` には混ぜない** — あちらは「Stage 2 の呼び出しが失敗し判断保留に
+        // したカード数」という定義で、再評価の失敗を足すと意味が2つになる
+        tally.rematchFailed += 1;
+        console.error(`[eval] rematch failed for "${card.term}":`, err);
+      }
+    });
+    // 元の並び順を保ったまま差し替える。順序が変わると `terms` 列の差分比較が読めなくなる
+    return { cards: cards.map((c) => promoted.get(c) ?? c), rematch };
+  }
+
   return { verify, tally };
 }
 
@@ -339,12 +488,16 @@ export async function runEval(
         shownTerms: job.case.shownTerms,
       });
       // 本番の清書は「今回のチャンク」を文脈に渡す。評価では transcript がそれに当たる
-      const cards = (
-        verifier
-          ? await verifier.verify(extracted, job.case.transcript, job.case.glossary)
-          : extracted
-      ) as EvaluatedCard[];
-      return scoreCase(job.case, cards, job.run);
+      const outcome = verifier
+        ? await verifier.verify(extracted, job.case.transcript, job.case.glossary)
+        : { cards: extracted, rematch: { attempts: 0, renames: [] } };
+      return scoreCase(
+        job.case,
+        outcome.cards as EvaluatedCard[],
+        job.run,
+        // 検証を回さないモードでは再評価も走らないので、分母ごと 0 になる
+        outcome.rematch,
+      );
     } catch (err) {
       // 1本の 429/500 で 30本ぶんの課金を捨てない。失敗は記録して集計は続ける。
       jobErrors.push({
@@ -398,6 +551,9 @@ export async function runEval(
     // 上限も**実効値**を残す(`model` と同じ理由)。`web検索 N回` の行は、
     // そのランの上限がいくつだったか分からなければ読めない
     maxWebSearches: appConfig.maxWebSearches,
+    // 閾値も**実効値**を残す(`maxWebSearches` と同じ理由)。あとで既定を変えたときに、
+    // 別の閾値で測った結果が同じラベルで並ばないようにする
+    rematchMinSimilarity: appConfig.rematchMinSimilarity,
     config,
     totalJobs: jobs.length,
     scores,
@@ -433,6 +589,35 @@ function formatVerifyTally(report: EvalReport): string {
     `${t.checked}件を確認 / 棄却 ${rejected}${breakdown === "" ? "" : `(${breakdown})`} / ` +
     `差し替え ${t.replaced} / 失敗 ${t.failed} / ` +
     `web検索 ${t.searches}回(1件あたり ${perCard} / ${cap})  適用: ${mode}`
+  );
+}
+
+/**
+ * 再評価の内訳(#40)。**昇格数と誤補正を必ず1行に並べる。**
+ *
+ * unresolved 率だけを見て「下がった」と読むのを防ぐための行。誤って何でも確定すれば
+ * unresolved 率は下がるので、`昇格` と `誤り` は必ず対で読むこと。
+ * 追加呼び出し数（`rematchChecked`）も出すのは、増分コストが想定内かを人が照合するため。
+ */
+function formatRematch(report: EvalReport): string {
+  const t = report.verifyTally;
+  if (!t) return "なし（EVAL_WITH_VERIFY=1 のときだけ走ります）";
+  const totals = sumTotals(report.scores);
+  // 絞り込みの閾値も一緒に出す。閾値がいくつだったか分からない発火数は読めない
+  // （`maxWebSearches` を検証の行に出しているのと同じ理由）
+  const cap =
+    report.rematchMinSimilarity > 0 ? `類似度≥${report.rematchMinSimilarity}` : "絞り込みなし";
+  // **分母は `rematchChecked`。** Stage 2 の `checked` で割ると、母集団の違う数字を
+  // 混ぜた平均になる（`searches` と別カウンタに分けてあるのと対）
+  const rematchPerCard =
+    t.rematchChecked > 0 ? (t.rematchSearches / t.rematchChecked).toFixed(1) : "-";
+  return (
+    `${totals.rematchAttempts}件を再評価(${cap}) / 昇格 ${totals.rematchPromoted}` +
+    `(正しい ${totals.rematchCorrect} / 誤り ${totals.rematchMiscorrected}) / ` +
+    `昇格率 ${pct(report.overall.rematchPromotion)} / ` +
+    `誤補正率 ${pct(report.overall.rematchMiscorrection)} / ` +
+    `追加の検証呼び出し ${t.rematchChecked}回` +
+    `(web検索 ${t.rematchSearches}回 / 1件あたり ${rematchPerCard} / 失敗 ${t.rematchFailed})`
   );
 }
 
@@ -481,6 +666,9 @@ export function formatTable(report: EvalReport): string {
     // 読めない。既定では棄却も差し替えも指標に反映されない（本番と同じ）ので、
     // Stage 2 が何をしたかはこの行だけが伝える。
     `検証: ${formatVerifyTally(report)}`,
+    // **再評価は検証とは別行に出す。** 同じ行にまとめると、増えた呼び出しが
+    // Stage 2 の数字に紛れて増分が読めない（この Issue のコストはその増分そのもの）
+    `再評価: ${formatRematch(report)}`,
     "",
     line(headers),
     cols.map((w) => "-".repeat(w)).join("  "),
@@ -489,7 +677,11 @@ export function formatTable(report: EvalReport): string {
   ];
 
   const problems = report.scores.filter(
-    (s) => s.missing.length > 0 || s.miscorrections.length > 0 || s.extra.length > 0,
+    (s) =>
+      s.missing.length > 0 ||
+      s.miscorrections.length > 0 ||
+      s.extra.length > 0 ||
+      s.rematches.length > 0,
   );
   if (problems.length > 0) {
     out.push("内訳:");
@@ -498,6 +690,8 @@ export function formatTable(report: EvalReport): string {
       if (s.missing.length > 0) parts.push(`未検出=[${s.missing.join(", ")}]`);
       if (s.miscorrections.length > 0) parts.push(`誤補正=[${s.miscorrections.join(", ")}]`);
       if (s.extra.length > 0) parts.push(`想定外=[${s.extra.join(", ")}]`);
+      // 再評価が何を何に直したかは内訳でしか読めない（指標は率にしか出ない）
+      if (s.rematches.length > 0) parts.push(`再評価=[${s.rematches.join(", ")}]`);
       out.push(`  ${s.id} #${s.run}: ${parts.join(" ")}`);
     }
     out.push("");

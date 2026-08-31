@@ -265,3 +265,107 @@ test("据え置き（unresolved）でも cardId は保たれる", () => {
   assert.equal(merged.status, "unresolved", "unresolved からは戻さない（#24）");
   assert.equal(merged.description, "特定できませんでした。", "解説も据え置く");
 });
+
+// --- 再評価による昇格（#40） ---------------------------------------------
+
+/**
+ * **`rename` を伴う `card_update` だけが unresolved から戻せる。**
+ *
+ * #24 のガードを「明示フラグでのみ開ける」という設計そのもの。素の `card_update` を
+ * 素通しさせると、再接続で再抽出されたカードの Stage 2 が `card_update{confirmed}` を
+ * 届けたときに、降格済みのカードが黙って昇格する（この経路は現行サーバーでも来る。
+ * 多層防御ではなく本線のガード）。
+ *
+ * **これは #24 の回帰テスト。** 昇格の穴を開けるついでにガードごと外しても、
+ * 画面には「もっともらしいカード」が出るだけで例外は起きない。
+ */
+test("rename の無い card_update は unresolved を昇格させない（#24 の回帰）", () => {
+  const stored = {
+    cardId: "k1",
+    term: "Grafana",
+    status: "unresolved",
+    description: "音声認識の表記から正しい用語を特定できませんでした。",
+    surfaceForms: ["グラファトス"],
+    links: [],
+  };
+  const merged = mergeCardUpdate(stored, {
+    status: "confirmed",
+    description: "メトリクスを可視化するダッシュボードです。",
+    links: [{ title: "公式", url: "https://grafana.test/" }],
+  });
+  assert.equal(merged.status, "unresolved", "昇格させない");
+  assert.equal(merged.description, stored.description, "本文も据え置く");
+  assert.deepEqual(merged.links, [], "リンクも据え置く");
+  assert.equal(merged.term, "Grafana", "term も動かさない");
+});
+
+test("rename があれば unresolved から昇格する（#40）", () => {
+  const stored = {
+    cardId: "k1",
+    term: "エービ",
+    reading: "エービ",
+    status: "unresolved",
+    description: "音声認識の表記から正しい用語を特定できませんでした。",
+    correctedFrom: "えーび",
+    surfaceForms: ["えーび"],
+    links: [],
+  };
+  const merged = mergeCardUpdate(stored, {
+    status: "confirmed",
+    description: "検証で裏付けの取れた解説。",
+    links: [{ title: "公式", url: "https://ab.test/" }],
+    rename: { term: "AB", reading: "エービー", correctedFrom: "えーび", surfaceForms: ["えーび"] },
+  });
+  assert.equal(merged.status, "confirmed");
+  assert.equal(merged.term, "AB", "見出しになる term が差し替わる");
+  assert.equal(merged.reading, "エービー");
+  assert.equal(merged.description, "検証で裏付けの取れた解説。");
+  assert.equal(merged.links.length, 1);
+  // **cardId は不変**（#38）。改名しても識別子は動かない
+  assert.equal(merged.cardId, "k1");
+  // 古い表記は残す。文字起こし本文は崩れた表記のまま残るため（#40 は raw transcript を
+  // 書き換えない）、消すと過去の行からカードへ辿れなくなる
+  assert.deepEqual(merged.surfaceForms, ["えーび"]);
+  assert.equal(merged.correctedFrom, "えーび", "「音声ではこう聞こえた」を残す");
+});
+
+test("昇格後の見出しは term になる（cardHeading と揃う）", () => {
+  const merged = mergeCardUpdate(
+    { cardId: "k1", term: "エービ", status: "unresolved", surfaceForms: ["えーび"], links: [] },
+    {
+      status: "confirmed",
+      description: "解説。",
+      links: [],
+      rename: { term: "AB", reading: "エービー", correctedFrom: "えーび", surfaceForms: ["えーび"] },
+    },
+  );
+  assert.equal(cardHeading(merged), "AB", "昇格したのに聞き取られた表記が見出しのまま");
+});
+
+test("rename は引数のカードを書き換えない", () => {
+  const stored = { cardId: "k1", term: "エービ", status: "unresolved", links: [] };
+  mergeCardUpdate(stored, {
+    status: "confirmed",
+    description: "新",
+    links: [],
+    rename: { term: "AB", reading: "エービー", correctedFrom: "えーび", surfaceForms: [] },
+  });
+  assert.equal(stored.term, "エービ");
+  assert.equal(stored.status, "unresolved");
+});
+
+/**
+ * **`shouldApplyResend()` は #40 でも変えない。**
+ *
+ * 速報カードの再送（`cards`）に `rename` は無いので、あちらのガードは #24 のまま
+ * 正しく効く。「昇格の経路が1つ開いたから両方緩める」としてしまうと、再接続のたびに
+ * 降格の判断が速報で上書きされる（降格したカードへ更新が届く経路は2つある）。
+ */
+test("速報の再送は rename を持たないので、unresolved の据え置きは変わらない", () => {
+  assert.equal(shouldApplyResend({ status: "unresolved", links: [] }), false);
+  assert.equal(
+    shouldApplyResend({ status: "unresolved", links: [], rename: { term: "AB" } }),
+    false,
+    "再送のペイロードに rename が紛れ込んでも昇格させない",
+  );
+});

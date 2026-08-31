@@ -19,10 +19,11 @@ export interface TermLink {
  * - `unresolved` — 音声認識の表記から正しい用語を特定できなかった。
  *   **UI は推定した term を見せず、聞き取られた表記そのものを見出しにする**
  *
- * `unresolved` から上へは戻さない。**`card_update` は #38 から `cardId` で突き合わせる**が、
- * 改名の経路そのものは**まだ作っていない**(#38 は識別子の分離だけで挙動は変えない)。
- * term を後から差し替える手段が無い以上、解説だけ差し替えると表示が食い違うため
- * この方針は #24 のまま維持する。
+ * `unresolved` から上へは戻さない。**ただし #40 の再評価だけは例外**で、後続の会話で
+ * 確定した用語を手がかりに web 検証をやり直し、裏付けが取れたときに限って昇格する。
+ * その経路では `card_update` に `rename` が載り、term も同時に差し替わる
+ * (「解説だけ差し替えると表示が食い違う」という #24 の理由がそこで消える)。
+ * **`rename` を伴わない `card_update` では従来どおり昇格させない。**
  */
 export type TermStatus = "confirmed" | "probable" | "unresolved";
 
@@ -49,6 +50,26 @@ export interface TermCard {
   willEnrich: boolean;
   /** web検索による清書前は空。card_update で更新される */
   links: TermLink[];
+}
+
+/**
+ * 再評価でカードを改名するときの新しい表示内容(#40)。
+ *
+ * **`cardId` は入っていない。** カードの識別子は不変(#38)で、改名しても動かない —
+ * ここに入れると「改名で ID が変わる」経路を型が許してしまう。
+ */
+export interface CardRename {
+  term: string;
+  reading: string;
+  correctedFrom: string | null;
+  /**
+   * 改名後のカードが持つ表記(ハイライト用)。
+   *
+   * **unresolved のときに聞き取られていた表記をそのまま引き継ぐ。** 文字起こし本文は
+   * 崩れた表記のまま残る(#40 は raw transcript を書き換えない)ので、ここを新しい表記に
+   * 置き換えると**過去の行からカードへ辿れなくなる**。
+   */
+  surfaceForms: string[];
 }
 
 export type ClientMessage =
@@ -80,7 +101,25 @@ export type ServerMessage =
   //
   // **更新対象は `cardId` で指定する**(#38)。以前は `term` を主キーにしていたが、
   // 同じ term のカードが2枚あると区別できず、term を後編集する余地も無かった。
-  | { type: "card_update"; cardId: string; status: TermStatus; description: string; links: TermLink[] }
+  | {
+      type: "card_update";
+      cardId: string;
+      status: TermStatus;
+      description: string;
+      links: TermLink[];
+      /**
+       * 再評価による改名(#40)。**この入れ子が在るときだけ**クライアントは
+       * `unresolved` からの昇格を許す(`public/card-status.js` の `mergeCardUpdate()`)。
+       *
+       * **boolean フラグ + 平置きの `term` にしていない。** それだと「フラグは立って
+       * いるが term が無い」という矛盾した組を型として書けてしまう。入れ子にすれば
+       * 「昇格の許可」と「新しい表示内容」が1つの存在で結ばれ、片方だけ届く形が作れない。
+       *
+       * **既存の3経路(裏付けあり / 棄却 / 例外フォールバック)は付けない。**
+       * 付けないかぎり挙動は #24 のままで、この Issue 以前と1ビットも変わらない。
+       */
+      rename?: CardRename;
+    }
   | { type: "status"; state: "stt_connecting" | "stt_open" | "stt_closed" | "extracting" }
   | {
       type: "error";
