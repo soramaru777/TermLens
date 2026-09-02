@@ -74,8 +74,11 @@ test("MOCK_SCRIPT: 句読点は独立 word にせず punctuated に付ける", (
  * MOCK_SCRIPT にも語を足したのに MOCK_MISHEARD_WORDS への追加を忘れた場合を検出できない。
  */
 test("MOCK_MISHEARD_WORDS は term-cases.json の expectCorrection ∩ MOCK_SCRIPT と一致する", () => {
+  // **`expectCorrection` は `TermCaseSchema` で `.default({})` の optional。**
+  // 生の JSON を読むここだけが「必ず在る」前提だったので、誤認識を扱わないケースを
+  // 1件足した時点で `Object.keys(undefined)` で落ちていた。スキーマの契約に合わせる
   interface TermCase {
-    expectCorrection: Record<string, string>;
+    expectCorrection?: Record<string, string>;
   }
   const termCases: TermCase[] = JSON.parse(
     readFileSync(new URL("./fixtures/term-cases.json", import.meta.url), "utf8"),
@@ -83,7 +86,7 @@ test("MOCK_MISHEARD_WORDS は term-cases.json の expectCorrection ∩ MOCK_SCRI
   const scriptWords = new Set(MOCK_SCRIPT.flatMap((l) => l.words.map((w) => w.word)));
   const expected = new Set(
     termCases
-      .flatMap((c) => Object.keys(c.expectCorrection))
+      .flatMap((c) => Object.keys(c.expectCorrection ?? {}))
       .filter((w) => scriptWords.has(w)),
   );
   assert.ok(expected.size > 0, "term-cases.json と MOCK_SCRIPT に共通の誤認識語が無い");

@@ -7,7 +7,8 @@
     "expectTerms": ["Kubernetes"],
     "expectCorrection": { "クバネテス": "Kubernetes" },
     "forbidTerms": ["キャバネット", "クーベルタン", "クバネテス"],
-    "allowLowConfidence": ["Pod", "ポッド", "メモリリーク", "再起動"]
+    "allowLowConfidence": ["Pod", "ポッド", "メモリリーク", "再起動"],
+    "expectImportance": { "Kubernetes": "high" }
   },
   {
     "id": "grafana-dedup",
@@ -27,7 +28,8 @@
     "expectTerms": ["RAG"],
     "expectCorrection": { "ラグ": "RAG" },
     "forbidTerms": ["ラグ", "Lag", "遅延"],
-    "allowLowConfidence": ["エンベディング", "Embedding", "埋め込み", "ベクトル検索"]
+    "allowLowConfidence": ["エンベディング", "Embedding", "埋め込み", "ベクトル検索"],
+    "expectImportance": { "RAG": "high" }
   },
   {
     "id": "vector-db-vendors",
@@ -47,7 +49,8 @@
     "expectTerms": ["OAuth", "PKCE"],
     "expectCorrection": { "オーオース": "OAuth", "ピーケーシーイー": "PKCE" },
     "forbidTerms": ["オース", "オーオーエス", "ピーケーシー"],
-    "allowLowConfidence": ["認可コードフロー", "OAuth 2.0", "認可コード"]
+    "allowLowConfidence": ["認可コードフロー", "OAuth 2.0", "認可コード"],
+    "expectImportance": { "PKCE": "high" }
   },
   {
     "id": "nda-business",
@@ -189,5 +192,22 @@
     "expectUnresolved": [],
     "expectRematch": [{ "from": "いらすちっくさぁち", "to": "Elasticsearch" }],
     "allowLowConfidence": ["いらすちっくさぁち", "インデックス", "全文検索", "検索基盤"]
+  },
+  {
+    "id": "importance-plain-but-central",
+    "transcript": "今回の議論の中心は運用引き継ぎです。担当交代のあいだ、オンコールのローテーションをどう埋めるかを決めます。あわせて、進捗管理の週次ミーティングは来週から時間を変更します。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectTerms": ["オンコール"],
+    "allowLowConfidence": ["運用引き継ぎ", "ローテーション", "週次ミーティング", "進捗管理", "担当交代"],
+    "expectImportance": { "オンコール": "high" }
+  },
+  {
+    "id": "importance-rare-but-aside",
+    "transcript": "本題はリリース判定の基準です。ところで先ほど話に出たクバネテスの件は、別のチームが見ているので今日は扱いません。まずは判定基準の合意を取りましょう。",
+    "glossary": [],
+    "shownTerms": [],
+    "expectCorrection": { "クバネテス": "Kubernetes" },
+    "allowLowConfidence": ["Kubernetes", "リリース判定", "判定基準"]
   }
 ]

@@ -643,3 +643,112 @@ test("セッション初期化で識別用の Map を3本ともクリアする",
   }
   assert.match(fnBody("resetSessionState"), /clearSessionContent\(\)/);
 });
+
+// ---- 表示優先度と折りたたみ（#44） ----------------------------------------
+
+/**
+ * 表示優先度の導出は `card-status.js` の1本を通す（#44）。
+ *
+ * `cardStatus()` と同じ理由。`card.importance` を直接読む箇所が増えると、
+ * **旧保存データ（importance を持たない）でその経路だけ判定が変わる**。
+ */
+test("表示優先度の導出は cardImportance() を通す", () => {
+  assert.match(CODE, /cardImportance,?\n\} from "\.\/card-status\.js"/, "import していない");
+  // 生の比較を書き散らさない。既定値の埋め込みも1箇所（card-status.js）に閉じる
+  assert.doesNotMatch(CODE, /card\.importance\s*===/, "card.importance を直接比べている");
+  assert.doesNotMatch(CODE, /importance\s*\?\?\s*"/, "既定値を app.js 側に書いている");
+});
+
+/**
+ * `low` クラスは `renderCardHead()` で付け外しする。
+ *
+ * `renderCardHead` は addCard / updateCard の両方が通る**唯一の再構築点**なので、
+ * ここに置けば片方だけ付け忘れる形が作れない（状態クラスと同じ扱い）。
+ */
+test("low クラスは renderCardHead で付け外しする", () => {
+  assert.match(
+    fnBody("renderCardHead"),
+    /classList\.toggle\("low", cardImportance\(card\) === "low"\)/,
+    "renderCardHead が low クラスを扱っていない",
+  );
+  // 他所で付けると、更新で importance が変わったときに剥がし忘れる
+  const toggles = CODE.match(/classList\.(add|toggle|remove)\("low"/g) ?? [];
+  assert.equal(toggles.length, 1, `low クラスの操作が ${toggles.length} 箇所ある`);
+});
+
+/**
+ * **折りたたみは DOM を動かさない**（#44 / 案B）。
+ *
+ * low カードを別コンテナへ移すと `[...cardsEl.children]` を走査している
+ * `findCardEl` / `setActiveCard` が引けなくなり、**例外を出さずに card_update が
+ * low カードにだけ届かなくなる**。DOM を触る経路が増えていないことで固定する。
+ */
+test("折りたたみはクラスの付け外しだけで、カードを別コンテナへ移さない", () => {
+  assert.match(CODE, /cardsEl\.classList\.toggle\("show-low"/, "展開状態がクラスで表現されていない");
+  // #cards への挿入は3箇所だけ: カード本体・エラーバナー・トグル行。
+  // 4箇所目が生えたら「low を別の場所へ入れている」疑いがある
+  const appends = CODE.match(/cardsEl\.(append|appendChild|insertBefore|prepend)\(/g) ?? [];
+  assert.equal(appends.length, 3, `#cards への挿入が ${appends.length} 箇所ある`);
+  assert.doesNotMatch(CODE, /<details/, "details コンテナを使っている");
+  assert.doesNotMatch(CODE, /lowCardsEl|lowContainer/, "low 専用のコンテナがある");
+});
+
+/**
+ * 追従・巡回の対象は `visibleCardIds()` 一本。
+ *
+ * **これは見た目の好みではなく空画面の防止**。縦積みでは `.active` の1枚だけが出るので、
+ * 折りたたまれた low が active になると**表示できるカードが1枚も無くなる**。
+ */
+test("追従と巡回は visibleCardIds() を通す", () => {
+  assert.match(CODE, /function visibleCardIds\(\)/, "ヘルパが無い");
+  // renderCardNav / latestBtn / addCard の3経路が同じ集合を見る
+  assert.match(fnBody("renderCardNav"), /visibleCardIds\(\)/, "件数表示が全カードを数えている");
+  assert.match(fnBody("addCard"), /visibleCardIds\(\)/, "追従が折りたたみを見ていない");
+  // 巡回対象を `cardData` から直に組む経路が残っていないこと（残ると辿り着けない番号が出る）
+  const rawKeys = CODE.match(/\[\.\.\.cardData\.keys\(\)\]/g) ?? [];
+  assert.equal(rawKeys.length, 2, `cardData.keys() の直接展開が ${rawKeys.length} 箇所ある`);
+});
+
+/**
+ * 折りたたまれた low へのハイライトジャンプは、先に展開してから通常経路へ合流する。
+ * 展開せずに `scrollIntoView` すると、何も見えないまま終わる（AC）。
+ */
+test("low カードへのジャンプは自動で展開する", () => {
+  const body = fnBody("jumpToCard");
+  assert.match(body, /classList\.contains\("low"\)/, "low かどうかを見ていない");
+  assert.match(body, /setLowExpanded\(true\)/, "展開していない");
+  // 展開は scrollIntoView より前。後に置くと、折りたたまれたままスクロールしてしまう
+  assert.ok(
+    body.indexOf("setLowExpanded(true)") < body.indexOf("scrollIntoView"),
+    "展開がスクロールより後になっている",
+  );
+});
+
+/**
+ * `cardData` そのものは絞らない（AC: Markdown と保存には全カードが残る）。
+ * 絞るのは「いま画面に出せるカード」だけ。
+ */
+test("エクスポートと保存は全カードを見る（visibleCardIds を通さない）", () => {
+  assert.match(
+    fnBody("buildTermsMarkdown"),
+    /\[\.\.\.cardData\.values\(\)\]/,
+    "Markdown が全カードを渡していない",
+  );
+  assert.doesNotMatch(fnBody("buildTermsMarkdown"), /visibleCardIds/, "Markdown が low を落としている");
+  assert.doesNotMatch(
+    fnBody("buildSessionSnapshot"),
+    /visibleCardIds/,
+    "保存が low を落としている（復元で消える）",
+  );
+});
+
+/**
+ * セッションを初期化したら、トグル行の参照と展開状態も一緒に落とす。
+ * 片方だけ残すと「展開済みだがトグルが無い」状態が次のセッションへ持ち越される。
+ */
+test("セッション初期化で折りたたみの状態も戻す", () => {
+  const body = fnBody("clearSessionContent");
+  assert.match(body, /lowToggle = null/, "トグル行の参照が残る");
+  assert.match(body, /lowExpanded = false/, "展開状態が残る");
+  assert.match(body, /classList\.remove\("show-low"\)/, "#cards のクラスが残る");
+});

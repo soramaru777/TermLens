@@ -23,6 +23,10 @@ export function card(term: string, overrides: Partial<ExtractedCard> = {}): Extr
     description: "テスト用のカード。",
     status: "confirmed",
     rarity: "rare",
+    // **既定は medium。** 既定を low にすると「low が折りたたまれる」テストが
+    // 上書きを忘れても通ってしまい、high にすると「重要でないカード」を作るたびに
+    // 明示が要る。どちらの分岐にも偏らない中央値を既定にしておく(#44)
+    importance: "medium",
     correctedFrom: null,
     surfaceForms: [],
     candidates: [candidate(term)],

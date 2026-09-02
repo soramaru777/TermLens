@@ -1,5 +1,5 @@
 import { normalizeTerm } from "../extract/normalize.js";
-import type { TermStatus } from "../protocol.js";
+import type { TermImportance, TermStatus } from "../protocol.js";
 import type { TermCase } from "./cases.js";
 
 /**
@@ -12,6 +12,8 @@ export interface EvaluatedCard {
   correctedFrom: string | null;
   /** 「特定できない」が正解の表記との突き合わせに使う(#24) */
   surfaceForms: string[];
+  /** 表示優先度(#44)。分布と「重要語の取りこぼし」を測る */
+  importance: TermImportance;
 }
 
 /** 1ケース・1試行ぶんの素点。集計は分子分母を足し合わせて行う（ケース平均の平均にしない）。 */
@@ -68,6 +70,23 @@ export interface CaseScore {
   rematchMiscorrected: number;
   /** 再評価の内訳（レポート用）。`聞き取られた表記 → 確定した用語` の並び */
   rematches: string[];
+  // --- 表示優先度(#44) -------------------------------------------------------
+  //
+  // **low の件数だけを成功条件にしない。** 全部 low にすれば「通常表示のノイズ」は
+  // ゼロになるので、件数と**取りこぼし件数を必ず対で**出す(#40 の
+  // 「unresolved 率だけを下げない」と同じ理屈)。
+  /** dedupe 後のカードの high / medium / low 枚数 */
+  importanceCounts: { high: number; medium: number; low: number };
+  /** 通常表示される枚数（high + medium）。折りたたまれない枚数 */
+  shownCards: number;
+  /** `expectImportance` で high/medium を期待した用語のうち、low になったもの＝重要語の取りこぼし */
+  importanceDemoted: number;
+  /** 取りこぼしの分母（high/medium を期待した用語のうち、カードが出たもの） */
+  importanceDemotedTotal: number;
+  /** 取りこぼしの内訳（レポート用） */
+  importanceDemotions: string[];
+  /** status × importance のクロス集計。`unresolved × high` を埋もれさせないため */
+  unresolvedByImportance: { high: number; medium: number; low: number };
 }
 
 /**
@@ -109,6 +128,15 @@ export interface Metrics {
    * 抽出段の誤補正に埋もれて見えない。unresolved 率と必ずセットで読むこと。
    */
   rematchMiscorrection: number;
+  /** 通常表示される割合（high + medium ÷ 全カード）(#44) */
+  shownRate: number;
+  /**
+   * **重要語の取りこぼし率**（high/medium を期待したのに low になった割合）(#44)。
+   *
+   * `shownRate` とは**必ずセットで読むこと**。カードを全部 low にすれば `shownRate` は
+   * 0 に近づくが、それは折りたたみが効いているのではなく重要語ごと隠しているだけ。
+   */
+  importanceDemotion: number;
 }
 
 export interface Totals {
@@ -128,6 +156,11 @@ export interface Totals {
   rematchPromoted: number;
   rematchCorrect: number;
   rematchMiscorrected: number;
+  /** 全カード枚数（dedupe 後）。`importanceCounts` の合計と一致する(#44) */
+  cards: number;
+  shownCards: number;
+  importanceDemoted: number;
+  importanceDemotedTotal: number;
 }
 
 /**
@@ -243,6 +276,34 @@ export function scoreCase(
     if (expected) rematchCorrect += 1;
   }
 
+  // --- 表示優先度の分布と取りこぼし(#44) -------------------------------------
+  // **分母は dedupe 後のカード**（`byTerm`）。Precision と同じ土俵に揃えておかないと、
+  // 同じ用語が2枚出た回だけ分布が歪む。
+  const importanceCounts = { high: 0, medium: 0, low: 0 };
+  const unresolvedByImportance = { high: 0, medium: 0, low: 0 };
+  for (const card of byTerm.values()) {
+    importanceCounts[card.importance] += 1;
+    // status と importance は別軸(#44)。`unresolved × high`（本当に重要そうだが
+    // まだ特定できていない）を埋もれさせないため、クロスで数える
+    if (card.status === "unresolved") unresolvedByImportance[card.importance] += 1;
+  }
+
+  // **「low が何件出たか」ではなく「本来 high/medium のものが low に落ちたか」を測る。**
+  // 前者だけを見ると、全部 low にした実装が最良のスコアになってしまう。
+  let importanceDemoted = 0;
+  let importanceDemotedTotal = 0;
+  const importanceDemotions: string[] = [];
+  for (const [term, expected] of Object.entries(c.expectImportance)) {
+    if (expected === "low") continue; // low を期待した語は取りこぼしの対象外
+    const card = byTerm.get(normalizeTerm(term));
+    if (!card) continue; // カードが出なかったのは Recall の問題。ここでは数えない
+    importanceDemotedTotal += 1;
+    if (card.importance === "low") {
+      importanceDemoted += 1;
+      importanceDemotions.push(`${term}: 期待 ${expected} → low`);
+    }
+  }
+
   return {
     id: c.id,
     run,
@@ -267,6 +328,12 @@ export function scoreCase(
     rematchCorrect,
     rematchMiscorrected: rematch.renames.length - rematchCorrect,
     rematches: rematch.renames.map((r) => `${r.from} → ${r.to}`),
+    importanceCounts,
+    shownCards: importanceCounts.high + importanceCounts.medium,
+    importanceDemoted,
+    importanceDemotedTotal,
+    importanceDemotions,
+    unresolvedByImportance,
   };
 }
 
@@ -288,6 +355,10 @@ export function sumTotals(scores: CaseScore[]): Totals {
     rematchPromoted: 0,
     rematchCorrect: 0,
     rematchMiscorrected: 0,
+    cards: 0,
+    shownCards: 0,
+    importanceDemoted: 0,
+    importanceDemotedTotal: 0,
   };
   for (const s of scores) {
     totals.recallHit += s.recallHit;
@@ -304,6 +375,10 @@ export function sumTotals(scores: CaseScore[]): Totals {
     totals.rematchPromoted += s.rematchPromoted;
     totals.rematchCorrect += s.rematchCorrect;
     totals.rematchMiscorrected += s.rematchMiscorrected;
+    totals.cards += s.importanceCounts.high + s.importanceCounts.medium + s.importanceCounts.low;
+    totals.shownCards += s.shownCards;
+    totals.importanceDemoted += s.importanceDemoted;
+    totals.importanceDemotedTotal += s.importanceDemotedTotal;
     if (s.miscorrected) totals.miscorrectedCases += 1;
   }
   return totals;
@@ -328,6 +403,13 @@ export function toMetrics(totals: Totals): Metrics {
     // 誤補正率は `miscorrection` と同じく「無ければ 0（良い）」の向き
     rematchMiscorrection:
       totals.rematchPromoted === 0 ? 0 : totals.rematchMiscorrected / totals.rematchPromoted,
+    // カードが1枚も出なかった回は 1（= 隠していない）。`ratio()` と同じ「分母 0 は減点しない」
+    shownRate: ratio(totals.shownCards, totals.cards),
+    // 取りこぼし率は `miscorrection` と同じく「無ければ 0（良い）」の向き
+    importanceDemotion:
+      totals.importanceDemotedTotal === 0
+        ? 0
+        : totals.importanceDemoted / totals.importanceDemotedTotal,
   };
 }
 

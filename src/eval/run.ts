@@ -621,6 +621,34 @@ function formatRematch(report: EvalReport): string {
   );
 }
 
+/**
+ * 表示優先度の分布（#44）。
+ *
+ * **件数と取りこぼしを必ず1行に並べる。** 「通常表示◯枚」だけを出すと、全部 low に
+ * 落とした実装が最良に見える（#40 の「unresolved 率だけを下げない」と同じ理屈）。
+ * `unresolved × high` も出すのは、特定できていない重要語が折りたたみに埋もれていないかを
+ * 分布と同時に読むため。
+ */
+function formatImportance(report: EvalReport): string {
+  const totals = sumTotals(report.scores);
+  const counts = report.scores.reduce(
+    (a, s) => ({
+      high: a.high + s.importanceCounts.high,
+      medium: a.medium + s.importanceCounts.medium,
+      low: a.low + s.importanceCounts.low,
+    }),
+    { high: 0, medium: 0, low: 0 },
+  );
+  const unresolvedHigh = report.scores.reduce((n, s) => n + s.unresolvedByImportance.high, 0);
+  return (
+    `high ${counts.high} / medium ${counts.medium} / low ${counts.low} / ` +
+    `通常表示 ${totals.shownCards}枚(${pct(report.overall.shownRate)}) / ` +
+    `**重要語の取りこぼし ${totals.importanceDemoted}/${totals.importanceDemotedTotal}` +
+    `(${pct(report.overall.importanceDemotion)})** / ` +
+    `unresolved×high ${unresolvedHigh}件`
+  );
+}
+
 export function formatTable(report: EvalReport): string {
   // probable と unresolved は**2列に分ける**(#24)。合算すると「補正はしたが自信がない」と
   // 「そもそも特定できない」が混ざり、過剰 unresolved（何でも諦める退行）に気づけない。
@@ -669,6 +697,9 @@ export function formatTable(report: EvalReport): string {
     // **再評価は検証とは別行に出す。** 同じ行にまとめると、増えた呼び出しが
     // Stage 2 の数字に紛れて増分が読めない（この Issue のコストはその増分そのもの）
     `再評価: ${formatRematch(report)}`,
+    // **表示優先度も独立した行に出す**(#44)。Recall / 補正の表に列を足すと、
+    // 「low が増えた」ことと「重要語を取りこぼした」ことが同じ行に並ばず読み違える
+    `表示優先度: ${formatImportance(report)}`,
     "",
     line(headers),
     cols.map((w) => "-".repeat(w)).join("  "),
@@ -681,7 +712,8 @@ export function formatTable(report: EvalReport): string {
       s.missing.length > 0 ||
       s.miscorrections.length > 0 ||
       s.extra.length > 0 ||
-      s.rematches.length > 0,
+      s.rematches.length > 0 ||
+      s.importanceDemotions.length > 0,
   );
   if (problems.length > 0) {
     out.push("内訳:");
@@ -692,6 +724,10 @@ export function formatTable(report: EvalReport): string {
       if (s.extra.length > 0) parts.push(`想定外=[${s.extra.join(", ")}]`);
       // 再評価が何を何に直したかは内訳でしか読めない（指標は率にしか出ない）
       if (s.rematches.length > 0) parts.push(`再評価=[${s.rematches.join(", ")}]`);
+      // どの語を折りたたみへ落としたかは内訳でしか読めない（指標は率にしか出ない）
+      if (s.importanceDemotions.length > 0) {
+        parts.push(`取りこぼし=[${s.importanceDemotions.join(", ")}]`);
+      }
       out.push(`  ${s.id} #${s.run}: ${parts.join(" ")}`);
     }
     out.push("");

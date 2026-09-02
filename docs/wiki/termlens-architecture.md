@@ -7,7 +7,7 @@ sources:
   - README.md
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]]
 confidence: high
-updated: 2026-09-01
+updated: 2026-09-03
 ---
 
 # TermLens アーキテクチャ
@@ -40,7 +40,12 @@ WebSocket 1本の中で、**音声はバイナリフレーム、制御メッセ�
 | `start` | C→S | `glossary` と `shownTerms`（再接続時のデデュープ、#8）。**`shownTerms` は term の一覧**であってカードの ID ではない（#38） |
 | `transcript` | S→C | `finalSeq` は「同じ Deepgram の final 由来か」の印（#36）。話者で分割されたイベントには同じ番号が付く |
 | `cards` | S→C | 速報カード。`TermCard.cardId` はサーバーがセッション内通番（`c1`, `c2`, …）で配る**不変の識別子**（#38） |
+| | | `importance` は**表示優先度**（#44）。`rarity` とは別軸で、`low` は「その他の用語」へ折りたたむ |
 | `card_update` | S→C | 清書（検証）の結果。**更新対象は `cardId` で指定する**（#38 以前は `term`）。`status` は optional にしない（#24）。`rename?` が載るのは #40 の再評価だけ |
+
+> **`card_update` と `CardRename` には `importance` を載せない**（#44）。載せないかぎり
+> `mergeCardUpdate()` の `{ ...stored, ...renamed }` で元の値が必ず残る — **入れないこと自体が
+> 「rename で importance を失わない」の実装**で、別途ガードは書いていない。
 
 > 2026-08-30 変更（#38）: `TermCard` に `cardId` を追加し、`card_update` から `term` を
 > 落とした。**`term` は識別子ではなくなり、「意味上の同一性」（デデュープ）だけに使う。**
@@ -119,4 +124,9 @@ scheduler.rematchCard()
     `surfaceForms` からハイライトを組み直すので、改名前の推定 term と、統合で消えた側の
     `correctedFrom` は復元後に引けなくなる。カード自体は残るので実害は「過去の行を
     タップしても飛ばない」に留まるが、ライブと復元後で挙動が違う点は把握しておくこと
+- **表示優先度で折りたたむが、情報は落とさない**（#44）。`importance=low` のカードは
+  「その他の用語」へ畳むだけで、Markdown エクスポートと localStorage には**全カードが残る**。
+  折りたたみは DOM を動かさずクラスと CSS の `order` だけで表現する — `cardsEl.children` を
+  走査している `findCardEl()` / `setActiveCard()` を壊すと、**例外を出さずに `card_update` が
+  low カードにだけ届かなくなる**（[[termlens-term-extraction]]）
 - **状態をサーバーに永続化していない。** ブラウザメモリのみのため、リロードで全消失する（[[termlens-open-issues]] の弱点4）

@@ -258,6 +258,7 @@ function toClientCard(card: ExtractedCard, willEnrich: boolean, cardId: string):
     correctedFrom: card.correctedFrom,
     surfaceForms: card.surfaceForms,
     rarity: card.rarity,
+    importance: card.importance,
     willEnrich,
     links: [],
   };

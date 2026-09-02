@@ -419,6 +419,106 @@ LLM が `high` かつ `unresolved` のような矛盾した組を返したとき
 Recall と正しい補正率が落ちていないかと**必ずセットで**読む（誤補正率だけを見て「改善した」と
 判断できないのと同じ構造）。
 
+## 表示優先度（`importance`、#44）
+
+> 2026-09-03 追加（Issue #44、案B）。
+
+`rarity`（用語そのものの珍しさ）とは**別軸**で、「この会話を理解するために、ユーザーが今
+見る価値」を `high` / `medium` / `low` の3値で持つ。`low` は**削除せず**「その他の用語」へ
+折りたたむ。情報を失わずに UI のノイズだけを減らすのが狙い。
+
+### なぜ `rarity` を兼用しないか
+
+`rarity` は Stage 2 の検証対象選定（`selectVerifyTargets()`）に既に使われている。兼用すると
+**「web 検証の優先度」と「UI の表示優先度」が同じフィールドに乗り**、片方を動かすともう
+片方が黙って変わる。2軸に分けたので次の組み合わせがどちらも成立する。
+
+| | 例 | 意味 |
+|---|---|---|
+| `rarity=common, importance=high` | 平易だがその会話の主題 | 珍しくないが今見る価値がある |
+| `rarity=rare, importance=low` | 珍しいがその会話では脇役 | web 検証はするが折りたたむ |
+
+**`selectVerifyTargets()` は1行も変えていない。** 引数の型が構造的部分型なので、
+`importance` を足しても選定は動かない — **触らないことが AC の実装**にあたる。
+`importance=low` でも誤補正疑い（`probable`）なら従来どおり検証に回る。
+
+### 折りたたみは DOM を動かさない（案B）
+
+`low` カードを `<details>` の別コンテナへ移す案（案A）は採らなかった。`public/app.js` の
+`findCardEl()` / `setActiveCard()` / `mergeRenamedCard()` はいずれも
+`[...cardsEl.children]` を走査しており、**別コンテナへ移すと引けなくなる**。
+`updateCard()` は引けなかったとき静かに抜けるので、「low カードだけ清書が反映されない」が
+**テスト緑のまま**通る。
+
+採ったのはクラスと CSS の `order` だけで表現する形。
+
+```
+#cards (flex column)                     order
+ ├─ .error-banner                         -1   (sticky, .card ではない)
+ ├─ .card           high / medium          0   ← insertBefore(firstChild) で新しい順
+ ├─ .low-toggle    「▶ その他の用語(12)」   1   (.card ではない = 縦積みでも常に見える)
+ └─ .card.low                              2   ← DOM 上の位置は到着順のまま
+```
+
+展開状態は `#cards` の `show-low` クラス1つ。`jumpToCard()` は low なら先に展開してから
+通常経路へ合流するだけで済む（案Aなら `<details open>` を開いてレイアウト確定を待つ必要が
+あった）。
+
+**CSS の詳細度は意図して稼いでいる。**
+
+| セレクタ | 詳細度 | 役割 |
+|---|---|---|
+| `#cards .card` | (1,1,0) | 縦積み: 既定で全部隠す |
+| `#cards .card.active` | (1,2,0) | 縦積み: active の1枚だけ出す |
+| `#cards:not(.show-low) .card.low` | **(1,3,0)** | 折りたたみ中の low を隠す（上2つに勝つ） |
+
+`:not()` の詳細度は引数（`.show-low` = クラス1つ）を数える。ここが (0,2,0) だと
+**低優先度カードが active のときだけ折りたたみをすり抜ける**。
+
+### 縦積み（スマホ）で追従対象から外すのは必須
+
+`addCard()` は追従中なら新しいカードを無条件に active にする。縦積みでは `.card` が既定で
+`display:none` なので、**`activeCardId` が折りたたまれた low を指した瞬間に表示できる
+カードが1枚も無くなる**（low は折りたたみで消え、他は `.active` が無い）。
+
+そのため `visibleCardIds()` を1本だけ用意し、`renderCardNav()` / `latestBtn` / `addCard()` の
+追従がすべてこれを見る。**UX の好みではなく空画面を防ぐための必要条件**で、AC には
+書かれていないが AC を満たす実装の副作用として不可避だった。
+
+**`cardData` そのものは絞らない。** Markdown エクスポートと保存は全カードを見る
+（AC: `low` を落とさない）。絞るのは「いま画面に出せるカード」だけ。
+
+### 導出と統合
+
+`public/card-status.js` の `cardImportance()` が唯一の定義箇所（`cardStatus()` と同じ理由）。
+旧保存データ（`importance` を持たない）の既定は **`medium`** — `low` にすると既存セッションを
+復元した瞬間に全カードが折りたたみへ消える。壊れた値は必ず3値に丸める。
+
+`mergeDuplicateCards()` では **`high > medium > low` で高いほうを残す**。`{ ...drop, ...keep }`
+だと残す側が無条件に勝つので、`keep=low` × `drop=high` のとき重要なカードが折りたたみへ落ちる。
+`surfaceForms` / `links` と同じ「明示的に決めるフィールド」。
+
+改名（`rename`）では importance は動かない。`CardRename` に入れていないので
+`mergeCardUpdate()` の `{ ...stored, ...renamed }` で必ず `stored` 側が残る —
+**入れないこと自体が実装**で、別途ガードは書いていない。
+
+### 評価指標
+
+**`low` の件数だけを成功条件にしない。** 全部 `low` にすれば「通常表示のノイズ」はゼロに
+なるので、件数と**取りこぼし件数を必ず対で**出す（#40 の「`unresolved` 率だけを下げない」と
+同じ理屈）。
+
+- `shownRate` … 通常表示される割合（`high + medium` ÷ 全カード）
+- `importanceDemotion` … **重要語の取りこぼし率**。`expectImportance` で `high`/`medium` を
+  期待した語が `low` になった割合
+- `unresolvedByImportance` … `status × importance` のクロス。`unresolved × high`
+  （本当に重要そうだが特定できていない）を埋もれさせないため
+
+`expectImportance` で **`low` を期待した語は取りこぼしの分母に入れない**。測りたいのは
+「重要な語を折りたたみへ落としていないか」であって `low` の判定精度ではない。分母に入れると
+平易な語を `medium` に置いただけで数字が悪化し、**「全部 low にする」ほうがスコアの良い実装に
+なってしまう**。
+
 ## 検証の内訳を外に出す（`verification`）
 
 > 2026-08-27 追加（Issue #25、案C）。

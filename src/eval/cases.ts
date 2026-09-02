@@ -68,6 +68,19 @@ export const TermCaseSchema = z.object({
    * 改名すると過去レポートとの比較がしづらくなるため、キー名は据え置いてある。
    */
   allowLowConfidence: z.array(z.string()).default([]),
+  /**
+   * 用語 → 期待する表示優先度(#44)。**high/medium を期待した語が low になったら取りこぼし**。
+   *
+   * **`low` を期待した語は取りこぼしの分母に入れない。** 測りたいのは「重要な語を
+   * 折りたたみへ落としていないか」であって、low の判定精度そのものではない。
+   * low を分母に入れると、平易な語を medium に置いただけで数字が悪化し、
+   * **「全部 low にする」ほうがスコアの良い実装になってしまう**。
+   *
+   * カードが出なかった語は分母にも入らない（それは Recall の問題）。
+   */
+  expectImportance: z
+    .record(z.string(), z.enum(["high", "medium", "low"]))
+    .default({}),
 });
 
 export type TermCase = z.infer<typeof TermCaseSchema>;

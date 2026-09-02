@@ -27,6 +27,28 @@ export interface TermLink {
  */
 export type TermStatus = "confirmed" | "probable" | "unresolved";
 
+/**
+ * 用語カードの表示優先度(#44)。**この会話を理解するために、ユーザーが今見る価値**を表す。
+ *
+ * **`rarity` とは別軸で、独立に判定する。** `rarity` は用語そのものの一般性・希少性で、
+ * Stage 2 の検証対象選定(`selectVerifyTargets`)に使われている既存の軸。兼用すると
+ * 「web 検証の優先度」と「UI の表示優先度」が混ざり、片方を動かすともう片方が
+ * 黙って変わる。`rarity=common, importance=high`(平易だが会話の主題)も
+ * `rarity=rare, importance=low`(珍しいが脇役)も許す。
+ *
+ * - `high`   — 主題・意思決定の理解に重要。専門技術/製品/規格/役割名、繰り返し参照される中心概念
+ * - `medium` — 理解に役立つが主題の中核ではない
+ * - `low`    — 日常語・一般的なビジネス語に近く、説明を読んでも新しい情報がほとんど増えない
+ *
+ * `low` は**削除せず**「その他の用語」へ折りたたむ(`public/app.js`)。情報を失わずに
+ * UI のノイズだけを減らすのが狙いなので、Markdown エクスポートと保存には全カードが残る。
+ *
+ * **`status` とも別軸。** `status` は「正しく用語を特定できたか」で、`importance` は
+ * 特定できたかに関係なく「この会話で見る価値が高いか」。`status=unresolved` かつ
+ * `importance=high`(本当に重要そうだが、まだ特定できていない)を埋もれさせないため。
+ */
+export type TermImportance = "high" | "medium" | "low";
+
 export interface TermCard {
   /**
    * カードの不変の識別子(#38)。サーバーがセッション内の通番(`c1`, `c2`, …)で採番する。
@@ -46,6 +68,13 @@ export interface TermCard {
   /** 文字起こし中に実際に登場した表記(ハイライト用) */
   surfaceForms: string[];
   rarity: "common" | "uncommon" | "rare";
+  /**
+   * 表示優先度(#44)。`low` は「その他の用語」へ折りたたまれる。
+   *
+   * **`card_update` には載せない。** importance の再評価は #44 の非スコープで、
+   * 載せると「解説の更新で表示優先度が変わる」経路を型が許してしまう。
+   */
+  importance: TermImportance;
   /** true ならこのカードは後から card_update で web検索結果に更新される */
   willEnrich: boolean;
   /** web検索による清書前は空。card_update で更新される */
@@ -57,6 +86,11 @@ export interface TermCard {
  *
  * **`cardId` は入っていない。** カードの識別子は不変(#38)で、改名しても動かない —
  * ここに入れると「改名で ID が変わる」経路を型が許してしまう。
+ *
+ * **`importance` も入れない(#44)。** `mergeCardUpdate()` は `{ ...stored, ...renamed }`
+ * なので、ここに無いかぎり改名しても元の importance が必ず生き残る。
+ * **入れないこと自体が「rename で importance を失わない」の実装**であって、
+ * 別途ガードを書いて守るものではない。
  */
 export interface CardRename {
   term: string;
