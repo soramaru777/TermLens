@@ -317,6 +317,30 @@ button.primary:disabled { opacity: 0.5; }
   #cards .card { display: none; }
   #cards .card.active { display: block; }
 }
+/* 「その他の用語」の折りたたみ(#44)。
+   #cards は flex column なので、DOM を動かさずに order だけで下部へ寄せられる
+   (別コンテナへ移すと cardsEl.children を走査している findCardEl / setActiveCard /
+   mergeRenamedCard が引けなくなり、card_update が静かに届かなくなる)。 */
+.card.low { order: 2; }
+.low-toggle {
+  order: 1;
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 6px 10px;
+  border: 1px solid #cfd6d4;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+/* **詳細度は意図して #cards と :not() で稼いでいる。**
+   縦積みの `#cards .card.active { display: block }` は (1,2,0)。ここが (0,2,0) だと
+   低優先度カードが active のときだけ折りたたみをすり抜ける。
+   `:not()` の詳細度は引数（.show-low = クラス1つ）を数えるので、この規則は (1,3,0) になり
+   横並び・縦積みの両方で確実に勝つ。 */
+#cards:not(.show-low) .card.low { display: none; }
 /* 恒久エラー通知(例: LLMのクレジット残高切れ)。#cards の先頭に固定し、
    status メッセージによる上書きやスクロールで隠れないようにする(#cards 自身が
    スクロールコンテナなので sticky の基準はここになる)。 */

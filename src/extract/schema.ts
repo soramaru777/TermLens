@@ -42,6 +42,15 @@ export const TermCardSchema = z.object({
     .describe(
       "用語のレア度。common=よく知られた一般的な用語、uncommon=その業界の人なら知っている用語、rare=ニッチ・新しい・固有名詞・誤認識から復元した用語など、最新情報の確認価値が高いもの",
     ),
+  // **`rarity` の直後・`correctedFrom` の前に置く。** 構造化出力はスキーマの順に生成されるので
+  // (`status` を `term` より前に置いてあるのと同じ理由)、term / description / rarity を
+  // 書き終えた後に「この会話での見る価値」を決めさせる。rarity より前に置くと、用語そのものの
+  // 性質を判断する前に表示価値を決めることになり、2つの軸が混ざりやすい。
+  importance: z
+    .enum(["high", "medium", "low"])
+    .describe(
+      "この会話を理解するために、ユーザーが今見る価値。high=会話の主題・意思決定の理解に重要、専門技術/製品/フレームワーク/規格/役割名、繰り返し参照される中心概念、誤認識から復元して正しく理解する価値が高いもの。medium=理解に役立つが主題の中核ではない。low=日常語・一般的なビジネス語に近く、文脈無しでも意味を推測でき、説明を読んでも新しい情報がほとんど増えないもの。rarity とは独立に判定すること",
+    ),
   correctedFrom: z.string().nullable().describe("誤認識から復元した場合の元の表記。復元していなければ null"),
   surfaceForms: z
     .array(z.string())

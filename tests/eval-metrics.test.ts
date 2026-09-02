@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { TermCaseSchema, type TermCase } from "../src/eval/cases.js";
 import { aggregate, scoreCase, type EvaluatedCard } from "../src/eval/metrics.js";
-import type { TermStatus } from "../src/protocol.js";
+import type { TermImportance, TermStatus } from "../src/protocol.js";
 
 /**
  * 指標の集計そのものを LLM 抜きで検証する。
@@ -17,8 +17,11 @@ function card(
   correctedFrom: string | null = null,
   status: TermStatus = "confirmed",
   surfaceForms: string[] = [],
+  // 既定は medium。`tests/helpers/cards.ts` と同じ理由で、high/low のどちらの分岐にも
+  // 偏らない中央値にしておく(#44)
+  importance: TermImportance = "medium",
 ): EvaluatedCard {
-  return { term, correctedFrom, status, surfaceForms };
+  return { term, correctedFrom, status, surfaceForms, importance };
 }
 
 const base = makeCase({
@@ -310,4 +313,83 @@ test("再評価: 集計は分子分母の合算（ケース平均の平均にし
   const metrics = aggregate([good, bad]);
   assert.equal(metrics.rematchPromotion, 2 / 4);
   assert.equal(metrics.rematchMiscorrection, 1 / 2);
+});
+
+// ---- 表示優先度の分布と取りこぼし（#44） -----------------------------------
+
+const importanceCase = makeCase({
+  id: "importance",
+  transcript: "AB と ドメイン知識 の話をしています。",
+  expectTerms: ["AB", "ドメイン知識"],
+  expectImportance: { AB: "high", ドメイン知識: "low" },
+});
+
+test("分布: high / medium / low の枚数と通常表示枚数を数える", () => {
+  const score = scoreCase(importanceCase, [
+    card("AB", null, "confirmed", [], "high"),
+    card("ABC", null, "confirmed", [], "medium"),
+    card("ドメイン知識", null, "confirmed", [], "low"),
+    card("業務知識", null, "confirmed", [], "low"),
+  ]);
+  assert.deepEqual(score.importanceCounts, { high: 1, medium: 1, low: 2 });
+  assert.equal(score.shownCards, 2, "通常表示は high + medium");
+  assert.equal(aggregate([score]).shownRate, 0.5);
+});
+
+test("分布の分母は dedupe 後のカード（同じ用語が2枚出ても1件）", () => {
+  // Precision と同じ土俵に揃える。揃えないと重複が出た回だけ分布が歪む
+  const score = scoreCase(importanceCase, [
+    card("AB", null, "confirmed", [], "high"),
+    card("ＡＢ", null, "confirmed", [], "low"),
+  ]);
+  assert.deepEqual(score.importanceCounts, { high: 1, medium: 0, low: 0 });
+});
+
+test("取りこぼし: high/medium を期待した語が low になったら数える", () => {
+  const score = scoreCase(importanceCase, [
+    card("AB", null, "confirmed", [], "low"), // 期待 high → low = 取りこぼし
+    card("ドメイン知識", null, "confirmed", [], "low"), // 期待どおり
+  ]);
+  assert.equal(score.importanceDemoted, 1);
+  assert.equal(score.importanceDemotedTotal, 1, "low を期待した語は分母に入れない");
+  assert.deepEqual(score.importanceDemotions, ["AB: 期待 high → low"]);
+  assert.equal(aggregate([score]).importanceDemotion, 1);
+});
+
+test("取りこぼし: 期待どおりなら 0（誤補正率と同じ「無ければ 0」の向き）", () => {
+  const score = scoreCase(importanceCase, [
+    card("AB", null, "confirmed", [], "high"),
+    card("ドメイン知識", null, "confirmed", [], "low"),
+  ]);
+  assert.equal(score.importanceDemoted, 0);
+  assert.equal(aggregate([score]).importanceDemotion, 0);
+  // 期待が1件も無いケースでも 0（減点しない）
+  assert.equal(aggregate([scoreCase(base, [card("Kubernetes")])]).importanceDemotion, 0);
+});
+
+test("取りこぼし: カードが出なかった語は分母に入れない（Recall の問題）", () => {
+  const score = scoreCase(importanceCase, [card("ドメイン知識", null, "confirmed", [], "low")]);
+  assert.equal(score.importanceDemotedTotal, 0, "出なかった AB を取りこぼしに数えない");
+  assert.equal(score.importanceDemoted, 0);
+});
+
+test("**全部 low にしてもスコアが良くならない**（件数と取りこぼしを対で読む）", () => {
+  // #44 の要点。`shownRate` だけを成功条件にすると「全部 low」が最良になる
+  const allLow = aggregate([
+    scoreCase(importanceCase, [
+      card("AB", null, "confirmed", [], "low"),
+      card("ドメイン知識", null, "confirmed", [], "low"),
+    ]),
+  ]);
+  assert.equal(allLow.shownRate, 0, "通常表示は0枚 = 一見「ノイズゼロ」");
+  assert.equal(allLow.importanceDemotion, 1, "が、重要語を全部取りこぼしている");
+});
+
+test("status × importance: unresolved × high を埋もれさせない", () => {
+  const score = scoreCase(importanceCase, [
+    card("AB", "えーびー", "unresolved", ["えーびー"], "high"),
+    card("ABC", null, "unresolved", ["えーびーしー"], "low"),
+    card("ドメイン知識", null, "confirmed", [], "medium"),
+  ]);
+  assert.deepEqual(score.unresolvedByImportance, { high: 1, medium: 0, low: 1 });
 });

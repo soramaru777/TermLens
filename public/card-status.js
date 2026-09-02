@@ -35,6 +35,36 @@ export function cardStatus(card) {
 }
 
 /**
+ * 旧保存データ・壊れた localStorage の既定値（#44）。
+ *
+ * **安全側＝「隠さない」に倒す。** `low` を既定にすると、importance を持たない
+ * 既存セッションを復元した瞬間に**全カードが「その他の用語」へ消える**。
+ */
+export const IMPORTANCE_DEFAULT = "medium";
+const IMPORTANCES = ["high", "medium", "low"];
+
+/**
+ * カードの表示優先度を返す（#44）。
+ *
+ * **`cardStatus()` と同じ場所・同じ理由でここに置いてある。** 呼び出し側に
+ * `card.importance ?? "medium"` を書き散らすと必ず片方が漏れる。導出を1箇所に
+ * 閉じておけば、旧保存データ（importance を持たない）の既定値もここだけで決まり、
+ * 復元経路に分岐を足さずに済む。
+ *
+ * **必ず3値のどれかに丸める。** 戻り値は `classList` の判定に使うので、復元した
+ * localStorage が壊れて空白入りの文字列だと DOM 側で例外になり、復元の catch が
+ * セッションを丸ごと消してしまう（`cardStatus()` が同じ理由で丸めている）。
+ */
+export function cardImportance(card) {
+  return IMPORTANCES.includes(card?.importance) ? card.importance : IMPORTANCE_DEFAULT;
+}
+
+/**
+ * 表示優先度の強さ。統合で「高いほうを残す」を決めるためだけに使う（#44）。
+ */
+const IMPORTANCE_RANK = { high: 2, medium: 1, low: 0 };
+
+/**
  * カードの見出しに出す文字列を返す。
  *
  * `unresolved` のときだけ **推定した term ではなく、音声認識が実際に聞き取った表記**を
@@ -128,6 +158,8 @@ export const MAX_LINKS = 3;
  * - `surfaceForms` … 残す側 → 消す側の順で連結して重複除去。登場順を保つ
  * - `links` … 残す側を優先し、足りない分を消す側から補って `MAX_LINKS` で切る。
  *   空配列で上書きして情報を失わないため
+ * - `importance` … **高いほうを残す**（`high > medium > low`、#44）。残す側優先だと
+ *   重要なカードが低優先度カードとの統合で折りたたまれてしまう
  *
  * **`term` / `reading` / `status` / `description` / `correctedFrom` はここでは決めない。**
  * 「再評価の結果を正とする」のは呼び出し側の判断で、`keep` に反映させてから渡すこと
@@ -160,7 +192,18 @@ export function mergeDuplicateCards(keep, drop) {
     links.push(link);
   }
 
+  // **importance は明示的に決める（#44）。** `{ ...drop, ...keep }` では残す側が
+  // 無条件に勝つので、`keep=low` × `drop=high` のとき**重要なカードが折りたたみへ落ちる**。
+  // 統合は2枚を1枚にする操作で、片方が「今見る価値が高い」と判定されていた事実は
+  // 消える側にあっても残す。`surfaceForms` / `links` と同じ「明示的に決める第4のフィールド」
+  const keepImportance = cardImportance(keep);
+  const dropImportance = cardImportance(drop);
+  const importance =
+    IMPORTANCE_RANK[keepImportance] >= IMPORTANCE_RANK[dropImportance]
+      ? keepImportance
+      : dropImportance;
+
   // `drop` を土台に `keep` で上書きする。残す側に無いフィールド（復元した古いカードには
   // 欠けていることがある）だけが消える側から埋まり、両方にあるものは必ず残す側が勝つ
-  return { ...drop, ...keep, surfaceForms, links };
+  return { ...drop, ...keep, surfaceForms, links, importance };
 }

@@ -70,3 +70,50 @@
 2026-09-01 update — Issue #40「後続文脈で unresolved 用語カードを再評価して確定候補へ更新する」。案A（後続の確定カードをトリガに既存 Stage 2 で再検証）で実装した。(1) `ExtractionScheduler` に `pendingUnresolved` を持たせた。`{cardId, term, surfaceForms, correctedFrom, candidates, 文脈抜粋, attempts, lastAttemptAt}` を`MAX_PENDING_UNRESOLVED`(20) 件まで、超えたら古いほうから捨てる。**`candidates` はこれまで `enrichCard()` に渡した後で捨てていた**ので、保持経路を1本足した。(2) 新規モジュール `src/extract/rematch.ts`（`toKana` / `similarity` / `isRelated` / `mergeCandidates` / `isResolved` / `pickCandidate`）。**依存ゼロで保つ** — `normalize.ts` / `glossary.ts` と同じ理由で、純関数のテストが `new OpenAI()` を連れ込まないようにする。値として取るのは `schema.js` の `MAX_CANDIDATES` だけ（zod しか読まない）。(3) トリガは `run()` で `status !== "unresolved"` のカードが出たとき。**pending へ積むより先にトリガを引く** — 同じチャンクで出た unresolved を同じチャンクの確定カードで再評価しても、抽出段が両方を見たうえで unresolved にしている以上新しい材料が無く、順序を逆にすると unresolved が出るたびに web 検索つきの呼び出しが1本増える。(4) 再検証は **`verifyAndEnrich()` をそのまま再利用**した。関数の口が絞り込み済みの `glossaryHints` しか受けないので、#25 のプライバシー原則が型のまま継承される（渡す文脈は「unresolved が出たチャンクの抜粋 + 直近の `ContextWindow`」で、会話全文ではない）。(5) **`isVerified()` は1文字も触っていない。** あちらは「表示中の term が裏付けられたか」で、候補#2 が選ばれたら false を返すのが #24 の降格判断そのもの。一律に緩めると通常の Stage 2 の降格が壊れるので、昇格の判定は新しい述語 `isResolved(chosen, candidates)` に分けた。候補外の遮断は `parseVerifyOutput()` と合わせて**2枚重ね**になる。(6) `protocol.ts` の `card_update` に `rename?: { term, reading, correctedFrom, surfaceForms }` を追加。**入れ子にしたのは「フラグは立っているが term が無い」矛盾した組を型として書けなくするため。** `cardId` は入れない（改名で ID が変わる経路を型が許してしまう）。**既存の3経路（裏付けあり / 棄却 / 例外フォールバック）は付けない**ので挙動は #24 のまま。`session.ts` は無いときキーごと落として中継する。(7) コスト制御は5段 — `REMATCH_MIN_SIMILARITY`(0.5) / `MAX_REMATCH_ATTEMPTS`(2) / `REMATCH_COOLDOWN_MS`(30s) / `MAX_REMATCH_PER_RUN`(2) / `MAX_PENDING_UNRESOLVED`(20)、加えて `verifyDisabled`。前3つは env ノブ（`config.ts` に `ratioEnv()` を新設。閾値だけは小数でないと意味が無く、範囲外は起動時に落とす）。**`REMATCH_MIN_SIMILARITY=0` は素通し**で、`MAX_WEB_SEARCHES=0` と同じ「分布を測ってから値を決める」約束。**試行は投げた時点で数える** — 結果を待つと、検証が遅い間に次のチャンクが来て同じカードを何本も投げられる。(8) 昇格に成功したら pending から外し、確定した用語を `shownTerms` に載せる（#24 が枠を空けていた理由がそこで消える。載せないと後続チャンクで同じ用語のカードがもう1枚出る）。**失敗しても `card_update` は送らない** — 再評価の対象は `willEnrich` を予告していない既存カードなので、送っても意味のない更新が増えるだけ。(9) クライアントは `mergeCardUpdate()` に `rename` の分岐だけを足した（**`shouldApplyResend()` は変更なし**。速報の再送に `rename` は無いので #24 のガードがそのまま正しい）。統合ルールは純関数 `mergeDuplicateCards(keep, drop)` を `card-status.js` に新設し、DOM 反映は `app.js` の `mergeRenamedCard()` に分けた。残す cardId は**登場順が早いほう**、`surfaceForms` は 残す側 → 消す側 の順で連結、`links` は残す側優先で3件まで補完。`incomingCardId` と `highlightOwner` は**全件走査で張り替える**（`reassignIncomingCardId()` / `reassignHighlightOwner()` を新設。同じカードを指す serverCardId は再接続のたびに増えるので、1件だけ直しても例外は出ず更新が迷子になる）。`activeCardId` が消える側を指していたら残す側へ移す。**古い surface form のハイライトは残す** — 文字起こし本文は崩れた表記のまま残る（この Issue は raw transcript を書き換えない）ので、消すと過去の行からカードへ辿れなくなる。(10) 評価ハーネスに `rematchAttempts` / `rematchPromoted` / `rematchCorrect` / `rematchMiscorrected`（`CaseScore`）と `rematchPromotion` / `rematchMiscorrection`（`Metrics`）、`TermCase.expectRematch` を追加し、`formatTable` に「再評価」行を新設した。**昇格率の分母 0 は 0 に倒す** — `ratio()` の「分母 0 は減点しない＝1」だと、機能が一度も発火していないランが「昇格率 100%」に見える。ハーネスも本番と同じ述語で再評価を回すが、**1ケース＝1チャンクなのでトリガの時間差だけは作れない**。測れるのは判断の質で、発火頻度は実機でしか分からない。(11) テスト: `rematch.test.ts`（純関数28本）/ `scheduler-rematch.test.ts`（昇格・維持・無関係・上限4種・cooldown・verifyDisabled・プライバシー、16本。**時計を差し替えて** cooldown を待たずに跨ぐ）/ `merge-duplicate.test.ts`（統合ルール12本）を新設し、`card-status`（**rename 無しでは昇格させない #24 の回帰**を含む5本）/ `app-wiring`（改名と統合の配線6本。**`finalLines` に触らない**ことも悪い形の不在で固定）/ `session-wiring`（rename の透過2本）/ `terms-markdown`（改名後の内容2本）/ `eval-metrics`（再評価指標7本）/ `config-env`（新ノブ3本）に追加。fixture に `rematch-garbled-then-clear` を1件足した（**匿名化した合成データのみ**。既存の `unresolved-*` 2件は `expectRematch` を空のままにしてある — あの2件は「断定しないのが正解」なので、昇格したら必ず誤補正に数えられるのが正しい）。532件（うち LLM 評価1件は skip）が緑。**変異は4系統で検出を確認**（1 run あたりの上限を外す / 昇格後に pending から外さない / `mergeCardUpdate` の unresolved ガードを外す / `mergeDuplicateCards` の残す側優先と `MAX_LINKS` を外す）。`isResolved()` を `chosen !== null` に緩める変異は**検出されなかった** — `parseVerifyOutput()` が先に候補外を弾くため、スケジューラ経由では観測できない多層防御になっている（述語そのものは `rematch.test.ts` が固定）。**上限値・閾値は5つとも暫定で、1つも計測していない。** 決め方（`REMATCH_MIN_SIMILARITY=0` で分布を測る手順）と、人がやる必要のあること4項目を open-issues に明記した。
 
 2026-09-02 update — Issue #42「Stage 2 の候補一致判定で読み仮名付き表記を正規化する」。案C（パーサ側のガード + プロンプト側の発生源修正）で実装した。**調査で分かったのは、これがモデルの逸脱ではなく仕様のズレだったこと** — `buildVerifyInput()` が候補一覧を `${c.term}(読み: ${c.reading}) — 根拠: …` と**用語と読みを結合した1つの文字列**で描画しておきながら、SYSTEM は「chosen には候補として与えられた表記をそのまま入れること」と指示していた。モデルから見れば与えられた表記は `AB(読み: エービー)` であり、それを返すのは**指示に忠実な挙動**。受け取る `parseVerifyOutput()` 側だけが「`c.term` と一致するはず」という別の前提で比べていたので、実在性・文脈適合性ともに問題のないカードが `out-of-candidates` で `unresolved` へ落ちていた。(1) `normalize.ts` に `stripReadingNote()` と `matchCandidate()` を新設（**依存ゼロを保つため `Candidate` 型は import せず** `{ term: string }` のジェネリックにした。`parseVerifyOutput()` の既存シグネチャと同じ形）。判定は 完全一致 → `normalizeTerm()` 一致 → `chosen` 側だけ読み注記を剥がしての一致 の3段。(2) **`normalizeTerm()` を先に通してから剥がす順序が設計の要**。NFKC が全角括弧・全角コロンを半角へ寄せ空白も落とすので、`AB（読み：エービー）` も `AB (読み: エービー)` も `ab(読み:エービー)` の一形に潰れ、**パターンが1本で済む**。生の文字列に当てる設計だと括弧の種類×コロンの全半角×空白の有無を数え上げることになり、数え漏らした表記だけが静かに候補外へ落ちる（#25 で `MIN_PREFIX_MATCH` / `MAX_ENTRY_WORDS` を畳んだときと同じ形の判断）。(3) **候補側は無加工にした**。3段目で候補側も剥がすと正式名称に括弧を含む候補（`AB(旧称)`）が別用語へ当たりうる。候補側を触らなければ、そういう候補は1〜2段目で当たるか別用語として棄却されるかの二択になり、**AC「正式名称中の括弧を誤って除去しない」をテストではなく構造で満たす**。(4) 発生源も直した — `buildVerifyInput()` は `AB — 読み: エービー — 根拠: …` と区切りを他フィールドへ揃え、SYSTEM も「chosen には候補の用語表記だけを入れること。読みや注記を付け足さないこと」に変えた。**ただし B 単独では AC を満たさない**（LLM の出力は保証できず「起きないこと」を決定的テストで固定できない）ので、3段目は多層防御として残す。(5) **候補制約（#23）は1文字も緩めていない**。候補集合の外から新しい用語を採る経路は増えておらず、`rejection: "out-of-candidates"` の内訳も維持。一般的な fuzzy match も入れていない。逆順の `エービー（AB）` は実ログでの発生が確認されていないのでスコープ外（観測されたら別 Issue）。(6) テストは `tests/match-candidate.test.ts` を新設（13本。**実会話の用語は使わず匿名化した合成データのみ**）— 読み注記あり / 全角括弧・全角コロン / 前後空白 / よみ・ヨミ表記 / canonical term が返る / 前方一致する別候補（`AB` vs `ABC`）を取り違えない / 別用語（`ドメイン知識` vs `業務知識`）は一致しない / 注記だけの応答は当てない / 正式名称の括弧を壊さない / 語中の括弧は剥がさない。`verify-parse.test.ts` に結線テスト2本（読み注記付き `chosen` が候補の表記へ寄る / 剥がしても候補外なら `out-of-candidates` のまま）と、`buildVerifyInput()` が **term と読みを結合しないこと**の固定を追加。560件（LLM 評価1件は skip）が緑。(7) **変異は3系統すべて検出を確認**（読み注記の除去を外す→7件失敗 / 候補外なら先頭候補へ倒す→3件失敗 / 全括弧を無条件削除→3件失敗）。(8) **効果の測定は人の作業として残っている** — `out-of-candidates` 件数 / `unresolved` 率 / 補正率 / **誤補正率** を develop と本ブランチの両方で LLM 評価を回して比較する必要がある。`out-of-candidates` が減ること自体は成功条件にしない（別用語まで通せば安全性が下がる）ので、誤補正率と必ずセットで読む。決定的テストが固定できるのは「別用語を通さないこと」までで、実データでの誤補正率の変化はモデルの実行結果でしか測れない。
+
+## 2026-09-03 — 用語カードの表示優先度（Issue #44、案B）
+
+`TermCard` に `importance: high | medium | low` を足し、`low` を「その他の用語」へ
+折りたたむところまで実装した。更新: [[termlens-term-extraction]]（「表示優先度」節を新設）、
+[[termlens-architecture]]（プロトコル表・設計上の選択）、[[termlens-open-issues]]（未計測項目）。
+
+**調査で「人の判断待ち」とした論点が、設計上は強制だと分かった。** 縦積み（スマホ）の
+カードナビから `low` を外すかは AC に無い任意項目のつもりだったが、`addCard()` が追従中に
+新しいカードを無条件で active にするため、**折りたたまれた `low` が active になると
+表示できるカードが1枚も無くなる**（`.card` は既定 `display:none`、`.active` の1枚だけが出る）。
+UX の好みではなく空画面の防止で、`visibleCardIds()` は必須だった。
+
+**AC の半分は「触らないこと」で満たされた。** `selectVerifyTargets()` は構造的部分型なので
+`importance` を足しても選定が動かず、`CardRename` に入れないかぎり `mergeCardUpdate()` の
+`{ ...stored, ...renamed }` が改名時の値を守る。`toClientCard()` はフィールドを1つずつ
+書き写す設計なので、`protocol.ts` に足した時点で**型エラーが写し漏れを止めた**。
+一方、`mergeDuplicateCards()` は `{ ...drop, ...keep }` で残す側が無条件に勝つため、
+`high > medium > low` は**明示的に書く必要があった**（AC が自動では満たされない唯一の箇所）。
+
+**案A（`<details>` の別コンテナ）を採らなかった理由が実装で裏取りできた。**
+`findCardEl()` / `setActiveCard()` / `mergeRenamedCard()` は `[...cardsEl.children]` を
+走査しており、別コンテナへ移すと引けなくなる。`updateCard()` は引けなかったとき静かに
+抜けるので「low カードだけ清書が来ない」がテスト緑のまま通る。案B（クラス + CSS `order`）は
+この3箇所を1行も触っていない。
+
+**CSS の詳細度は数えて決めた。** `#cards:not(.show-low) .card.low` は (1,3,0) で、縦積みの
+`#cards .card.active` (1,2,0) に勝つ。`:not()` の詳細度は引数を数えるので、ここを
+`.card.low`(0,2,0) と書くと**低優先度カードが active のときだけ折りたたみをすり抜ける**。
+
+**評価指標は件数と取りこぼしを対で出す。** `shownRate` だけを成功条件にすると「全部 low に
+する」が最良の実装になる（#40 の「unresolved 率だけを下げない」と同じ構造）。
+`expectImportance` は `low` を期待した語を取りこぼしの分母から外している。入れると平易な語を
+`medium` に置いただけで数字が悪化し、同じ穴が空く。
+
+**変異テスト 11 種すべてを検出できた。** 統合規則の削除 / 丸めの除去 / 既定値を low へ /
+選定への importance 持ち込み / 追従を `cardData.keys()` へ戻す / 自動展開の削除 /
+`low` クラスの削除 / Markdown からの除外 / 取りこぼし分母への low 混入 / dedupe 前集計 /
+クロス集計の削除。
+
+**副次的に既存テストの前提ずれを1つ直した。** `tests/mock-words.test.ts` が生の
+`term-cases.json` を読むとき `expectCorrection` を必須扱いしていたが、`TermCaseSchema` では
+`.default({})` の optional。誤補正を扱わないケースを1件足した時点で
+`Object.keys(undefined)` で落ちた。スキーマの契約に合わせた。
+
+**未計測**: 実機での分布・重要語の取りこぼし率・スマホでの折りたたみ挙動。
+[[termlens-open-issues]] に人の作業として残した。

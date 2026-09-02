@@ -13,6 +13,7 @@ import {
   mergeDuplicateCards,
   shouldApplyResend,
   UNRESOLVED_LABEL,
+  cardImportance,
 } from "./card-status.js";
 import {
   buildTermsMarkdown as buildTermsMarkdownPure,
@@ -295,6 +296,11 @@ function clearSessionContent() {
   interimText.textContent = "";
   cardsEl.textContent = ""; // エラーバナーもここで消えるので参照を落とす
   errorBanner = null;
+  // トグル行も cardsEl の子なのでここで消えている。参照と展開状態を必ず一緒に落とす(#44) —
+  // 片方だけ残すと、次のセッションで「展開済みだがトグルが無い」状態が作れてしまう
+  lowToggle = null;
+  lowExpanded = false;
+  cardsEl.classList.remove("show-low");
   renderCardNav();
 }
 
@@ -698,6 +704,31 @@ let pinnedToCard = false;
 // style.css の @media (max-width: 899px) と対になっている。片方だけ変えないこと
 const stackedLayout = window.matchMedia("(max-width: 899px)");
 
+/**
+ * 「その他の用語」を展開しているか(#44)。**セッション内だけの状態**で永続化しない
+ * (Issue の要件: 折りたたみ状態はセッション内で維持すれば十分)。
+ */
+let lowExpanded = false;
+
+/**
+ * 追従・巡回の対象になるカードのローカル ID(#44)。折りたたみ中は `low` を除く。
+ *
+ * **これは UX の好みではなく、空画面を防ぐための必要条件。** 縦積み(スマホ)では
+ * `.card` が既定で `display:none` で、`.active` の1枚だけが出る。そこへ
+ * 「折りたたみ中の low を隠す」規則が加わるので、`activeCardId` が low を指した瞬間に
+ * **表示できるカードが1枚も無くなる**(low は折りたたみで消え、他は .active が無い)。
+ * `addCard()` は追従中なら新しいカードを無条件に active にするため、low が届いた
+ * だけでその状態になりうる。
+ *
+ * **`cardData` そのものは絞らない。** Markdown エクスポートと保存は全カードを見る
+ * (AC: low を落とさない)。ここで絞るのは「いま画面に出せるカード」だけ。
+ */
+function visibleCardIds() {
+  return [...cardData.keys()].filter(
+    (id) => lowExpanded || cardImportance(cardData.get(id)) !== "low",
+  );
+}
+
 function setActiveCard(cardId) {
   activeCardId = cardId;
   for (const card of cardsEl.children) {
@@ -706,9 +737,54 @@ function setActiveCard(cardId) {
   renderCardNav();
 }
 
+// ---- 「その他の用語」の折りたたみ(#44) ----
+// **DOM は #cards 直下のまま**にする。`<details>` の別コンテナへ移すと
+// `findCardEl()` / `setActiveCard()` / `mergeRenamedCard()` の `cardsEl.children` 走査が
+// 引けなくなり、**例外を出さずに card_update が low カードだけ届かなくなる**。
+// `#cards` は flex column なので、CSS の `order` で「下部へ寄せる」がDOMを動かさずに済む。
+//
+// トグル行に `.card` クラスを付けないのは `.error-banner` と同じ理由 —
+// 縦積みの `#cards .card { display:none }` を受けず、入口として常に見えるようにするため。
+let lowToggle = null;
+
+function lowCardCount() {
+  let n = 0;
+  for (const card of cardData.values()) if (cardImportance(card) === "low") n++;
+  return n;
+}
+
+function setLowExpanded(expanded) {
+  if (lowExpanded === expanded) return;
+  lowExpanded = expanded;
+  cardsEl.classList.toggle("show-low", lowExpanded);
+  renderLowToggle();
+  // 巡回対象が変わるので件数表示を作り直す。追従中に low が可視化されたときは
+  // 表示を動かさない（人が展開した直後にカードが勝手に飛ぶのを避ける）
+  renderCardNav();
+}
+
+function renderLowToggle() {
+  const count = lowCardCount();
+  if (count === 0) {
+    lowToggle?.remove();
+    lowToggle = null;
+    return;
+  }
+  if (!lowToggle) {
+    lowToggle = el("button", "low-toggle");
+    lowToggle.type = "button";
+    lowToggle.addEventListener("click", () => setLowExpanded(!lowExpanded));
+    cardsEl.append(lowToggle);
+  }
+  lowToggle.textContent = `${lowExpanded ? "▼" : "▶"} その他の用語（${count}件）`;
+  lowToggle.setAttribute("aria-expanded", String(lowExpanded));
+}
+
 function renderCardNav() {
-  // cardData のキーはローカル ID。挿入順 = 登場順なので、並びの意味は #38 前と同じ
-  const ids = [...cardData.keys()];
+  // 巡回対象は**いま画面に出せるカードだけ**(#44)。`cardData` を直に使うと、
+  // 折りたたまれた low まで「N / M」に数えられ、辿り着けない番号が出る。
+  // キーはローカル ID で挿入順 = 登場順なので、並びの意味は #38 前と同じ
+  const ids = visibleCardIds();
   if (ids.length === 0) {
     cardNav.hidden = true;
     return;
@@ -723,13 +799,18 @@ function renderCardNav() {
 
 latestBtn.addEventListener("click", () => {
   pinnedToCard = false;
-  const ids = [...cardData.keys()];
+  // 「最新」も可視カードの中で選ぶ(#44)。折りたたまれた low へ飛ぶと画面が空になる
+  const ids = visibleCardIds();
   setActiveCard(ids[ids.length - 1] ?? null);
 });
 
 function jumpToCard(cardId) {
   const card = findCardEl(cardId);
   if (!card) return;
+  // **折りたたまれた low へ飛ぶと何も見えない**(#44)。先に展開してから通常経路へ合流する。
+  // 展開すると visibleCardIds() に low が入るので、この後の active 切り替えもそのまま効く。
+  // DOM の付け替えもレイアウト確定待ちも要らず、クラス1つの付け外しで済む
+  if (card.classList.contains("low")) setLowExpanded(true);
   // 縦積みのときだけ、タップした語に固定する(以後、新しいカードが出ても表示は変わらない)。
   // 横並びでは全カードが見えており、固定する意味がないうえ回転時に古いカードが残るため。
   if (stackedLayout.matches) {
@@ -832,6 +913,10 @@ function renderCardHead(div, card) {
   const heading = cardHeading(card);
   div.classList.remove("confirmed", "probable", "unresolved");
   div.classList.add(status);
+  // 表示優先度のクラスも**ここで付け外しする**(#44)。renderCardHead は addCard と
+  // updateCard の両方が通る唯一の再構築点なので、片方だけ付け忘れる形が作れない。
+  // 折りたたみは CSS 側(`#cards:not(.show-low) .card.low`)がこのクラスだけを見る
+  div.classList.toggle("low", cardImportance(card) === "low");
 
   let header = div.querySelector(".card-header");
   if (!header) {
@@ -933,8 +1018,15 @@ function addCard(card) {
   }
   // バナーがあればその直後に挿入し、バナーを常に先頭に保つ
   cardsEl.insertBefore(div, errorBanner ? errorBanner.nextSibling : cardsEl.firstChild);
-  // 追従中なら新しいカードに切り替える。固定中は表示を動かさず件数だけ更新する
-  if (pinnedToCard) renderCardNav();
+  // 「その他の用語」の件数はカードが増えるたびに変わる(#44)。
+  // **DOM への追加より後**に呼ぶ — トグル行は cardsEl.append() で末尾に置くので、
+  // 先に呼ぶと新しいカードがトグル行より後ろに入る(CSS の order で見た目は揃うが、
+  // DOM 順は登場順の意味を持つので崩さない)
+  renderLowToggle();
+  // 追従中なら新しいカードに切り替える。固定中は表示を動かさず件数だけ更新する。
+  // **折りたたまれた low には追従しない**(#44) — 縦積みで表示できるカードが
+  // 1枚も無い状態になるため。可視でないカードが来たときは件数だけ更新する
+  if (pinnedToCard || !visibleCardIds().includes(localId)) renderCardNav();
   else setActiveCard(localId);
   scheduleSessionSave();
   return localId;
@@ -986,6 +1078,8 @@ function mergeRenamedCard(renamedId, otherId) {
   // **固定中でも表示が飛ばないようにする。** `pinnedToCard` は真偽値なので付け替えは
   // 要らないが、`activeCardId` が消えた DOM を指したままだと縦積みレイアウトで
   // カードが1枚も表示されない画面になる
+  // 統合で「その他の用語」の件数が変わる（低いほうが消える／統合で high に昇格する、#44）
+  renderLowToggle();
   if (activeCardId === dropId) setActiveCard(keepId);
   else renderCardNav(); // 件数が1枚減るので位置表示だけ更新する
   return keepId;
