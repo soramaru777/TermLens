@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
 import type { TermLink } from "../protocol.js";
-import { normalizeTerm } from "./normalize.js";
+import { matchCandidate, normalizeTerm } from "./normalize.js";
 // 依存ゼロのモジュールに置いてある(評価ハーネスが `new OpenAI()` 抜きで見出しを読むため)
 import { REJECTION_LABEL, type RejectionKind } from "./rejection.js";
 import type { Candidate } from "./schema.js";
@@ -63,7 +63,7 @@ ${SEARCH_BUDGET_RULE}- 「用語集の関連語」が与えられている場合
 - verification.exists には、採用した候補(棄却した場合は最も有力だった候補)が実在するとウェブ検索で確認できたかを入れること
 - verification.fitsContext には、その用語が会議の文脈に意味的に合うかを入れること。実在するが文脈に合わない場合は exists: true, fitsContext: false とすること
 - verification.evidence には判断の根拠を一言で書くこと(どのページで何を確認したか)
-- chosen には候補として与えられた表記をそのまま入れること。候補に無い用語を新たに作らないこと
+- chosen には候補の用語表記だけを入れること。読みや注記を付け足さないこと。候補に無い用語を新たに作らないこと
 - どの候補も裏付けが取れない場合は、無理に選ばず chosen を null にすること。音韻が似ているだけの実在用語を選ぶくらいなら、選ばないほうがよい
 - exists か fitsContext のどちらかが false のときは chosen を null にすること
 - reason には選択または棄却の理由を日本語で一言だけ書くこと(内部記録用。利用者には表示しない)
@@ -261,7 +261,7 @@ export function isJapaneseSource(url: string, title?: string): boolean {
  */
 export function buildVerifyInput(input: VerifyAndEnrichInput): string {
   const list = input.candidates
-    .map((c, i) => `${i + 1}. ${c.term}(読み: ${c.reading}) — 根拠: ${c.rationale}`)
+    .map((c, i) => `${i + 1}. ${c.term} — 読み: ${c.reading} — 根拠: ${c.rationale}`)
     .join("\n");
   const hints = input.glossaryHints;
   return [
@@ -386,7 +386,9 @@ export function parseVerifyOutput(
   if (raw === "")
     return { verification, chosen: null, rejection: rejectionOf(verification), reason, description };
 
-  const matched = candidates.find((c) => normalizeTerm(c.term) === normalizeTerm(raw));
+  // 表記の揺れ(読み注記)は候補側へ寄せてから比べる(#42)。候補外を採らない制約は
+  // `matchCandidate()` の中でもそのまま — 一致しなければ null が返る。
+  const matched = matchCandidate(raw, candidates);
   if (!matched) {
     return {
       verification,

@@ -105,6 +105,25 @@ test("chosen の表記ゆれは候補側の表記に揃える", () => {
   assert.equal(decision.chosen, "Qdrant", "isVerified() の突き合わせを表記に振らせない");
 });
 
+test("読み注記付きの chosen は候補の表記へ寄せる", () => {
+  // 候補一覧は `Qdrant — 読み: テスト` の形で渡しているが、モデルが読みを結合して
+  // 返しても候補外にはしない(#42)。返るのは候補側の canonical な表記。
+  const decision = parseVerifyOutput(output({ chosen: "Qdrant(読み: クドラント)" }), CANDIDATES);
+  assert.equal(decision.chosen, "Qdrant");
+  assert.equal(decision.rejection, null, "装飾が付いただけの同一用語を棄却しない");
+});
+
+test("読み注記を剥がしても候補に無い用語は候補外のまま棄却する", () => {
+  // #42 は候補制約を緩めない。ここが通ると検証段を立てた意味が無くなる
+  const decision = parseVerifyOutput(
+    output({ chosen: "Pinecone(読み: パインコーン)", reason: "こちらのほうが自然" }),
+    CANDIDATES,
+  );
+  assert.equal(decision.chosen, null);
+  assert.equal(decision.rejection, "out-of-candidates", "棄却理由の内訳を変えない");
+  assert.ok(decision.reason.includes("Pinecone"), "何が返ってきたかは追えるようにする");
+});
+
 test("コードフェンスや前置きに包まれていても拾う", () => {
   const wrapped = "検索結果に基づきます。\n\n```json\n" + output({ chosen: "Qdrant" }) + "\n```";
   assert.equal(parseVerifyOutput(wrapped, CANDIDATES).chosen, "Qdrant");
@@ -241,6 +260,10 @@ test("候補・元の表記・文脈を入力に並べる", () => {
   });
   assert.ok(input.includes("1. Qdrant"));
   assert.ok(input.includes("2. Quadrant"));
+  // 用語表記と読みを結合しない(#42)。`Qdrant(読み: テスト)` と描画すると、
+  // 「候補として与えられた表記をそのまま入れる」に従ったモデルの応答が候補外に落ちる
+  assert.ok(!input.includes("Qdrant(読み:"), "term と読みを1つの文字列にしない");
+  assert.ok(input.includes("Qdrant — 読み: テスト"), "読みは別のフィールドとして渡す");
   assert.ok(input.includes("音韻が近い"), "根拠も渡す（候補ごとのスコア相当）");
   assert.ok(input.includes("クドラント"));
   assert.ok(input.indexOf("Qdrant") < input.indexOf("ベクトル検索の比較検討"));
