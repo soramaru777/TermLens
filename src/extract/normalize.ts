@@ -44,3 +44,59 @@ export function splitWords(text: string): Array<{ raw: string; key: string }> {
     .map((raw) => ({ raw, key: normalizeTerm(raw) }))
     .filter((w) => w.key.length > 0);
 }
+
+/**
+ * 読み注記だけを剥がした比較用のキーを返す(#42)。**入力は `normalizeTerm()` 済みの文字列**。
+ *
+ * 剥がすのは末尾の `(読み: …)` に限る。**一般の括弧は削らない** — 正式名称に括弧を含む
+ * 用語(`AB(旧称)` のような表記)まで壊れ、別用語へ当たる経路ができてしまう。
+ *
+ * **`normalizeTerm()` を先に通す前提にしてあるのは、パターンを1本で済ませるため。**
+ * NFKC が全角括弧・全角コロンを半角へ寄せ、空白も落ちるので、
+ * `AB（読み：エービー）` も `AB (読み: エービー)` も `ab(読み:エービー)` の一形に潰れる。
+ * 生の文字列に当てようとすると、括弧の種類とコロンの全半角と空白の有無の組み合わせを
+ * 数え上げることになり、**数え漏らした表記だけが静かに候補外へ落ちる**。
+ */
+export function stripReadingNote(key: string): string {
+  return key.replace(/\((?:読み|よみ|ヨミ):?[^()]*\)$/, "");
+}
+
+/**
+ * 検証段が返した `chosen` を候補へ突き合わせる(#42)。一致した候補をそのまま返す。
+ *
+ * **候補制約(#23)を緩める関数ではない。** 候補集合の外から新しい用語を採る経路は
+ * 増やしていない。同じ用語に装飾が付いただけの表記を候補へ寄せるだけで、
+ * 別用語は従来どおり `null`(= `out-of-candidates`)に倒れる。
+ *
+ * 判定は3段:
+ *   1. 完全一致
+ *   2. `normalizeTerm()` 一致(#42 以前の判定そのもの)
+ *   3. **`chosen` 側だけ**読み注記を剥がしての `normalizeTerm()` 一致
+ *
+ * **候補側は `normalizeTerm()` しか通さない。** 3段目で候補側も剥がすと、正式名称に
+ * 括弧を含む候補が別用語へ当たりうる。候補側を無加工にしておけば、そういう候補は
+ * 1段目か2段目で当たるか、当たらないなら別用語として棄却されるかの二択になり、
+ * **「正式名称の括弧を壊す」経路が構造上生まれない**。
+ *
+ * 3段目が要るのは、候補一覧を `AB(読み: エービー)` の形でプロンプトへ描画していたため
+ * (`buildVerifyInput()`)。モデルは「候補として与えられた表記」を忠実に返しているのに、
+ * 受け側だけが `term` と一致する前提で比べていた。描画は #42 で分離したが、
+ * それだけではモデルの出力を保証できないので、こちらは多層防御として残す。
+ */
+export function matchCandidate<T extends { term: string }>(
+  chosen: string,
+  candidates: readonly T[],
+): T | null {
+  const exact = candidates.find((c) => c.term === chosen);
+  if (exact) return exact;
+
+  const key = normalizeTerm(chosen);
+  const normalized = candidates.find((c) => normalizeTerm(c.term) === key);
+  if (normalized) return normalized;
+
+  const stripped = stripReadingNote(key);
+  // 剥がせなかった(= 読み注記が無い)なら2段目と同じ判定になるので、そこで打ち切る。
+  // 空になるのは `chosen` が注記だけだったとき。用語名が無いので候補には当てない。
+  if (stripped === key || stripped === "") return null;
+  return candidates.find((c) => normalizeTerm(c.term) === stripped) ?? null;
+}
