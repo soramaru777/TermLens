@@ -70,6 +70,12 @@
       <select id="capture-mode"></select>
       <p id="capture-mode-hint" class="hint"></p>
 
+      <label for="expected-speakers">想定話者数</label>
+      <!-- 選択肢は speaker-stats.js の EXPECTED_SPEAKER_OPTIONS から app.js が組み立てる
+           (ここに文言を書き写すと定義が2箇所になる) -->
+      <select id="expected-speakers"></select>
+      <p class="hint">Deepgram に話者数を指定するものではありません。診断で実際に検出された話者数と比べるためだけに使います。</p>
+
       <label class="checkbox-row"><input id="persist-toggle" type="checkbox"> 会議の内容をこの端末に保存する</label>
       <p class="hint">音声は保存されません。保存から24時間で自動的に削除されます。</p>
 

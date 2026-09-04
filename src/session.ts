@@ -139,10 +139,26 @@ export class Session {
         // buildFinalEvents() 側に持たせるとグローバルカウンタになり、純関数として
         // テストできなくなる
         finalSeq: e.isFinal ? this.assignFinalSeq(e) : undefined,
+        // word 数だけを整数1つで載せる(#46)。words 配列そのものは #19 の判断どおり
+        // 載せない(ペイロードが約13倍になる)。interim には付けない —
+        // 話者統計は final だけを数えるので、付けても読み手がいない
+        wordCount: e.isFinal ? e.words?.length : undefined,
       });
       if (e.isFinal) builder.addFinal(e);
     });
     stt.onUtteranceEnd(() => builder.utteranceEnd());
+    // モデル情報はアダプタが「変わったときだけ」呼ぶ契約なので、ここは素通しでよい(#46)。
+    //
+    // **スプレッド(`...info`)にしないこと。** オブジェクトリテラルへのスプレッドには
+    // TypeScript の excess property check が効かないので、将来 `SttInfo` に
+    // `requestId` のようなフィールドが1つ増えると、`ServerMessage` の型に書かなくても
+    // **型エラーゼロのままクライアントへ出ていく**。フィールドを明示して並べておけば、
+    // 「型に書き、ここにも書く」まで進まないと外へ出ない
+    // (`toSttInfo()` の採用リストと合わせて2層。`diagnostics.js` の `TRACK_KEYS` が
+    // `pickTrackSettings()` と `trackSettingRows()` の2層で守っているのと同じ密度にする)
+    stt.onSttInfo((info) =>
+      this.send({ type: "stt_info", model: info.model, diarizer: info.diarizer }),
+    );
     stt.onError((err) => {
       console.error("[session] STT error:", err);
       this.send({ type: "error", code: "stt_error", message: err.message });

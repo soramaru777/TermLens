@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import type { SttAdapter, TranscriptEvent, TranscriptWord } from "./types.js";
+import type { SttAdapter, SttInfo, TranscriptEvent, TranscriptWord } from "./types.js";
 import { buildFinalEvents } from "./split.js";
 import { config } from "../config.js";
 
@@ -89,6 +89,55 @@ export function toTranscriptWords(words?: DeepgramWord[]): TranscriptWord[] | un
 }
 
 /**
+ * Deepgram streaming の Results に載る `metadata`。ここで使うぶんだけ。
+ *
+ * 実際の形は
+ * `{ request_id, model_info: { name, version, arch }, model_uuid, diarize_info?: { model_uuid, arch } }`。
+ * `diarize_info` は **diarizer が動いたときだけ** present。
+ *
+ * **`request_id` は型に持たせない。** 持たせると「載せない」がコメントだけの約束になる。
+ * 型に無ければ、`toSttInfo()` を書き換えないかぎり外へ出しようがない
+ * (`public/diagnostics.js` の `TRACK_KEYS` と同じ、採用リストの発想)。
+ */
+export interface DeepgramMetadata {
+  model_info?: { name?: string; version?: string; arch?: string };
+  diarize_info?: { model_uuid?: string; arch?: string };
+}
+
+/**
+ * Results の metadata から `SttInfo` を作る。スネークケース → キャメルケースの変換は
+ * ここに閉じる(`toTranscriptWords()` と同じ方針)。
+ *
+ * **取れなかったキーは落とす。** 「取れていない」ことは、キーの不在で表す
+ * (ダミー値や空文字を入れると、受け手が「取れたが空だった」と区別できない)。
+ * 何も取れなければ `undefined` を返し、アダプタはコールバックを呼ばない。
+ *
+ * **判定は `!= null`。** `undefined` だけを弾くと、Deepgram が `name: null` を返したときに
+ * `{ name: null }` という「取れていない値を持つオブジェクト」が1階層できてしまい、
+ * 「取れたものだけを持つ」という上の約束が崩れる(表示側は truthy 判定で落とすので
+ * 画面には出ないが、その差は型からは読めない)。
+ *
+ * export しているのは tests/stt-info.test.ts から検証するため。
+ */
+export function toSttInfo(metadata: DeepgramMetadata | undefined): SttInfo | undefined {
+  const info: SttInfo = {};
+  const mi = metadata?.model_info;
+  const model = {
+    ...(mi?.name != null ? { name: mi.name } : {}),
+    ...(mi?.version != null ? { version: mi.version } : {}),
+    ...(mi?.arch != null ? { arch: mi.arch } : {}),
+  };
+  if (Object.keys(model).length > 0) info.model = model;
+  const di = metadata?.diarize_info;
+  const diarizer = {
+    ...(di?.arch != null ? { arch: di.arch } : {}),
+    ...(di?.model_uuid != null ? { modelUuid: di.model_uuid } : {}),
+  };
+  if (Object.keys(diarizer).length > 0) info.diarizer = diarizer;
+  return info.model || info.diarizer ? info : undefined;
+}
+
+/**
  * Deepgram streaming STT アダプタ。
  * wss://api.deepgram.com/v1/listen に 16kHz mono PCM16 を流し、
  * interim/final transcript を受け取る。用語集は keywords ブーストとして渡す。
@@ -98,6 +147,13 @@ export class DeepgramSttAdapter implements SttAdapter {
   private keepAlive: NodeJS.Timeout | null = null;
   private transcriptCb: ((e: TranscriptEvent) => void) | null = null;
   private utteranceEndCb: (() => void) | null = null;
+  private sttInfoCb: ((info: SttInfo) => void) | null = null;
+  /**
+   * 直近に通知した `SttInfo` の JSON。**変化の検出だけに使う。**
+   * Deepgram は Results ごとに同じ metadata を返すので、素通しすると
+   * 同じ内容の `stt_info` を数百回クライアントへ送ることになる。
+   */
+  private lastSttInfoJson: string | null = null;
   private errorCb: ((err: Error) => void) | null = null;
   private closeCb: (() => void) | null = null;
   private stopping = false;
@@ -112,6 +168,11 @@ export class DeepgramSttAdapter implements SttAdapter {
       interim_results: "true",
       punctuate: "true",
       smart_format: "true",
+      // **`diarize_model` へは切り替えない(#46)。** streaming の `diarize_model=latest` は
+      // 現状 v1 に解決され、deprecated な `diarize=true` も v1 に行くので今日は挙動が
+      // 変わらない。かつ `diarize` と `diarize_model` の同時指定は Deepgram に 400 で
+      // 拒否されるため、切り替えるなら**入れ替え**が必要で、それは別 PR にする
+      // (この Issue は「どの diarizer が動いていたか」を観測できるようにするだけ)。
       diarize: "true",
       // 既定値は 10ms で、わずかな間でも確定してしまい文の途中で切れる。
       // 300ms にすると自然な文単位でまとまり、smart_format の句読点も付きやすくなる。
@@ -154,6 +215,15 @@ export class DeepgramSttAdapter implements SttAdapter {
         try {
           const msg = JSON.parse(data.toString());
           if (msg.type === "Results") {
+            // モデル情報は Results ごとに同じ値で載ってくる。**変わったときだけ**通知する
+            const info = toSttInfo(msg.metadata as DeepgramMetadata | undefined);
+            if (info) {
+              const json = JSON.stringify(info);
+              if (json !== this.lastSttInfoJson) {
+                this.lastSttInfoJson = json;
+                this.sttInfoCb?.(info);
+              }
+            }
             const events = buildTranscriptEvents(
               msg.channel?.alternatives?.[0],
               msg.is_final === true,
@@ -224,6 +294,9 @@ export class DeepgramSttAdapter implements SttAdapter {
   }
   onUtteranceEnd(cb: () => void): void {
     this.utteranceEndCb = cb;
+  }
+  onSttInfo(cb: (info: SttInfo) => void): void {
+    this.sttInfoCb = cb;
   }
   onError(cb: (err: Error) => void): void {
     this.errorCb = cb;

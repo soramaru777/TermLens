@@ -129,9 +129,51 @@ test("表示とエクスポートは同じ groupUtterances() を通す", () => {
 test("受信した final には finalSeq を seq として積む", () => {
   assert.match(
     CODE,
-    /finalLines\.push\(\{ text: msg\.text, speaker: msg\.speaker, t: Date\.now\(\), seq: msg\.finalSeq \}\)/,
-    "final の行に seq を積んでいない",
+    /finalLines\.push\(\{ text: msg\.text, speaker: msg\.speaker, t: Date\.now\(\), seq: msg\.finalSeq, w: msg\.wordCount \}\)/,
+    "final の行に seq / w を積んでいない",
   );
+});
+
+// ---- 話者分離の診断（#46） ----
+
+/**
+ * **診断統計は raw の `finalLines` から取る。**
+ *
+ * `groupUtterances()` の結果から集計しても例外は出ないが、#36 の jitter 補正が
+ * 掛かった後の speaker ラベルを数えることになり、「表示補正と診断用 raw 統計が
+ * 分離されている」という #46 の AC が**静かに**壊れる（補正の効き具合を測るための
+ * 統計が、補正後の値になる）。純関数側のテストでは守れない配線なので、
+ * 呼び出しの引数をここで固定する。
+ */
+test("話者統計は raw の finalLines から集計する", () => {
+  assert.match(APP, /from "\.\/speaker-stats\.js"/, "speaker-stats.js を import していない");
+  const calls = CODE.match(/collectSpeakerStats\(([^)]*)\)/g) ?? [];
+  assert.ok(calls.length >= 1, "collectSpeakerStats を呼んでいない");
+  for (const call of calls) {
+    assert.equal(call, "collectSpeakerStats(finalLines)", `raw 以外から集計している: ${call}`);
+  }
+  // app.js 側に集計を書き直すと、import した純関数が使われないまま別の定義で動く
+  assert.doesNotMatch(CODE, /function collectSpeakerStats\(/, "app.js に定義が残っている");
+});
+
+test("想定話者数の選択肢は EXPECTED_SPEAKER_OPTIONS から組み立てる", () => {
+  // HTML に <option> を書き写すと、選択肢の定義が2箇所になる（収音モードと同じ規則）
+  assert.match(HTML, /id="expected-speakers"/, "設定画面に想定話者数が無い");
+  // **`<select>` の中だけを切り出して見る。** 固定したいのは「この select に option を
+  // 書き写していない」ことなので、文字数で切ると後続の要素が増減しただけで意味が変わる
+  const openTag = HTML.indexOf('id="expected-speakers"');
+  const closeTag = HTML.indexOf("</select>", openTag);
+  assert.ok(closeTag > openTag, "expected-speakers の </select> が見つからない");
+  const select = HTML.slice(openTag, closeTag);
+  assert.doesNotMatch(select, /<option/, "HTML に選択肢が書き写されている");
+  assert.match(CODE, /for \(const opt of EXPECTED_SPEAKER_OPTIONS\)/);
+  // 保存値は信頼境界の外。読み側で必ず丸める
+  assert.match(
+    CODE,
+    /normalizeExpectedSpeakers\(localStorage\.getItem\("termlens\.expectedSpeakers"\)\)/,
+    "想定話者数を丸めずに読んでいる",
+  );
+  assert.match(CODE, /localStorage\.setItem\("termlens\.expectedSpeakers"/, "保存していない");
 });
 
 // ---- 収音モードと診断（#26） ----
@@ -238,10 +280,19 @@ test("開始のたびに診断の状態を初期化する", () => {
   assert.match(reset, /diag = null/, "診断の状態が持ち越される");
 });
 
-test("診断のダウンロードはマイクを開いた区間でだけ押せる", () => {
-  // mock モードや復元セッションでは設定も統計も無い。空のファイルを保存できると
-  // 「診断が取れた」と誤解する
-  assert.match(CODE, /dlDiagnosticsBtn\.disabled = !hasDiagnostics\(\)/);
+/**
+ * **収音側と話者側でライフタイムが違う**（#46 で条件が変わった）。
+ *
+ * 収音の設定・入力統計はマイクを開いた区間（`hasDiagnostics()`）にしか無いが、
+ * 話者統計は `finalLines` に紐づくので、マイクを開いていない復元セッションでも出せる。
+ * 旧条件（`!hasDiagnostics()` だけ）に戻すと、復元セッションから話者分離の診断を
+ * 取り出す経路が消える — ボタンが押せないだけで例外は出ないので気づけない。
+ */
+test("診断のダウンロードは、収音か発話のどちらかがあれば押せる", () => {
+  assert.match(
+    CODE,
+    /dlDiagnosticsBtn\.disabled = !hasDiagnostics\(\) && spokenLines\(\)\.length === 0/,
+  );
 });
 
 /**

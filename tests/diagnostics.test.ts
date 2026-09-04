@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   CLIP_THRESHOLD,
@@ -14,7 +15,9 @@ import {
   pickTrackSettings,
   summarizeAudioStats,
   trackSettingRows,
+  fmtElapsed,
 } from "../public/diagnostics.js";
+import { collectSpeakerStats } from "../public/speaker-stats.js";
 
 /**
  * 収音診断（#26）。固定するのは2つ。
@@ -221,10 +224,16 @@ test("設定の行は採用リストの順に並び、AudioContext sampleRate �
 const MD_ARGS = {
   modeLabel: "対面会議",
   startedAt: "2026-08-27 23:30",
+  // 話者の初出・最終を相対時間にするための基準（#46）。絶対時刻は診断に出さない
+  startedAtMs: 0,
   elapsed: "12:34",
   trackSettings: RAW_SETTINGS,
   contextSampleRate: 48000,
   stats: { samples: 200, sumSq: 8, clipped: 2, peak: 0.62, windows: [0, 0, 4, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0] },
+  // #46 のセクションは既定では出さない（発話が1件も無い＝収音だけの診断）
+  speakerStats: collectSpeakerStats([]),
+  expectedSpeakers: "auto",
+  sttInfo: null,
 };
 
 test("Markdown にモード・設定・統計が載る", () => {
@@ -274,4 +283,205 @@ test("測定できていなくても Markdown は組み立てられる", () => {
   assert.match(md, /## 入力の統計/);
   // 空の表を出すより「取れていない」と書く方が読める（0 と未取得を取り違えない）
   assert.doesNotMatch(md, /\|---\|---\|/);
+});
+
+// ---- 話者分離の診断（#46） ----
+//
+// **セクションごとにライフタイムが違う。** 収音の設定・入力統計はマイクを開いた区間の
+// 値だが、話者統計は `finalLines` に紐づくので、マイクを開いていない復元セッションでも
+// 出る。1つの条件でまとめると、復元セッションで空の入力統計が出るか話者統計が出ないかの
+// どちらかになる。
+
+/** 発話行1件。テキストは長さにしか意味が無いのでダミー文字列（#18 の匿名化方針）。 */
+function line(speaker: number | null, words: number, chars = words, t = 0) {
+  return { text: "x".repeat(chars), speaker, t, seq: 1, w: words };
+}
+
+const SPEAKER_MD_ARGS = {
+  ...MD_ARGS,
+  startedAtMs: 1_000_000,
+  speakerStats: collectSpeakerStats([
+    line(0, 120, 240, 1_012_000),
+    line(1, 76, 152, 1_030_000),
+    line(0, 2, 4, 1_100_000),
+    line(2, 2, 4, 1_200_000),
+  ]),
+  expectedSpeakers: "2",
+  sttInfo: {
+    model: { name: "nova-3", version: "2025-01-01.0", arch: "nova-3" },
+    diarizer: { arch: "v1", modelUuid: "e1c2f6d0-0000-0000-0000-000000000000" },
+  },
+};
+
+test("話者統計が無ければセクションごと出さない", () => {
+  // 収音だけの診断（mock モードや発話ゼロのセッション）で空の表を出すと、
+  // 「話者が1人も検出されなかった」と読めてしまう
+  const md = buildDiagnosticsMarkdown(MD_ARGS);
+  assert.doesNotMatch(md, /## 話者分離の診断/);
+  // 収音側のセクションは従来どおり出る（片方が消えないこと）
+  assert.match(md, /## 入力の統計/);
+});
+
+test("想定2人・検出3 が警告つきで Markdown に出る", () => {
+  const md = buildDiagnosticsMarkdown(SPEAKER_MD_ARGS);
+  assert.match(md, /## 話者分離の診断/);
+  assert.match(md, /- 想定話者数: 2人/);
+  assert.match(md, /- 検出話者数: 3/);
+  assert.match(md, /⚠ 想定2人に対し 3 speaker を検出/);
+  // 1.0% の speaker 2 は偽 speaker の候補として挙がる
+  assert.match(md, /⚠ speaker 2 が全 word の 1\.0%（偽 speaker の可能性）/);
+  // speaker ごとの表。**数字だけで、テキストは1文字も出さない**
+  assert.match(md, /\| speaker \| words \| 割合 \| 文字数 \| segments \| 初出 \| 最終 \|/);
+  assert.match(md, /\| 0 \| 122 \| 61\.0% \| 244 \| 2 \| 00:12 \| 01:40 \|/);
+  // 遷移は from !== to だけ、回数降順
+  assert.match(md, /### 話者遷移/);
+  assert.match(md, /\| 0 \| 1 \| 1 \|/);
+  assert.match(md, /\| 1 \| 0 \| 1 \|/);
+});
+
+/**
+ * **初出・最終は開始からの相対時間。** 絶対時刻を出すと、診断ファイルから
+ * 会議の実施時刻が読めてしまう（会話本文でも音声でもないが、共有される前提の
+ * ファイルに要らない情報）。
+ */
+test("Markdown に絶対時刻を出さない", () => {
+  const md = buildDiagnosticsMarkdown(SPEAKER_MD_ARGS);
+  assert.equal(md.includes("1012000"), false, "受信時刻の生値が出ている");
+  assert.equal(md.includes("1200000"), false);
+  assert.match(md, /\| 00:12 \|/, "相対時間になっていない");
+});
+
+/**
+ * **診断に会話本文を混ぜない**（#46 のプライバシー要件）。
+ * 出るのは speaker 番号・件数・割合・遷移数・時刻の集計値・diarizer の metadata だけ。
+ */
+test("診断 Markdown に会話本文が混入しない", () => {
+  const SECRET = "この文字列は会話本文のつもりです";
+  const md = buildDiagnosticsMarkdown({
+    ...SPEAKER_MD_ARGS,
+    speakerStats: collectSpeakerStats([
+      { text: SECRET, speaker: 0, t: 1_010_000, seq: 1, w: 9 },
+      { text: `${SECRET}2`, speaker: 1, t: 1_020_000, seq: 2, w: 9 },
+    ]),
+  });
+  assert.equal(md.includes(SECRET), false, "本文が診断に出ている");
+  assert.match(md, /- 検出話者数: 2/, "統計そのものは出ている");
+});
+
+test("stt_info が来なくても壊れず、diarizer は「取得できませんでした」になる", () => {
+  // mock アダプタは onSttInfo を呼ばない。復元セッションにも情報は無い
+  const md = buildDiagnosticsMarkdown({ ...SPEAKER_MD_ARGS, sttInfo: null });
+  assert.match(md, /- Deepgram diarizer: \(取得できませんでした\)/);
+  assert.match(md, /- 認識モデル: \(取得できませんでした\)/);
+  // 情報があれば arch と model_uuid が出る
+  const withInfo = buildDiagnosticsMarkdown(SPEAKER_MD_ARGS);
+  assert.match(withInfo, /- Deepgram diarizer: arch=v1 \/ model_uuid=e1c2f6d0-/);
+  assert.match(withInfo, /- 認識モデル: nova-3 \(version=2025-01-01\.0, arch=nova-3\)/);
+});
+
+/**
+ * **どちらの分母で割合を出したかを必ず書く。** 旧サーバー・#46 以前に保存された
+ * セッションでは word 数が無く文字数へ落ちる。書いておかないと、別々のセッションから
+ * 取った診断の数値どうしを比較できない。
+ */
+test("word 数が無いセッションは比率の基準が文字数になり、その旨が Markdown に出る", () => {
+  const md = buildDiagnosticsMarkdown({
+    ...SPEAKER_MD_ARGS,
+    speakerStats: collectSpeakerStats([
+      { text: "x".repeat(80), speaker: 0, t: 1_010_000 },
+      { text: "x".repeat(20), speaker: 1, t: 1_020_000 },
+    ]),
+  });
+  assert.match(md, /- 比率の基準: 文字数/);
+  assert.match(md, /\| 0 \| - \| 80\.0% \| 80 \| 1 \|/, "word 数を 0 と書くと「0語だった」と読める");
+  // word 基準のときは word 数を出す
+  assert.match(buildDiagnosticsMarkdown(SPEAKER_MD_ARGS), /- 比率の基準: word 数/);
+});
+
+test("収音を測っていなくても話者統計は出せる（復元セッション）", () => {
+  const md = buildDiagnosticsMarkdown({
+    ...SPEAKER_MD_ARGS,
+    // マイクを開いていないので収音側は何も無い。モードも分からないので出さない
+    modeLabel: null,
+    trackSettings: undefined,
+    contextSampleRate: null,
+    stats: emptyAudioStats(),
+  });
+  assert.doesNotMatch(md, /- 収音モード:/, "録っていないモードを事実として書いている");
+  assert.match(md, /## 話者分離の診断/);
+  assert.match(md, /- 検出話者数: 3/);
+});
+
+test("話者統計を足しても「会話本文と音声は含みません」は1行のまま", () => {
+  const md = buildDiagnosticsMarkdown(SPEAKER_MD_ARGS);
+  assert.equal(md.split("> 会話本文と音声は含みません。").length - 1, 1);
+  // 末尾に置く（セクションを足したときに途中へ紛れ込ませない）
+  assert.match(md.trimEnd(), /> 会話本文と音声は含みません。$/);
+});
+
+test("fmtElapsed は1時間を超えたら h:mm:ss にする", () => {
+  // 話者の初出・最終と文字起こしの時刻表記が同じ実装から出ることの担保（app.js が import する）
+  assert.equal(fmtElapsed(0), "00:00");
+  assert.equal(fmtElapsed(12_000), "00:12");
+  assert.equal(fmtElapsed(3_600_000 + 61_000), "1:01:01");
+  assert.equal(fmtElapsed(-5_000), "00:00", "負の経過時間は 0 に倒す");
+});
+
+// ---- レビュー指摘に対する回帰（#46 のレビュー）----
+
+/**
+ * **話者不明ぶんは「量」まで出す。** 未帰属の word は割合の分母には入るが、
+ * どの speaker にも帰属しない。件数だけ出しても Σratio が 1 に足りない理由も、
+ * 足りない量も読めない。閾値（MINOR/DOMINANT）はこの分母に対して当たるので、
+ * 未帰属の量が分からないと実データから閾値を決められない。
+ */
+test("話者不明のセグメントは件数と量の両方を出す", () => {
+  const md = buildDiagnosticsMarkdown({
+    ...SPEAKER_MD_ARGS,
+    speakerStats: collectSpeakerStats([line(0, 60, 60, 1_010_000), line(null, 40, 40, 1_020_000)]),
+  });
+  assert.match(md, /- 話者不明のセグメント: 1 seg \/ 40 word \(40\.0%\)/);
+});
+
+/** 遷移が下限であることを書く。切れた回数が読めないと別セッションと比較できない */
+test("再接続があれば回数と「遷移は下限」の注記を出す", () => {
+  const md = buildDiagnosticsMarkdown({
+    ...SPEAKER_MD_ARGS,
+    speakerStats: collectSpeakerStats([
+      line(0, 10, 10, 1_010_000),
+      line(1, 10, 10, 1_020_000),
+      { type: "reconnect", t: 1_030_000 },
+      line(0, 10, 10, 1_040_000),
+    ]),
+  });
+  assert.match(md, /- 再接続: 1 回/);
+  assert.match(md, /遷移回数は下限です/);
+});
+
+/**
+ * 復元セッションで `sessionStartedAt` が無いと `savedAt`（＝セッションの**終わり**）が
+ * 起点になり、差が全て負になる。`fmtElapsed()` は負を 0 に丸めるので、そのまま出すと
+ * 初出・最終が全行 `00:00` に揃い、表として誤読を招く。
+ */
+test("開始より前の時刻は - にする", () => {
+  const md = buildDiagnosticsMarkdown({
+    ...SPEAKER_MD_ARGS,
+    startedAtMs: 9_000_000,
+    speakerStats: collectSpeakerStats([line(0, 10, 10, 1_010_000)]),
+  });
+  assert.match(md, /\| 0 \| 10 \| 100\.0% \| 10 \| 1 \| - \| - \|/);
+});
+
+/**
+ * **割合の桁数と単位は `speaker-stats.js` が唯一の定義箇所。** ここに独自の実装を置くと、
+ * 警告文（speaker-stats 側）と表（diagnostics 側）で桁が食い違っても全テストが緑のまま、
+ * 同じ診断ファイルの中に `95.0%` と `95.00%` が混ざる。
+ */
+test("割合の整形は speaker-stats.js から取る", async () => {
+  const src = await readFile(new URL("../public/diagnostics.js", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /const pct1 = /, "diagnostics.js が独自の pct1 を持っている");
+  assert.match(src, /pct1,/, "speaker-stats.js から import していない");
+  assert.match(src, /ratioBasisView,/, "ratioBasis の表示定義を import していない");
+  // ratioBasis の分岐をこちらに書き直すと、基準を1つ足したときに直し漏れる
+  assert.doesNotMatch(src, /ratioBasis === "words"/, "diagnostics.js で基準を分岐している");
 });

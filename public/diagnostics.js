@@ -6,6 +6,17 @@
 // (`lowpass.js` / `card-status.js` / `capture-mode.js` と同じ理由)。
 // 加えてこのファイルは **AudioWorklet(`audio-processor.js`)からも static import される**
 // ので、worklet スコープに無い API(`document` / `window` など)に触れてはいけない。
+// 下で import している `speaker-stats.js` にも同じ制約が伝播する(あちらも依存ゼロ・
+// 副作用ゼロなので、worklet に連れて行っても評価時に何も起きない)。
+
+// 話者統計の集計と閾値は speaker-stats.js が唯一の定義箇所(#46)。
+// ここで割合を計算し直すと、画面と Markdown で別の基準の数字が出る。
+import {
+  expectedSpeakerLabel,
+  pct1,
+  ratioBasisView,
+  speakerWarnings,
+} from "./speaker-stats.js";
 
 // ---- 入力統計の閾値 ----
 //
@@ -236,10 +247,174 @@ export function audioStatRows(stats) {
   ];
 }
 
+// ---- 話者分離の診断(#46) ----
+//
+// **入力統計とはライフタイムが違う。** 入力統計はマイクを開いた区間(`hasDiagnostics()`)
+// に紐づくが、話者統計は `finalLines` に紐づくので、マイクを開いていない復元セッションでも
+// 出せる。1つのフラグにまとめると、復元セッションで空の入力統計が出るか話者統計が
+// 出ないかのどちらかになる。
+
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/**
+ * 会議開始からの経過時間。1時間を超えたら h:mm:ss にする。
+ *
+ * **定義箇所はここだけ**(`app.js` は import して使う)。話者の初出・最終は
+ * 診断側で整形する必要がある一方、文字起こしの Markdown は app.js が整形するので、
+ * 両方に書くと同じ「経過時間」が2つの実装で出ることになる。
+ */
+export function fmtElapsed(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${pad2(m)}:${pad2(s)}`;
+}
+
+/** 絶対時刻ではなく**セッション開始からの相対時間**。実施時刻は診断に出さない */
+function elapsedFrom(t, startedAtMs) {
+  if (typeof t !== "number" || !Number.isFinite(t) || typeof startedAtMs !== "number") return "-";
+  // **開始より前の時刻は "-"。** 復元セッションで `sessionStartedAt` が無いと `savedAt`
+  // (＝セッションの**終わり**)が起点になり、差が全て負になる。`fmtElapsed()` は負を 0 に
+  // 丸めるので、そのまま出すと初出・最終の列が全行 `00:00` に揃い、表として誤読を招く
+  if (t < startedAtMs) return "-";
+  return fmtElapsed(t - startedAtMs);
+}
+
+/** 認識モデル・diarizer の1行表記。取れていなければ null(呼び出し側が文言を決める) */
+function sttInfoValues(sttInfo) {
+  const model = sttInfo?.model;
+  const diarizer = sttInfo?.diarizer;
+  const detail = [
+    model?.version ? `version=${model.version}` : null,
+    model?.arch ? `arch=${model.arch}` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  // **`name` が無くても `detail` だけで1行にする。** `version` / `arch` は取れているのに
+  // `name` が無いというだけで「(取得できませんでした)」に倒すと、持っている情報を捨てる
+  const modelText = model?.name ? (detail ? `${model.name} (${detail})` : model.name) : detail || null;
+  const diarizerText = diarizer
+    ? [
+        diarizer.arch ? `arch=${diarizer.arch}` : null,
+        diarizer.modelUuid ? `model_uuid=${diarizer.modelUuid}` : null,
+      ]
+        .filter(Boolean)
+        .join(" / ")
+    : null;
+  return { modelText, diarizerText: diarizerText || null };
+}
+
+/**
+ * 話者統計の見出し行。**画面の診断パネルと Markdown が同じ配列から描く**
+ * (収音側の `trackSettingRows()` / `audioStatRows()` と同じ規則)。
+ *
+ * 会話本文は1文字も入らない。出るのは speaker 番号・件数・割合・時刻の集計値・
+ * diarizer の metadata だけ。
+ */
+export function speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo }) {
+  if (!speakerStats || speakerStats.totalSegments <= 0) return [];
+  const { modelText, diarizerText } = sttInfoValues(sttInfo);
+  const rows = [
+    ["想定話者数", expectedSpeakerLabel(expectedSpeakers)],
+    ["検出話者数", String(speakerStats.detected)],
+    // **どちらの分母で割合を出したかを必ず書く。** 旧サーバー/旧セッションでは
+    // word 数が無く文字数へ落ちるので、書いておかないと数値どうしを比較できない
+    ["比率の基準", ratioBasisView(speakerStats.ratioBasis).basisLabel],
+  ];
+  if (speakerStats.unknownSegments > 0) {
+    // **量まで出す。** 話者不明ぶんは割合の分母には入るがどの speaker にも帰属しないので、
+    // 件数だけ出しても `Σ ratio` が 1 に足りない理由と「どれだけ足りないか」が読めない。
+    // 閾値はこの分母に対して当たるため、未帰属の量が分からないと実データから決められない
+    const view = ratioBasisView(speakerStats.ratioBasis);
+    const unknown = view.value({ words: speakerStats.unknownWords, chars: speakerStats.unknownChars });
+    const denom = view.value({ words: speakerStats.totalWords, chars: speakerStats.totalChars });
+    const share = denom > 0 ? ` (${pct1(unknown / denom)})` : "";
+    rows.push([
+      "話者不明のセグメント",
+      `${speakerStats.unknownSegments} seg / ${unknown} ${view.unit}${share}`,
+    ]);
+  }
+  if (speakerStats.reconnects > 0) {
+    // **遷移回数が下限であることの手掛かり。** 再接続と話者不明の区間で遷移の鎖が切れるので、
+    // 別セッションと遷移数を比べるときに「何回切れていたか」が読めないと比較にならない
+    rows.push(["再接続", `${speakerStats.reconnects} 回`]);
+  }
+  rows.push(["Deepgram diarizer", diarizerText ?? "(取得できませんでした)"]);
+  rows.push(["認識モデル", modelText ?? "(取得できませんでした)"]);
+  return rows;
+}
+
+/**
+ * 診断パネル(画面)に出す話者統計の行。見出し + speaker ごとの1行 + 警告。
+ * Markdown の表と同じ数字を、テーブル1本で読める形に畳んだもの。
+ */
+export function speakerDiagRows({ speakerStats, expectedSpeakers, sttInfo }) {
+  if (!speakerStats || speakerStats.totalSegments <= 0) return [];
+  const view = ratioBasisView(speakerStats.ratioBasis);
+  const rows = speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo });
+  for (const s of speakerStats.speakers) {
+    rows.push([
+      `speaker ${s.speaker}`,
+      `${pct1(s.ratio)} (${view.value(s)} ${view.unit} / ${s.segments} seg)`,
+    ]);
+  }
+  for (const w of speakerWarnings(speakerStats, expectedSpeakers)) rows.push(["警告", w]);
+  return rows;
+}
+
 // ---- Markdown エクスポート ----
 
 function table(rows) {
   return ["| 項目 | 値 |", "|---|---|", ...rows.map(([k, v]) => `| ${k} | ${v} |`), ""];
+}
+
+/**
+ * 「話者分離の診断」セクション(#46)。**発話が1件も無ければセクションごと出さない。**
+ *
+ * 出るのは speaker 番号・件数・割合・遷移数・**セッション開始からの相対時間**・
+ * diarizer の metadata だけで、会話本文も音声も、絶対時刻(＝会議の実施時刻)も入らない。
+ */
+function speakerSection({ speakerStats, expectedSpeakers, sttInfo, startedAtMs }) {
+  if (!speakerStats || speakerStats.totalSegments <= 0) return [];
+  const warnings = speakerWarnings(speakerStats, expectedSpeakers);
+  const view = ratioBasisView(speakerStats.ratioBasis);
+  const rows = speakerStats.speakers.map((s) => [
+    String(s.speaker),
+    view.wordsCell(s),
+    pct1(s.ratio),
+    String(s.chars),
+    String(s.segments),
+    elapsedFrom(s.firstT, startedAtMs),
+    elapsedFrom(s.lastT, startedAtMs),
+  ]);
+  return [
+    "## 話者分離の診断",
+    "",
+    ...speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo }).map(([k, v]) => `- ${k}: ${v}`),
+    "",
+    ...(warnings.length ? [...warnings, ""] : []),
+    "| speaker | words | 割合 | 文字数 | segments | 初出 | 最終 |",
+    "|---|---:|---:|---:|---:|---|---|",
+    ...rows.map((r) => `| ${r.join(" | ")} |`),
+    "",
+    ...(speakerStats.transitions.length
+      ? [
+          "### 話者遷移",
+          "",
+          "| from | to | 回数 |",
+          "|---|---|---:|",
+          ...speakerStats.transitions.map((t) => `| ${t.from} | ${t.to} | ${t.count} |`),
+          "",
+          // **下限であることを書く。** 再接続と話者不明の区間では遷移の鎖を切っている
+          // (観測していない話者交代を作らないため)。切れた回数が読めないと、
+          // 別セッションの遷移数と突き合わせたときに差の理由が分からない
+          ...(speakerStats.reconnects > 0 || speakerStats.unknownSegments > 0
+            ? ["> 再接続と話者不明の区間では鎖が切れるため、遷移回数は下限です。", ""]
+            : []),
+        ]
+      : []),
+  ];
 }
 
 /**
@@ -253,20 +428,32 @@ function table(rows) {
  * `pickTrackSettings()` を必ず通すので、**呼び出し側がホワイトリストを忘れても
  * `deviceId` は出ない**。
  *
- * @param modeLabel 収音モードの表示名(`captureModeLabel()`)
+ * **セクションごとに出す条件が違う。** 収音側(設定・入力統計)はマイクを開いた区間の値で、
+ * 話者統計は `finalLines` に紐づく。1つの条件でまとめると、復元セッションで
+ * 空の入力統計が出るか話者統計が出ないかのどちらかになる(#46)。
+ *
+ * @param modeLabel 収音モードの表示名(`captureModeLabel()`)。マイクを開いていなければ null
  * @param startedAt 開始日時の表示文字列
+ * @param startedAtMs 開始時刻(epoch ms)。話者の初出・最終を**相対時間**にするために使う
  * @param elapsed 継続時間の表示文字列
  * @param trackSettings `MediaStreamTrack.getSettings()` の戻り
  * @param contextSampleRate `AudioContext.sampleRate`
  * @param stats `mergeAudioStats()` の累積値
+ * @param speakerStats `collectSpeakerStats()` の戻り(#46)
+ * @param expectedSpeakers 想定話者数の選択値(#46)
+ * @param sttInfo `ServerMessage.stt_info` の中身(#46)
  */
 export function buildDiagnosticsMarkdown({
   modeLabel,
   startedAt,
+  startedAtMs,
   elapsed,
   trackSettings,
   contextSampleRate,
   stats,
+  speakerStats,
+  expectedSpeakers,
+  sttInfo,
 }) {
   const settingRows = trackSettingRows(trackSettings, contextSampleRate);
   const statRows = audioStatRows(stats);
@@ -276,7 +463,9 @@ export function buildDiagnosticsMarkdown({
   const out = [
     `# 収音診断 ${startedAt}`,
     "",
-    `- 収音モード: ${modeLabel}`,
+    // 収音モードはマイクを開いた区間でしか分からない。復元セッションで既定モードを
+    // 書くと、実際には別のモードで録ったかもしれない値が事実として残る
+    ...(modeLabel ? [`- 収音モード: ${modeLabel}`] : []),
     `- 開始: ${startedAt}`,
     `- 継続時間: ${elapsed}`,
     "",
@@ -292,6 +481,7 @@ export function buildDiagnosticsMarkdown({
     ...(windowRows.length
       ? [`## 入力レベルの分布 (${(SILENCE_WINDOW_SEC * 1000).toFixed(0)}ms 窓ごとの RMS)`, "", ...table(windowRows)]
       : []),
+    ...speakerSection({ speakerStats, expectedSpeakers, sttInfo, startedAtMs }),
     "> 会話本文と音声は含みません。",
     "",
   ];

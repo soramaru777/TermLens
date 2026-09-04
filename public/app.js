@@ -32,13 +32,25 @@ import {
 // 発話グループの組み立て(話者 jitter の補正 + 同一話者の結合)は utterances.js が唯一の
 // 定義箇所(#36)。ここでまとめ直すと、画面と Markdown エクスポートで補正結果が食い違う。
 import { groupUtterances } from "./utterances.js";
+// 話者統計の集計・想定話者数の選択肢は speaker-stats.js が唯一の定義箇所(#46)。
+// **集計は raw の finalLines に対して行う**(groupUtterances() の結果ではない) —
+// 表示補正の効き具合を測るための統計が、補正後の値になってしまうため。
+import {
+  EXPECTED_SPEAKER_OPTIONS,
+  collectSpeakerStats,
+  normalizeExpectedSpeakers,
+} from "./speaker-stats.js";
 // 診断の整形も純関数側(diagnostics.js)。getSettings() の採用リストもそこにある。
+// 経過時間の整形(fmtElapsed)もそこが定義箇所 — 話者の初出・最終と文字起こしの
+// 時刻表記が別実装にならないよう、1箇所から取る。
 import {
   audioStatRows,
   buildDiagnosticsMarkdown,
   emptyAudioStats,
+  fmtElapsed,
   mergeAudioStats,
   pickTrackSettings,
+  speakerDiagRows,
   trackSettingRows,
 } from "./diagnostics.js";
 
@@ -77,6 +89,7 @@ const captureModeSelect = $("capture-mode");
 const captureModeHintEl = $("capture-mode-hint");
 const captureModeRow = $("capture-mode-row");
 const captureModeCurrent = $("capture-mode-current");
+const expectedSpeakersSelect = $("expected-speakers");
 const dlDiagnosticsBtn = $("dl-diagnostics");
 const diagPanel = $("diag-panel");
 const diagTable = $("diag-table");
@@ -106,6 +119,15 @@ let savedTerms = false;
  * うっかり表示・保存する経路も作れない。
  */
 let diag = null;
+/**
+ * STT のモデル情報(#46)。`ServerMessage.stt_info` の中身をそのまま持つ。
+ *
+ * **`diag` とは別のライフタイム**なので同じ入れ物に入れない。`diag` は
+ * 「マイクを開いた区間」に紐づくが、こちらはサーバーから届くものなので、
+ * マイクを開いていない mock モードでも来うる(逆に、マイクを開いていても
+ * Deepgram が metadata を返さなければ来ない)。
+ */
+let sttInfo = null;
 let stopping = false; // 停止操作によるクローズか(意図しない切断と区別する)
 // 再接続: 指数バックオフ 1s, 2s, 4s, 8s, 16s の最大5回。
 // マイクは掴んだまま(releaseCapture を呼ばない)、送信だけ止めて待つ
@@ -133,6 +155,14 @@ const getGlossary = () =>
 const getPersistEnabled = () => localStorage.getItem("termlens.persist") !== "false";
 // 保存値は信頼境界の外なので必ず normalizeCaptureMode() を通す(未知の名前は既定に倒れる)
 const getCaptureMode = () => normalizeCaptureMode(localStorage.getItem("termlens.captureMode"));
+// 同上。想定話者数も信頼境界の外から来るので normalizeExpectedSpeakers() を通す(#46)。
+//
+// **収音モードと違い、セッション開始時に固定しない。** captureMode は getUserMedia に
+// 渡る値なので途中で変わると収音が変わるが、想定話者数は診断に添える**申告値**でしかない。
+// 会議のあとで「やっぱり2人だった」と申告し直して診断を出し直せるほうが、実データを
+// 集めるという #46 の目的には合う。
+const getExpectedSpeakers = () =>
+  normalizeExpectedSpeakers(localStorage.getItem("termlens.expectedSpeakers"));
 
 function refreshGlossaryCount() {
   glossaryCount.textContent = `${getGlossary().length}語`;
@@ -163,6 +193,16 @@ refreshCaptureMode();
 captureModeSelect.addEventListener("change", () => {
   syncCaptureHint();
 });
+
+// ---- 想定話者数(#46) ----
+// 選択肢は EXPECTED_SPEAKER_OPTIONS から組み立てる。HTML に文言を書き写すと定義が2箇所になる。
+// **この値は STT には一切流れない** — 診断で実検出話者数と突き合わせるためだけの申告値
+for (const opt of EXPECTED_SPEAKER_OPTIONS) {
+  const option = document.createElement("option");
+  option.value = opt.value;
+  option.textContent = opt.label;
+  expectedSpeakersSelect.append(option);
+}
 
 // ---- サーバー情報 ----
 let serverInfo = null;
@@ -210,6 +250,7 @@ function showSettings() {
   glossaryInput.value = getGlossaryText();
   persistToggle.checked = getPersistEnabled();
   captureModeSelect.value = getCaptureMode();
+  expectedSpeakersSelect.value = getExpectedSpeakers();
   syncCaptureHint();
   home.hidden = true;
   live.hidden = true;
@@ -239,6 +280,8 @@ saveSettingsBtn.addEventListener("click", () => {
   // ここで丸めても option 生成が壊れたときに黙って既定へ倒すだけになる。
   // 境界は読み側の getCaptureMode() 1箇所に閉じる
   localStorage.setItem("termlens.captureMode", captureModeSelect.value);
+  // 収音モードと同じ扱い。丸めるのは読み側(getExpectedSpeakers)1箇所に閉じる
+  localStorage.setItem("termlens.expectedSpeakers", expectedSpeakersSelect.value);
   // OFF にした時点で保存済みのものも消す。「ONに戻すまで一切残さない」を保証するため(要件5)。
   // 復元案内(pendingRestoreSession とバナー)も一緒に戻さないと、保存をOFFにしたのに
   // 案内からは復元できてしまう(L1)
@@ -318,6 +361,9 @@ function resetSessionState() {
   // 診断は前回のセッションの値を持ち越さない。持ち越すと、比較のために
   // モードを変えて撮り直した数値に前回ぶんが混ざる(#26)
   diag = null;
+  // モデル情報も持ち越さない。前回のセッションの diarizer が今回の診断に残ると、
+  // 「どの diarizer で録ったか」という記録そのものが嘘になる(#46)
+  sttInfo = null;
   diagPanel.hidden = true;
   renderDiagnostics();
   // 前回セッションの再接続待ちが万一残っていたら止める(持ち越さない)
@@ -474,8 +520,12 @@ function connectWs(token, glossary) {
           // seq(= サーバーの finalSeq)は「同じ Deepgram の final 由来か」の印。
           // 1つの final が話者で分割されると同じ seq の行が複数並ぶので、
           // utterances.js の jitter 補正がそれを手掛かりに再結合する(#36)。
-          // 旧サーバーからは届かないので undefined のまま積む(復元経路と同じ扱い)
-          finalLines.push({ text: msg.text, speaker: msg.speaker, t: Date.now(), seq: msg.finalSeq });
+          // w(= サーバーの wordCount)はそのセグメントの word 数(#46)。話者ごとの
+          // word 数と割合を出すために積む。**キーを1文字にするのは `t` / `seq` と同じ
+          // 短縮キーの流儀に揃えるため** — 保存は `SESSION_MAX_CHARS`(1MB)で頭打ちに
+          // なるので、行数ぶん効くキー名の長さがそのまま復元できる履歴の長さになる。
+          // seq / w はどちらも旧サーバーからは届かない。undefined のまま積む(復元経路と同じ扱い)
+          finalLines.push({ text: msg.text, speaker: msg.speaker, t: Date.now(), seq: msg.finalSeq, w: msg.wordCount });
           renderTranscript();
           interimText.textContent = "";
           scheduleSessionSave();
@@ -498,6 +548,11 @@ function connectWs(token, glossary) {
         break;
       case "card_update":
         updateCard(msg);
+        break;
+      case "stt_info":
+        // 変化したときだけ届く(サーバー側で判定済み)。type は捨てて中身だけ持つ
+        sttInfo = { model: msg.model, diarizer: msg.diarizer };
+        renderDiagnostics();
         break;
       case "status":
         if (msg.state === "extracting") setStatus("用語を調べています…");
@@ -1173,14 +1228,8 @@ function fmtDateTime(d) {
 function fmtStamp(d) {
   return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}`;
 }
-// 会議開始からの経過時間。1時間を超えたら h:mm:ss にする
-function fmtElapsed(ms) {
-  const total = Math.max(0, Math.round(ms / 1000));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${pad2(m)}:${pad2(s)}`;
-}
+// 会議開始からの経過時間(fmtElapsed)は diagnostics.js が定義箇所(#46)。
+// 話者の初出・最終を診断側で整形する必要があるので、両方に書かず import する。
 
 // Markdown の記号が含まれても記法として解釈されないようにする。
 // 記号を含まない文字列は素通りするので、通常の発話では出力は変わらない。
@@ -1227,11 +1276,25 @@ function renderDiagnostics() {
   // toggle から呼ぶので、表示される内容は変わらない
   if (!diagPanel.open) return;
   diagTable.textContent = "";
-  if (!hasDiagnostics()) return;
   const rows = [
-    ["収音モード", captureModeLabel(diag.mode)],
-    ...trackSettingRows(diag.trackSettings, diag.contextSampleRate),
-    ...audioStatRows(diag.stats),
+    // 収音側はマイクを開いた区間の値。話者統計は finalLines に紐づく別のライフタイムなので、
+    // 片方が空でももう片方は出す(復元セッションでは話者統計だけが出る)(#46)
+    ...(hasDiagnostics()
+      ? [
+          ["収音モード", captureModeLabel(diag.mode)],
+          ...trackSettingRows(diag.trackSettings, diag.contextSampleRate),
+          ...audioStatRows(diag.stats),
+        ]
+      : // **黙って省かない。** Markdown 側は同じ状況で見出し +「(取得できませんでした)」を
+        // 必ず出すので、ここだけ行ごと消すと「項目が無い」のか「取れなかった」のかを
+        // 画面から区別できず、`diagnostics.js` 冒頭の「画面と Markdown が同じものを描く」
+        // という主張が崩れる
+        [["収音の統計", "(取得できませんでした)"]]),
+    ...speakerDiagRows({
+      speakerStats: collectSpeakerStats(finalLines),
+      expectedSpeakers: getExpectedSpeakers(),
+      sttInfo,
+    }),
   ];
   for (const [label, value] of rows) {
     const tr = el("tr");
@@ -1252,12 +1315,21 @@ function buildDiagnosticsMd() {
   // 整形は diagnostics.js の純関数に任せる(テストから読めるようにするため)。
   // trackSettings は既に採用リストを通してあるが、整形側でももう一度通る
   return buildDiagnosticsMarkdown({
-    modeLabel: captureModeLabel(diag.mode),
+    // マイクを開いていない復元セッションでは収音モードが分からない。既定モードを
+    // 書くと「実際には別のモードで録ったかもしれない値」が事実として残るので渡さない
+    modeLabel: hasDiagnostics() ? captureModeLabel(diag.mode) : null,
     startedAt: fmtDateTime(started),
+    // 話者の初出・最終を**相対時間**にするための基準。絶対時刻は診断に出さない
+    startedAtMs: started.getTime(),
     elapsed: fmtElapsed(ended.getTime() - started.getTime()),
-    trackSettings: diag.trackSettings,
-    contextSampleRate: diag.contextSampleRate,
-    stats: diag.stats,
+    trackSettings: diag?.trackSettings,
+    contextSampleRate: diag?.contextSampleRate,
+    stats: diag?.stats,
+    // **raw の finalLines から集計する。** groupUtterances() の結果を渡すと、
+    // 表示補正の効き具合を測るための統計が補正後の値になる(#46)
+    speakerStats: collectSpeakerStats(finalLines),
+    expectedSpeakers: getExpectedSpeakers(),
+    sttInfo,
   });
 }
 
@@ -1323,7 +1395,16 @@ function showExport() {
   sessionEndedAt ??= new Date();
   dlTranscriptBtn.disabled = spokenLines().length === 0;
   dlTermsBtn.disabled = cardData.size === 0;
-  dlDiagnosticsBtn.disabled = !hasDiagnostics();
+  // **復元セッションでも押せる。** マイクを開いていなくても話者統計は出せるので、
+  // 収音側の有無(hasDiagnostics)だけで閉じると #46 の診断が取り出せない
+  dlDiagnosticsBtn.disabled = !hasDiagnostics() && spokenLines().length === 0;
+  // 押せる内容があるならパネルも出す。条件を1つにして「ボタンは押せるのに
+  // 画面には何も無い」状態を作らない
+  diagPanel.hidden = dlDiagnosticsBtn.disabled;
+  // **停止時にも描き直す。** 他の呼び出し元(開始時 / worklet の stats / stt_info 受信 /
+  // toggle)はどれも停止後には来ないので、パネルを開いたまま停止すると、停止時の flush で
+  // 届いた final がパネルに反映されず、ダウンロードした Markdown とだけ食い違う
+  renderDiagnostics();
   exportRow.hidden = false;
   measureLiveChrome();
 }

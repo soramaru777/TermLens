@@ -8,12 +8,15 @@ sources:
   - public/capture-mode.js
   - public/diagnostics.js
   - public/utterances.js
+  - https://developers.deepgram.com/docs/diarization
+  - https://developers.deepgram.com/reference/speech-to-text/listen-streaming
   - docs/local/status-2026-08-13.md
   - docs/raw/session-2026-08-13-fly-deploy.md
   - src/stt/
+  - public/speaker-stats.js
 related: [[termlens-architecture]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-deployment]], [[termlens-testing]]
 confidence: high
-updated: 2026-08-29
+updated: 2026-09-04
 ---
 
 # TermLens STT パイプライン
@@ -77,6 +80,23 @@ Nova-3 の keyterm は**日本語を含む多言語に対応済み**（2026-08 �
 > 切り替わる位置で発話を分割するようにした。** それまでは 1 セグメント全体を 1 話者に潰していたため、
 > 1 セグメント内に入った短い相槌や話者交代が多数派話者に吸収されて消えていた。
 > `dominantSpeaker()` は削除済み。
+
+### Deepgram 側のパラメータは `diarize=true` のまま（Issue #46 で確認）
+
+`src/stt/deepgram.ts` は `diarize=true` を送っている。**`diarize` は deprecated だが、
+今日の挙動は `diarize_model` と変わらない。**
+
+- streaming の `diarize_model` は **`v1` と `latest` のみ**（`v2` は streaming 非対応）
+- その `latest` は**現状 v1 に解決される**。deprecated な `diarize=true` も v1 に行く
+  ＝ どちらを送っても同じ diarizer が動く
+- **`diarize` と `diarize_model` の同時指定は 400 で拒否される。** つまり切り替えるなら
+  「足す」ではなく**入れ替え**になり、失敗したときに diarization ごと落ちる
+
+> 出典は Deepgram の公式ドキュメント（下の `sources`）。**実機で 400 を確認したわけではない**
+> ため、切り替える PR では mock ではなく実接続で 1 回確かめること。
+
+以上から #46 では触っていない。切り替えるなら単独の PR にする。どの diarizer が実際に
+動いていたかは `diarize_info`（後述の診断）で観測できるようになった。
 
 `splitBySpeaker()`（`src/stt/split.ts`）の規則は2つだけ。
 
@@ -185,6 +205,48 @@ speaker が欠けるのは例外的で、独立させると 1 語だけの発話
 用語抽出（`UtteranceBuilder`）は `session.ts` が final を直接渡す別経路のままで、この補正の
 影響を受けない。**画面と Markdown エクスポートは同じ `groupUtterances()` を通る**（片方が
 自前でまとめ直すと補正結果が割れる。`tests/app-wiring.test.ts` が呼び出しを固定している）。
+
+#### 診断統計はクライアント側で raw から集計する（Issue #46）
+
+想定話者数と**実検出話者数**の差を測るための統計を、`public/speaker-stats.js` の
+`collectSpeakerStats()` が **`public/app.js` の raw な `finalLines`** から集計する
+（サーバーは word 数と diarizer の metadata だけを足す）。
+
+**なぜクライアント集計で raw と等価になるか。** `splitBySpeaker()` は **word の speaker が
+切り替わる位置でしかセグメントを切らない**ので、クライアントが受け取る final イベント列は
+「raw word の同一話者ラン」の列そのものになる。
+
+```
+Deepgram words:  [w0:sp0][w1:sp0][w2:sp1][w3:sp1][w4:sp0]
+                          └─ seg(sp0) ─┴─ seg(sp1) ─┴─ seg(sp0)
+```
+
+- **検出話者数** … ラン集合の speaker 種類数 ＝ word レベルと一致
+- **遷移** … 隣接ランの `(from,to)` ＝ word レベルと一致。`0→0` はそもそもランにならないので
+  「同一話者の継続を数えない」が構造で満たされる
+- **word 数** … ランごとの `words.length` を `ServerMessage.transcript.wordCount`（**整数1つ**）
+  として送れば一致する。`words` 配列そのものは #19 の判断どおり載せない
+
+**集計元は必ず `finalLines`（`groupUtterances()` の結果ではない）。** 上の jitter 補正は
+コピーの上で `speaker` を書き換えるので、補正後から集計すると**補正の効き具合を測るための
+統計が補正後の値になる**。この配線は純関数のテストでは守れないので、
+`tests/app-wiring.test.ts` が `collectSpeakerStats(finalLines)` という呼び出しを固定している。
+
+**`w` を持つ行が1件も無ければ割合の分母は文字数へ落ちる**（旧サーバー・#46 以前に保存された
+セッションの復元経路）。落ちること自体より **どちらで計算したかを返す**ことが要点で、
+`ratioBasis` として返し Markdown にも書く — 分母が黙って入れ替わると、別々のセッションから
+取った数値どうしを比較できなくなる。
+
+診断に出るのは speaker 番号・word/segment 数・割合・遷移数・**セッション開始からの相対時間**・
+diarizer の metadata だけ。**会話本文・音声・絶対時刻・`request_id` は出さない**
+（`request_id` はセッションを一意に指す値で、診断ファイルは共有されうる。
+`public/diagnostics.js` の `TRACK_KEYS` と同じ採用リストの発想で、`DeepgramMetadata` の型に
+そもそも持たせていない）。
+
+**この Issue では speaker の強制統合などの補正は行っていない。** 警告文も
+「偽 speaker の可能性」「潰れている可能性」と断定しない形にしてある。閾値
+（`MINOR_SPEAKER_RATIO` = 0.05 / `DOMINANT_SPEAKER_RATIO` = 0.90）は暫定値で、
+実データを集めてから判断する（[[termlens-open-issues]]）。
 
 #### 残っている弱点: 段落内の連結は半角スペース
 

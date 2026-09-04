@@ -1,4 +1,4 @@
-import type { SttAdapter, TranscriptEvent, TranscriptWord } from "./types.js";
+import type { SttAdapter, SttInfo, TranscriptEvent, TranscriptWord } from "./types.js";
 import { MOCK_SCRIPT, type MockLine } from "./mock-script.js";
 import { buildFinalEvents } from "./split.js";
 
@@ -255,6 +255,14 @@ export class MockSttAdapter implements SttAdapter {
    * UtteranceEnd 経路とタイムアウト経路は tests/utterance.test.ts の純関数テストで見る。
    */
   onUtteranceEnd(_cb: () => void): void {
+    // 何もしない
+  }
+  /**
+   * mock は STT のモデル情報を持たないので**登録するだけで呼ばない**(#46)。
+   * クライアントは `stt_info` が来なくても壊れず、診断には
+   * 「(取得できませんでした)」と出る(`tests/diagnostics.test.ts` が固定)。
+   */
+  onSttInfo(_cb: (info: SttInfo) => void): void {
     // 何もしない
   }
   onError(cb: (err: Error) => void): void {
