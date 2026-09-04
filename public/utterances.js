@@ -1,5 +1,6 @@
-// 発話グループの組み立て — 話者ラベルの揺れ(speaker jitter)の補正と、
-// 連続する同一話者の結合(#36)。
+// 発話グループの組み立て — 話者ラベルの揺れ(speaker jitter)の補正(#36)、
+// 想定話者数を超えて検出された少数 speaker の島の補正(#48)、
+// そして連続する同一話者の結合。
 //
 // **app.js から切り出してあるのは、Node のテストから読めるようにするため**
 // (`card-status.js` / `terms-markdown.js` / `lowpass.js` と同じ理由)。app.js は
@@ -13,6 +14,22 @@
 // **raw の `finalLines` は書き換えない。** 補正はコピーの上だけで行う。localStorage に
 // 保存されるのも、用語抽出(サーバー側の `UtteranceBuilder`)が見るのも常に補正前の生データで、
 // あとで閾値を変えたときに保存済みのセッションが古い補正結果に固定されない。
+
+// 話者統計の集計・想定話者数の選択肢は `speaker-stats.js` が唯一の定義箇所(#46)。
+// **ここが import しても制約違反にならない**: どちらも依存ゼロ・副作用ゼロの純関数モジュールで、
+// `diagnostics.js → speaker-stats.js` と同じ形。
+//
+// **`ratioBasis` の分岐はここには置かない。** 分母が文字数へ落ちるセッション(旧サーバー・
+// #46 以前の保存データ)では補正そのものを無効にするので(`charsBasis` ゲート)、
+// この先に来る統計の分母は必ず word 数になる。`speaker-stats.js` に閉じてある分岐を
+// こちらで再現すると、基準を1つ足したときに直し漏れる(#46 のレビューで一度潰した形)。
+import {
+  collectSpeakerStats,
+  definedSpeaker,
+  expectedSpeakerAtLeast,
+  expectedSpeakerCount,
+  num,
+} from "./speaker-stats.js";
 
 // ---- jitter 補正の閾値 ----
 //
@@ -48,6 +65,28 @@ export const JITTER_CHAR_LIMIT = 4;
  * (Deepgram の endpointing による無音を挟む)を巻き込む。
  */
 export const JITTER_WINDOW_MS = 500;
+
+// ---- minor speaker island の閾値(#48) ----
+//
+// **jitter 補正(上の2つ)とは効く条件がまったく違う。** jitter は「同じ final が話者ラベルの
+// 揺れで割れた」ことを `seq` で確かめてから直す局所的な補正で、想定話者数を見ない。
+// こちらは**ユーザーが想定話者数を申告していて、Deepgram がそれを超える speaker を検出した
+// ときにだけ**動く、セッション全体の統計に基づく補正。
+
+/**
+ * minor と見なす最大の割合(#48)。
+ * **`speaker-stats.js` の `MINOR_SPEAKER_RATIO`(5%) とは別物。** あちらは
+ * 「人が見て疑うべき」線で診断の警告に使う。こちらは「機械が黙って統合してよい」線。
+ * 役割が違うので、名前とファイルの両方で離してある(片方を実機データで動かしたときに
+ * もう片方を触ったつもりにならないため)。
+ */
+export const MINOR_ISLAND_MAX_RATIO = 0.03;
+
+/** 1つの island として吸収してよい最大 word 数。長い誤割り当て区間は吸収しない(#48 の将来スコープ) */
+export const MINOR_ISLAND_MAX_WORDS = 20;
+
+/** これ未満の総 word 数では主要 speaker の順位が信用できないので補正しない */
+export const MIN_TOTAL_WORDS_FOR_ISLANDS = 200;
 
 /** 再接続の区切り印。発話ではないので結合にも補正にも参加させない。 */
 const isReconnect = (line) => line?.type === "reconnect";
@@ -133,6 +172,226 @@ export function smoothSpeakerJitter(lines) {
   return out;
 }
 
+// ---- 第2段: 想定話者数つきの minor speaker island 補正(#48) ----
+//
+// 実機で観測された形(2人の会話なのに4 speaker 検出、`0:78.7% / 1:1.3% / 2:19.5% / 3:0.5%`)では、
+// `0 → 1 → 0` のように**主要 speaker に挟まれた少数 speaker の島**が何度も出る。これは
+// jitter 補正では直らない — 同じ final の中で割れているとは限らず、`seq` が違うためである。
+//
+// 補正するのは speaker ラベルだけで、テキストも行数も変えない(#36 と同じ規律)。
+
+/** 補正を見送った理由の内訳。**0 でも必ず全キーを出す**(件数を比べられるようにするため) */
+const emptySkipped = () => ({ mismatch: 0, tooLong: 0, edge: 0, boundary: 0, unknown: 0 });
+
+/** ゲートで弾かれたときの空の計画。`disabledBy` に理由を入れる */
+function disabledPlan(reason) {
+  return { merges: [], skipped: emptySkipped(), majors: [], minors: [], others: [], disabledBy: reason };
+}
+
+/**
+ * minor island の補正計画を返す。**何も変更しない純関数。**
+ *
+ * 表示に効かせずに計画だけ見たい(診断)ときも同じ関数を通るので、
+ * 「表示に効かせた補正」と「診断に出す件数」が別実装になりようがない。
+ *
+ * @param lines 発話行の配列(変更しない)
+ * @param opts.expectedSpeakers 想定話者数の選択値(`EXPECTED_SPEAKER_OPTIONS` の value)
+ * @param opts.stats **raw の `finalLines` から取った** `collectSpeakerStats()` の戻り。
+ *   省略時は `lines` から集計する(テストと診断の呼び出しを簡単にするためのフォールバック)
+ * @returns {{
+ *   merges: Array<{from:number, to:number, segments:number, words:number, indexes:number[]}>,
+ *   skipped: {mismatch:number, tooLong:number, edge:number, boundary:number, unknown:number},
+ *   majors: number[], minors: number[], others: number[],
+ *   disabledBy: "auto"|"atLeast"|"noStats"|"detectedNotOver"|"charsBasis"|"tooFewWords"|null,
+ * }}
+ */
+export function planMinorIslandMerges(lines, { expectedSpeakers, stats } = {}) {
+  const rows = Array.isArray(lines) ? lines : [];
+  const s = stats ?? collectSpeakerStats(rows);
+
+  // ---- ゲート ----
+  // どれか1つでも当たれば計画は空。**「効いていない」と「効いた結果0件」は別の事実**なので、
+  // 空にした理由を `disabledBy` で必ず返す(診断がそれを1行出す)。
+  const n = expectedSpeakerCount(expectedSpeakers);
+  // 想定人数の申告が無い(既定)。減らす根拠が無いので何もしない
+  if (n == null) return disabledPlan("auto");
+  // 「4人以上」は上限が定まらない。**`count === 4` のハードコードにしない** —
+  // 「4人ちょうど」の選択肢を将来足したときに黙って壊れる
+  if (expectedSpeakerAtLeast(expectedSpeakers)) return disabledPlan("atLeast");
+  // 統計そのものが壊れている(呼び出し側が別の形を渡した)。素通りさせると後段で throw する
+  if (!Number.isFinite(s?.detected) || !Array.isArray(s?.speakers)) return disabledPlan("noStats");
+  // 検出が想定以下なら減らす理由が無い
+  if (s.detected <= n) return disabledPlan("detectedNotOver");
+  // **分母が文字数へ落ちるセッションでは補正しない。** 下の2つの閾値は word 数で決めた値で、
+  // 文字数に当てると意味が変わる — しかも**逆方向にずれる**。日本語のおよそ 1 word ≒ 2 文字で
+  // 見ると、`MINOR_ISLAND_MAX_WORDS`(20) は「約40文字ぶんの島」のつもりが20文字までに縮んで
+  // 取りこぼし、`MIN_TOTAL_WORDS_FOR_ISLANDS`(200) は「約400文字ぶんの会話」のつもりが
+  // 200文字で開く。**安全側であるべき総量ゲートが緩む向きに外れる**ので、
+  // 旧サーバー・#46 以前の保存データのために補正精度を賭けない
+  if (s.ratioBasis !== "words") return disabledPlan("charsBasis");
+  const denom = s.totalWords;
+  // 序盤は順位が信用できない(最初の数発話で主要 speaker が決まってしまう)
+  if (denom < MIN_TOTAL_WORDS_FOR_ISLANDS) return disabledPlan("tooFewWords");
+
+  // ---- 主要 speaker と minor speaker ----
+  // **tie-break を明示するのは純関数の決定性のため。** 同数が上位 N の境界にまたがると
+  // 順位が不定になり、同じ入力から違う補正結果が出る
+  const ranked = [...s.speakers].sort((a, b) => b.words - a.words || a.speaker - b.speaker);
+  // **上位 N 件でも、minor と同じ割合しか持たない speaker は統合先にしない。**
+  // 1人が支配的で残りが全員小さい(diarization が崩れたとき現実に起きる)分布では、
+  // 「このコードが minor と判定するはずの speaker」が順位だけで主要になれてしまう。
+  // そこへ島を寄せるのは、誤りを別の誤りに置き換えるだけ。落ちた run は自然に mismatch になる
+  const majors = ranked
+    .slice(0, n)
+    .filter((x) => x.ratio >= MINOR_ISLAND_MAX_RATIO)
+    .map((x) => x.speaker);
+  const majorSet = new Set(majors);
+  // minor は「主要でない」だけでは足りない。割合の閾値も満たすこと
+  // (想定を超えて検出された speaker が、実は無視できない量を話していることがある)
+  const minors = s.speakers
+    .filter((x) => !majorSet.has(x.speaker) && x.ratio < MINOR_ISLAND_MAX_RATIO)
+    .map((x) => x.speaker);
+  const minorSet = new Set(minors);
+  // **主要でも minor でもない speaker も出す。** 「候補が1人もいなかった」と
+  // 「候補はいたが条件で落ちた」を区別するために majors/minors を診断へ出しているが、
+  // 割合が閾値以上なのに上位 N に入らなかった speaker はどちらにも現れず、run も作らないので
+  // `skipped` にも出ない。診断だけを見ると存在ごと消える
+  const others = s.speakers
+    .filter((x) => !majorSet.has(x.speaker) && !minorSet.has(x.speaker))
+    .map((x) => x.speaker);
+
+  // ---- 行を走査用のトークンへ落とす ----
+  // 発話行(確定 speaker つき) / 話者不明 / 再接続の印の3種。**元の添字を持たせる**ので、
+  // 計画をそのまま `smoothMinorSpeakerIslands()` が適用できる
+  // 分母は上のゲートで word 数に確定している(chars 基準はここへ来ない)
+  const lineValue = (line) => num(line.w);
+  const tokens = [];
+  for (let i = 0; i < rows.length; i++) {
+    const line = rows[i];
+    if (isReconnect(line)) {
+      tokens.push({ kind: "reconnect" });
+      continue;
+    }
+    if (line == null || !definedSpeaker(line.speaker)) {
+      tokens.push({ kind: "unknown" });
+      continue;
+    }
+    tokens.push({ kind: "speaker", speaker: line.speaker, index: i, value: lineValue(line) });
+  }
+
+  // ---- run(同一 minor speaker の連続)の抽出 ----
+  //
+  // **異なる minor が隣接したら run を切る。** `A → X → Y → A` は X も Y も補正しない。
+  // `X → Y` という遷移**そのものが観測された話者交代**であり、またいで両方を A へ寄せると
+  // 「ここで話者が変わった」という観測事実を消すことになる。少数派どうしの取り違えは
+  // 「どちらが誰か」の問題であって「島かどうか」の問題ではない。
+  const runs = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const head = tokens[i];
+    if (head.kind !== "speaker" || !minorSet.has(head.speaker)) continue;
+    const start = i;
+    let words = 0;
+    const indexes = [];
+    while (i < tokens.length && tokens[i].kind === "speaker" && tokens[i].speaker === head.speaker) {
+      words += tokens[i].value;
+      indexes.push(tokens[i].index);
+      i++;
+    }
+    runs.push({ speaker: head.speaker, start, end: i - 1, words, indexes });
+    i--; // while で1つ進みすぎているぶんを for の i++ と相殺する
+  }
+
+  /**
+   * run の外側へ向かって最初の「確定 speaker つき発話行」を探す。
+   *
+   * - 再接続の印に当たったら**探索を打ち切って境界を返す**。再接続後は話者番号が振り直しで、
+   *   同じ番号でも別人でありうる(`mergeSameSpeaker()` が結合を切っているのと同じ理由)
+   * - **話者不明の行でも打ち切る。** run のほうは不明で切るので、跨いで探すと
+   *   `A → X → ? → X → A` で**run の反対側にいる同じ minor X が「隣」として見つかり**、
+   *   両方の run が「前後の主要 speaker が不一致」として落ちる — 事実と違う見送り理由が、
+   *   閾値を決めるための内訳に混ざる。加えて `speaker-stats.js` は「不明をまたいで
+   *   `0→1` を数えると観測していない話者交代を作る」として遷移の鎖を切っており、
+   *   不明をまたいで統合するのは同じ理屈で「観測していない話者の連続」を作る行為になる
+   * - 端まで来たら `null`(前後で挟めない)
+   */
+  const neighbor = (from, step) => {
+    for (let i = from; i >= 0 && i < tokens.length; i += step) {
+      if (tokens[i].kind === "reconnect") return { boundary: true };
+      if (tokens[i].kind === "unknown") return { unknown: true };
+      if (tokens[i].kind === "speaker") return { speaker: tokens[i].speaker };
+    }
+    return null;
+  };
+
+  const skipped = emptySkipped();
+  const merged = new Map();
+  // **1つの run は1つの理由にしか計上しない。** 優先順位は
+  // boundary → unknown → edge → mismatch → tooLong で、上にあるものほど
+  // 「そもそも隣を見られなかった」に近い。内訳は閾値を決めるための材料なので、
+  // 二重に数えると `tooLong` の多さから `MINOR_ISLAND_MAX_WORDS` を判断できなくなる
+  for (const run of runs) {
+    const prev = neighbor(run.start - 1, -1);
+    const next = neighbor(run.end + 1, 1);
+    if (prev?.boundary || next?.boundary) {
+      skipped.boundary++;
+      continue;
+    }
+    if (prev?.unknown || next?.unknown) {
+      skipped.unknown++;
+      continue;
+    }
+    if (!prev || !next) {
+      skipped.edge++;
+      continue;
+    }
+    // 前後が同じ主要 speaker でなければ島ではない。**統合先は必ず主要 speaker**
+    // (minor へ寄せても speaker の数は減らず、誤りを別の誤りに置き換えるだけ)
+    if (prev.speaker !== next.speaker || !majorSet.has(prev.speaker)) {
+      skipped.mismatch++;
+      continue;
+    }
+    // 長い区間は「誤割り当てされた本物の発話」でありうるので吸収しない
+    if (run.words > MINOR_ISLAND_MAX_WORDS) {
+      skipped.tooLong++;
+      continue;
+    }
+    const key = `${run.speaker}>${prev.speaker}`;
+    const entry = merged.get(key) ?? {
+      from: run.speaker,
+      to: prev.speaker,
+      segments: 0,
+      words: 0,
+      indexes: [],
+    };
+    entry.segments += run.indexes.length;
+    entry.words += run.words;
+    entry.indexes.push(...run.indexes);
+    merged.set(key, entry);
+  }
+
+  // 並びを決めておく。決めないと同じデータから作った診断 Markdown が実行ごとに違う順序で出る
+  const merges = [...merged.values()].sort((a, b) => a.from - b.from || a.to - b.to);
+  return { merges, skipped, majors, minors, others, disabledBy: null };
+}
+
+/**
+ * 計画を適用した**コピー**を返す。引数の配列も要素も変更しない。
+ *
+ * 直すのは `speaker` ラベルだけで、テキストも行数も入力のまま(#36 と同じ)。
+ */
+export function smoothMinorSpeakerIslands(lines, opts = {}) {
+  return applyMerges(lines, planMinorIslandMerges(lines, opts));
+}
+
+/** 計画の `indexes` は `lines` の添字。**計画を立てた配列と同じものへ当てること** */
+function applyMerges(lines, plan) {
+  const out = lines.map((line) => ({ ...line }));
+  for (const m of plan.merges) {
+    for (const i of m.indexes) out[i].speaker = m.to;
+  }
+  return out;
+}
+
 /**
  * 連続する同一話者の発言を1つの段落にまとめる。
  *
@@ -155,11 +414,74 @@ export function mergeSameSpeaker(lines) {
 }
 
 /**
- * 表示・エクスポート用の発話グループを作る。**この2段の順序が要点**で、
+ * 表示・エクスポート用に speaker ラベルを補正した**コピー**を返す(グループ化の手前まで)。
+ *
+ * **①jitter → ②minor island の順序が要点で、この順序を関数の中に閉じてある**
+ * (呼び出し側の規律にしない)。逆にすると吸収できる island が減る:
+ *
+ * ```
+ * A → [jitter B] → minorX → A
+ *   ② を先にすると … prev が B なので「前後が同じ主要 speaker」に当たらず補正されない
+ *   ① を先にすると … B が A に直り、A → minorX → A が見えるので補正できる
+ * ```
+ *
+ * どちらの段も自分の条件は緩めないまま、**後段が見える範囲だけが広がる**。
+ *
+ * **主要 speaker の選定は raw の統計から取る。** `tests/app-wiring.test.ts` が
+ * 「`collectSpeakerStats` は `finalLines` に対して呼ぶ」を固定しており(#46)、
+ * ①通過後のコピーから取るとその不変条件を壊す。実害の面でも、①が動かすのは
+ * 4文字以下の行だけなので word 数の順位は動かない。
+ *
+ * @param lines raw の `finalLines`（変更しない）
+ * @param opts.expectedSpeakers 想定話者数の選択値(#48)。渡さなければ②は何もしない
+ */
+function correctSpeakers(lines, opts) {
+  // **走査する配列は①通過後、統計は raw。** この2つの出どころは別物で、混同すると
+  // 表示と診断がずれる(下の `planDisplayCorrection()` のコメントを参照)
+  const jittered = smoothSpeakerJitter(lines);
+  const plan = planMinorIslandMerges(jittered, {
+    expectedSpeakers: opts.expectedSpeakers,
+    stats: collectSpeakerStats(lines), // ← raw から(#46)
+  });
+  return { plan, corrected: applyMerges(jittered, plan) };
+}
+
+/**
+ * 表示・エクスポート用の発話グループを作る。**この3段の順序が要点**で、
  * 先に speaker ラベルを直してからでないと同一話者としてまとまらない。
  *
  * @param lines raw の `finalLines`（変更しない）
+ * @param opts.expectedSpeakers 想定話者数の選択値(#48)
  */
-export function groupUtterances(lines) {
-  return mergeSameSpeaker(smoothSpeakerJitter(lines));
+export function groupUtterances(lines, opts = {}) {
+  return mergeSameSpeaker(correctSpeakers(lines, opts).corrected);
+}
+
+/**
+ * 診断が見る「表示補正の実際」(#48)。**計画と表示上の話者数を1回の計算から返す。**
+ *
+ * **診断は必ずここを通すこと。`planMinorIslandMerges()` を raw の `finalLines` に
+ * 直接当ててはいけない。** 表示に効くのは①jitter 通過後の行に対する計画なので、
+ * raw から立てた計画とは**両方向にずれる**:
+ *
+ * - jitter が先に島を潰していれば、raw の計画は #48 の手柄を過大に数える
+ * - jitter が島を作っていれば、raw の計画は 0 件なのに表示では補正が効く
+ *   (「表示補正 0 seg」と「表示上の話者数が減っている」が同じ節に並ぶ)
+ *
+ * どちらも `skipped` の理由別内訳を事実と違う値にする。その内訳は
+ * 「実機データを見て `MINOR_ISLAND_MAX_WORDS` を決める」ための唯一の材料なので、
+ * ずれた数字は測定器の目盛りが狂っているのと同じ。
+ *
+ * **統計(majors/minors の選定)を raw から取ることとは別の話。** そちらは #46 の
+ * 不変条件どおりで正しい。揃えるのは「走査する行の配列」のほう。
+ *
+ * @param lines raw の `finalLines`（変更しない）
+ * @param opts.expectedSpeakers 想定話者数の選択値。`groupUtterances()` と同じ引数を渡すこと
+ * @returns {{ plan: object, displayDetected: number }}
+ */
+export function planDisplayCorrection(lines, opts = {}) {
+  const { plan, corrected } = correctSpeakers(lines, opts);
+  // 補正後に speaker が何人へ減ったか。**計画の merges から引き算しない** —
+  // 適用と数え方が別実装になり、片方だけ直したときに静かにずれる
+  return { plan, displayDetected: collectSpeakerStats(corrected).detected };
 }

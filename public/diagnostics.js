@@ -305,6 +305,70 @@ function sttInfoValues(sttInfo) {
   return { modelText, diarizerText: diarizerText || null };
 }
 
+// ---- 表示補正(minor island)の診断(#48) ----
+//
+// **補正が0件でも沈黙させない。** 「補正が効いていない(ゲートで無効)」と「効いた結果0件」は
+// 別の事実で、前者は設定の問題、後者はデータの問題。区別が付かないと、実データを見た人が
+// 閾値を動かすべきかどうか判断できない。
+
+/** ゲートで無効になった理由の表示名。`planMinorIslandMerges()` の `disabledBy` に対応する */
+const ISLAND_DISABLED_LABELS = {
+  auto: "想定話者数が自動",
+  atLeast: "想定話者数が「以上」指定",
+  noStats: "話者統計を取得できない",
+  detectedNotOver: "検出話者数が想定以下",
+  // 閾値は word 数で決めた値なので、分母が文字数のセッションでは意味が変わる(#48)
+  charsBasis: "比率の基準が文字数",
+  tooFewWords: "総 word 数が閾値未満",
+};
+
+/**
+ * 見送った理由の表示名。**順序も含めてここが定義箇所。**
+ * 内訳を出さないと「`run が長い` が多い ⇒ `MINOR_ISLAND_MAX_WORDS` が狭すぎる」のような
+ * 読み方ができず、人が実データから閾値を決められない。
+ */
+const ISLAND_SKIP_LABELS = [
+  ["mismatch", "前後の主要speaker不一致"],
+  ["tooLong", "run が長い"],
+  ["edge", "端"],
+  ["boundary", "再接続境界"],
+  ["unknown", "隣が話者不明"],
+];
+
+/**
+ * 表示補正の見出し行。**画面パネルと Markdown が同じ配列から描く**(既存の規則)。
+ * 出るのは speaker 番号・件数・word 数だけで、会話本文は1文字も入らない。
+ */
+function minorIslandRows(islandPlan, ratioBasis) {
+  // 計画そのものを渡されていない(古い呼び出し)なら何も出さない。
+  // 「補正0件」と紛れないよう、行ごと出さないことで区別する
+  if (!islandPlan) return [];
+  if (islandPlan.disabledBy) {
+    const why = Object.hasOwn(ISLAND_DISABLED_LABELS, islandPlan.disabledBy)
+      ? ISLAND_DISABLED_LABELS[islandPlan.disabledBy]
+      : islandPlan.disabledBy;
+    return [["表示補正", `無効（${why}）`]];
+  }
+  const view = ratioBasisView(ratioBasis);
+  const segments = islandPlan.merges.reduce((n, m) => n + m.segments, 0);
+  const words = islandPlan.merges.reduce((n, m) => n + m.words, 0);
+  const skipped = islandPlan.skipped ?? {};
+  return [
+    ["表示補正", `${segments} seg / ${words} ${view.unit}`],
+    // **主要 / minor の顔ぶれも出す。** 0件だったときに「候補が1人もいなかった」のか
+    // 「候補はいたが条件で落ちた」のかは、この2行が無いと区別できない
+    // (`MINOR_ISLAND_MAX_RATIO` を動かすべきかどうかがそこで決まる)
+    ["主要 speaker", islandPlan.majors.length ? islandPlan.majors.join(", ") : "(なし)"],
+    ["minor speaker", islandPlan.minors.length ? islandPlan.minors.join(", ") : "(なし)"],
+    // 主要でも minor でもない speaker。どちらのリストにも出ないと診断上は存在が消える
+    ...(islandPlan.others?.length ? [["対象外 speaker", islandPlan.others.join(", ")]] : []),
+    [
+      "表示補正の見送り",
+      ISLAND_SKIP_LABELS.map(([key, label]) => `${label} ${skipped[key] ?? 0}`).join(" / "),
+    ],
+  ];
+}
+
 /**
  * 話者統計の見出し行。**画面の診断パネルと Markdown が同じ配列から描く**
  * (収音側の `trackSettingRows()` / `audioStatRows()` と同じ規則)。
@@ -312,12 +376,15 @@ function sttInfoValues(sttInfo) {
  * 会話本文は1文字も入らない。出るのは speaker 番号・件数・割合・時刻の集計値・
  * diarizer の metadata だけ。
  */
-export function speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo }) {
+export function speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo, displayDetected }) {
   if (!speakerStats || speakerStats.totalSegments <= 0) return [];
   const { modelText, diarizerText } = sttInfoValues(sttInfo);
   const rows = [
     ["想定話者数", expectedSpeakerLabel(expectedSpeakers)],
     ["検出話者数", String(speakerStats.detected)],
+    // **raw の検出数と別ラベルで併記する**(#48)。#46 の「診断は raw から」の原則は
+    // 崩さない — 主は raw の統計で、こちらは表示補正を通した後の従の値
+    ...(typeof displayDetected === "number" ? [["表示上の話者数", String(displayDetected)]] : []),
     // **どちらの分母で割合を出したかを必ず書く。** 旧サーバー/旧セッションでは
     // word 数が無く文字数へ落ちるので、書いておかないと数値どうしを比較できない
     ["比率の基準", ratioBasisView(speakerStats.ratioBasis).basisLabel],
@@ -349,15 +416,28 @@ export function speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo }) 
  * 診断パネル(画面)に出す話者統計の行。見出し + speaker ごとの1行 + 警告。
  * Markdown の表と同じ数字を、テーブル1本で読める形に畳んだもの。
  */
-export function speakerDiagRows({ speakerStats, expectedSpeakers, sttInfo }) {
+export function speakerDiagRows({
+  speakerStats,
+  expectedSpeakers,
+  sttInfo,
+  islandPlan,
+  displayDetected,
+}) {
   if (!speakerStats || speakerStats.totalSegments <= 0) return [];
   const view = ratioBasisView(speakerStats.ratioBasis);
-  const rows = speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo });
+  const rows = speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo, displayDetected });
   for (const s of speakerStats.speakers) {
     rows.push([
       `speaker ${s.speaker}`,
       `${pct1(s.ratio)} (${view.value(s)} ${view.unit} / ${s.segments} seg)`,
     ]);
+  }
+  rows.push(...minorIslandRows(islandPlan, speakerStats.ratioBasis));
+  // Markdown は from/to を表で出すが、画面パネルには表が無いので1行ずつ出す
+  // (speaker ごとの行と同じ扱い。**同じ計画から描く**ので数字が割れることはない)
+  const merges = islandPlan && !islandPlan.disabledBy ? islandPlan.merges : [];
+  for (const m of merges) {
+    rows.push([`表示補正 ${m.from} → ${m.to}`, `${m.segments} seg / ${m.words} ${view.unit}`]);
   }
   for (const w of speakerWarnings(speakerStats, expectedSpeakers)) rows.push(["警告", w]);
   return rows;
@@ -375,9 +455,17 @@ function table(rows) {
  * 出るのは speaker 番号・件数・割合・遷移数・**セッション開始からの相対時間**・
  * diarizer の metadata だけで、会話本文も音声も、絶対時刻(＝会議の実施時刻)も入らない。
  */
-function speakerSection({ speakerStats, expectedSpeakers, sttInfo, startedAtMs }) {
+function speakerSection({
+  speakerStats,
+  expectedSpeakers,
+  sttInfo,
+  startedAtMs,
+  islandPlan,
+  displayDetected,
+}) {
   if (!speakerStats || speakerStats.totalSegments <= 0) return [];
   const warnings = speakerWarnings(speakerStats, expectedSpeakers);
+  const islandRows = minorIslandRows(islandPlan, speakerStats.ratioBasis);
   const view = ratioBasisView(speakerStats.ratioBasis);
   const rows = speakerStats.speakers.map((s) => [
     String(s.speaker),
@@ -391,7 +479,9 @@ function speakerSection({ speakerStats, expectedSpeakers, sttInfo, startedAtMs }
   return [
     "## 話者分離の診断",
     "",
-    ...speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo }).map(([k, v]) => `- ${k}: ${v}`),
+    ...speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo, displayDetected }).map(
+      ([k, v]) => `- ${k}: ${v}`,
+    ),
     "",
     ...(warnings.length ? [...warnings, ""] : []),
     "| speaker | words | 割合 | 文字数 | segments | 初出 | 最終 |",
@@ -412,6 +502,26 @@ function speakerSection({ speakerStats, expectedSpeakers, sttInfo, startedAtMs }
           ...(speakerStats.reconnects > 0 || speakerStats.unknownSegments > 0
             ? ["> 再接続と話者不明の区間では鎖が切れるため、遷移回数は下限です。", ""]
             : []),
+        ]
+      : []),
+    // **表示補正の節は「行データ」を画面パネルと共有する**(見出し行は同じ配列から描き、
+    // from/to の明細だけ Markdown では表にする — speaker の表と同じ形)。
+    // 計画を渡されていなければ節ごと出さない(「補正0件」と紛れないため)
+    ...(islandRows.length
+      ? [
+          "### 表示補正（minor island）",
+          "",
+          ...islandRows.map(([k, v]) => `- ${k}: ${v}`),
+          "",
+          ...(islandPlan.disabledBy || islandPlan.merges.length === 0
+            ? []
+            : [
+                // 分母は必ず word 数(chars 基準は補正そのものが無効になる #48)
+                "| from | to | segments | words |",
+                "|---|---|---:|---:|",
+                ...islandPlan.merges.map((m) => `| ${m.from} | ${m.to} | ${m.segments} | ${m.words} |`),
+                "",
+              ]),
         ]
       : []),
   ];
@@ -442,6 +552,8 @@ function speakerSection({ speakerStats, expectedSpeakers, sttInfo, startedAtMs }
  * @param speakerStats `collectSpeakerStats()` の戻り(#46)
  * @param expectedSpeakers 想定話者数の選択値(#46)
  * @param sttInfo `ServerMessage.stt_info` の中身(#46)
+ * @param islandPlan `planMinorIslandMerges()` の戻り(#48)。渡さなければ節ごと出ない
+ * @param displayDetected 表示補正後の話者数(`displaySpeakerCount()`、#48)
  */
 export function buildDiagnosticsMarkdown({
   modeLabel,
@@ -454,6 +566,8 @@ export function buildDiagnosticsMarkdown({
   speakerStats,
   expectedSpeakers,
   sttInfo,
+  islandPlan,
+  displayDetected,
 }) {
   const settingRows = trackSettingRows(trackSettings, contextSampleRate);
   const statRows = audioStatRows(stats);
@@ -481,7 +595,14 @@ export function buildDiagnosticsMarkdown({
     ...(windowRows.length
       ? [`## 入力レベルの分布 (${(SILENCE_WINDOW_SEC * 1000).toFixed(0)}ms 窓ごとの RMS)`, "", ...table(windowRows)]
       : []),
-    ...speakerSection({ speakerStats, expectedSpeakers, sttInfo, startedAtMs }),
+    ...speakerSection({
+      speakerStats,
+      expectedSpeakers,
+      sttInfo,
+      startedAtMs,
+      islandPlan,
+      displayDetected,
+    }),
     "> 会話本文と音声は含みません。",
     "",
   ];

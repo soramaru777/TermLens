@@ -16,8 +16,12 @@ import {
   summarizeAudioStats,
   trackSettingRows,
   fmtElapsed,
+  speakerDiagRows,
 } from "../public/diagnostics.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
+// 表示補正の計画は utterances.js が唯一の定義箇所（#48）。**診断もそこを通る**ので、
+// 「表示に効かせた補正」と「診断に出す件数」が別実装になりようがない
+import { planDisplayCorrection, planMinorIslandMerges } from "../public/utterances.js";
 
 /**
  * 収音診断（#26）。固定するのは2つ。
@@ -234,6 +238,9 @@ const MD_ARGS = {
   speakerStats: collectSpeakerStats([]),
   expectedSpeakers: "auto",
   sttInfo: null,
+  // #48 の表示補正。既定では**計画を渡していない**状態（節ごと出ない）を表す
+  islandPlan: null,
+  displayDetected: null,
 };
 
 test("Markdown にモード・設定・統計が載る", () => {
@@ -484,4 +491,117 @@ test("割合の整形は speaker-stats.js から取る", async () => {
   assert.match(src, /ratioBasisView,/, "ratioBasis の表示定義を import していない");
   // ratioBasis の分岐をこちらに書き直すと、基準を1つ足したときに直し漏れる
   assert.doesNotMatch(src, /ratioBasis === "words"/, "diagnostics.js で基準を分岐している");
+});
+
+// ---- 表示補正（minor island、#48） ----
+//
+// **raw の統計が主で、補正後は別ラベルで併記する**（#46 の「診断は raw から」を崩さない）。
+// 補正が0件でも沈黙させない — 「ゲートで無効」と「効いた結果0件」は別の事実で、
+// 前者は設定の問題、後者はデータの問題。区別が付かないと閾値を決める材料にならない。
+
+/** 想定2人・検出3。`0 → 2(minor) → 0` の島が1つある合成セッション */
+const ISLAND_LINES = [
+  line(0, 120, 240, 1_010_000),
+  line(1, 76, 152, 1_020_000),
+  line(0, 20, 40, 1_030_000),
+  line(2, 3, 6, 1_040_000),
+  line(0, 20, 40, 1_050_000),
+  line(1, 20, 40, 1_060_000),
+];
+
+/** 島が1つも吸収されず、見送りの理由だけが積まれる合成セッション */
+const SKIPPED_LINES = [
+  line(2, 3, 6, 1_000_000), // 端（前に確定 speaker が無い）
+  line(0, 120, 240, 1_010_000),
+  line(1, 76, 152, 1_020_000),
+  line(0, 20, 40, 1_030_000),
+  line(2, 3, 6, 1_040_000), // 前後不一致（0 → 2 → 1）
+  line(1, 20, 40, 1_050_000),
+];
+
+/** 診断の2箇所（画面パネル / Markdown）と同じ形で計画を立てる */
+function islandArgs(lines: ReturnType<typeof line>[], expectedSpeakers = "2") {
+  const speakerStats = collectSpeakerStats(lines);
+  return {
+    ...SPEAKER_MD_ARGS,
+    speakerStats,
+    expectedSpeakers,
+    islandPlan: planMinorIslandMerges(lines, { expectedSpeakers, stats: speakerStats }),
+    displayDetected: planDisplayCorrection(lines, { expectedSpeakers }).displayDetected,
+  };
+}
+
+test("表示補正の件数・word 数・from/to が Markdown に出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(ISLAND_LINES));
+  // raw の検出数は主のまま。補正後は別ラベルで併記する（#46 の原則を崩さない）
+  assert.match(md, /- 検出話者数: 3/);
+  assert.match(md, /- 表示上の話者数: 2/);
+  assert.match(md, /### 表示補正（minor island）/);
+  assert.match(md, /- 表示補正: 1 seg \/ 3 word/);
+  assert.match(md, /- 主要 speaker: 0, 1/);
+  // **候補の顔ぶれも出す。** 0件だったときに「候補がいなかった」のか「条件で落ちた」のかは、
+  // この2行が無いと区別できない（MINOR_ISLAND_MAX_RATIO を動かすべきかがそこで決まる）
+  assert.match(md, /- minor speaker: 2/);
+  assert.match(md, /\| from \| to \| segments \| words \|/);
+  assert.match(md, /\| 2 \| 0 \| 1 \| 3 \|/);
+});
+
+/**
+ * **見送りの内訳を必ず出す。** 「run が長い」が多ければ `MINOR_ISLAND_MAX_WORDS` が
+ * 狭すぎる、と実データから読める。これが無いと人が閾値を決められない。
+ */
+test("見送りの内訳を理由ごとに Markdown へ出す", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(SKIPPED_LINES));
+  assert.match(md, /- 表示補正: 0 seg \/ 0 word/);
+  assert.match(md, /- 表示補正の見送り: 前後の主要speaker不一致 1 \/ run が長い 0 \/ 端 1 \/ 再接続境界 0/);
+  // 補正0件なら from/to の表そのものを出さない（空の表は「補正が無かった」と読めない）
+  assert.doesNotMatch(md, /\| from \| to \| segments \| words \|/);
+});
+
+/**
+ * **「効いていない」と「効いた結果0件」は別の事実。** ゲートで無効なら、
+ * 見送りの内訳ではなく「なぜ無効か」を1行出す。
+ */
+test("ゲートで無効なら理由を1行出す", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(ISLAND_LINES, "auto"));
+  assert.match(md, /- 表示補正: 無効（想定話者数が自動）/);
+  assert.doesNotMatch(md, /- 表示補正の見送り:/, "無効のときに 0 件の内訳を並べない");
+});
+
+test("計画を渡さなければ表示補正の節ごと出さない", () => {
+  // 「補正0件」と紛れないよう、行ごと出さないことで区別する（復元経路などで計画が無い場合）
+  const md = buildDiagnosticsMarkdown({ ...SPEAKER_MD_ARGS });
+  assert.doesNotMatch(md, /### 表示補正（minor island）/);
+  assert.doesNotMatch(md, /- 表示上の話者数:/);
+  assert.match(md, /## 話者分離の診断/, "話者統計そのものは従来どおり出る");
+});
+
+/**
+ * **表示補正の節を足しても会話本文は1文字も出ない。** 出るのは speaker 番号・件数・
+ * word 数だけ（`buildDiagnosticsMarkdown()` の他のセクションと同じ規律）。
+ */
+test("表示補正の節に会話本文が混入しない", () => {
+  const marker = "このもじれつはほんぶんのしるし";
+  const lines = ISLAND_LINES.map((l) => ({ ...l, text: marker }));
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.equal(md.includes(marker), false);
+  assert.match(md, /### 表示補正（minor island）/, "節そのものは出ている");
+});
+
+/**
+ * **画面の診断パネルと Markdown は同じ行データから描く**（#46 からの規則）。
+ * 片方だけに項目が増えると、実機で画面を見た人とファイルを読んだ人で違う数字を見る。
+ */
+test("画面パネルにも表示補正の行が出る", () => {
+  const args = islandArgs(ISLAND_LINES);
+  const rows = speakerDiagRows(args) as Array<[string, string]>;
+  const labels = rows.map(([k]) => k);
+  assert.ok(labels.includes("表示上の話者数"));
+  assert.ok(labels.includes("表示補正"));
+  assert.ok(labels.includes("表示補正の見送り"));
+  // from/to の明細は Markdown では表、画面では1行ずつ（speaker ごとの行と同じ形）
+  assert.deepEqual(
+    rows.find(([k]) => k === "表示補正 2 → 0"),
+    ["表示補正 2 → 0", "1 seg / 3 word"],
+  );
 });
