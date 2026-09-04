@@ -61,6 +61,8 @@ interface Harness {
   transcript: (e: TranscriptEvent) => void;
   /** STT が UtteranceEnd を受けたことにする */
   utteranceEnd: () => void;
+  /** STT がモデル情報を通知したことにする（#46） */
+  sttInfo: (info: unknown) => void;
   /** スケジューラに渡った発話のテキスト */
   utterances: string[];
   stop: () => Promise<void>;
@@ -85,12 +87,17 @@ async function harness(): Promise<Harness> {
   ];
   let transcriptCb: ((e: TranscriptEvent) => void) | undefined;
   let utteranceEndCb: (() => void) | undefined;
+  let sttInfoCb: ((info: unknown) => void) | undefined;
   spies.push(
     mock.method(MockSttAdapter.prototype, "onTranscript", (cb: (e: TranscriptEvent) => void) => {
       transcriptCb = cb;
     }),
     mock.method(MockSttAdapter.prototype, "onUtteranceEnd", (cb: () => void) => {
       utteranceEndCb = cb;
+    }),
+    // mock は onSttInfo を呼ばない（登録するだけ）。配線の有無はここで掴む
+    mock.method(MockSttAdapter.prototype, "onSttInfo", (cb: (info: unknown) => void) => {
+      sttInfoCb = cb;
     }),
   );
 
@@ -100,6 +107,7 @@ async function harness(): Promise<Harness> {
   await settle();
   assert.ok(transcriptCb, "onTranscript が登録されていない");
   assert.ok(utteranceEndCb, "onUtteranceEnd が登録されていない");
+  assert.ok(sttInfoCb, "onSttInfo が登録されていない");
   // Session が scheduler へ渡した配線をそのまま掴む。`card_update` の中継は
   // scheduler を動かさずにこのコールバックを叩けば確かめられる（#38）
   const scheduler = (session as unknown as { scheduler: ExtractionScheduler }).scheduler;
@@ -112,6 +120,7 @@ async function harness(): Promise<Harness> {
     utterances,
     transcript: (e) => transcriptCb!(e),
     utteranceEnd: () => utteranceEndCb!(),
+    sttInfo: (info) => sttInfoCb!(info as never),
     stop: async () => {
       ws.clientSend({ type: "stop" });
       await settle();
@@ -382,6 +391,86 @@ test("rename に cardId は載らない", async () => {
     };
     assert.equal(update.cardId, "c7", "更新対象の ID はトップレベルのまま");
     assert.ok(!("cardId" in update.rename), "改名の中に識別子を持ち込まない");
+  } finally {
+    h.restore();
+  }
+});
+
+// ---- word 数とモデル情報（#46） ----
+//
+// クライアントは話者ごとの word 数からしか「割合」を出せない。載っていなければ
+// 文字数へフォールバックするので**例外は出ず、分母が黙って入れ替わる**だけ。
+
+/** 送信済み transcript の wordCount 列。 */
+function wordCounts(ws: FakeWs): Array<number | undefined> {
+  return ws.sent
+    .filter((m) => m.type === "transcript")
+    .map((m) => (m as { wordCount?: number }).wordCount);
+}
+
+const WORD = (word: string, speaker: number) => ({
+  word,
+  punctuatedWord: word,
+  start: 0,
+  end: 0.5,
+  confidence: 0.9,
+  speaker,
+});
+
+test("final の wordCount はそのセグメントの word 数と一致する", async () => {
+  const h = await harness();
+  try {
+    h.transcript({
+      text: "w0w1",
+      isFinal: true,
+      speaker: 0,
+      words: [WORD("w0", 0), WORD("w1", 0)],
+      segIndex: 0,
+    });
+    h.transcript({ text: "w2", isFinal: true, speaker: 1, words: [WORD("w2", 1)], segIndex: 1 });
+    assert.deepEqual(wordCounts(h.ws), [2, 1], "分割後のセグメントごとの件数になっていない");
+  } finally {
+    h.restore();
+  }
+});
+
+test("words を持たない final の wordCount は付かない（0 と偽らない）", async () => {
+  const h = await harness();
+  try {
+    // words を出せないアダプタもありうる（TranscriptEvent.words は optional）。
+    // 0 を送ると「word が0個だった」と読め、割合の分母が狂う
+    h.transcript({ text: "words なし", isFinal: true, speaker: 0 });
+    assert.deepEqual(wordCounts(h.ws), [undefined]);
+  } finally {
+    h.restore();
+  }
+});
+
+test("interim には wordCount を付けない", async () => {
+  const h = await harness();
+  try {
+    // interim は分割されず、話者統計の対象でもない。付けても読み手がいないうえ、
+    // クライアントが interim を数えると word 数が二重計上される
+    h.transcript({ text: "とちゅう", isFinal: false, speaker: undefined, words: [WORD("w0", 0)] });
+    assert.deepEqual(wordCounts(h.ws), [undefined]);
+  } finally {
+    h.restore();
+  }
+});
+
+test("stt_info はそのままクライアントへ中継する", async () => {
+  const h = await harness();
+  try {
+    h.sttInfo({ model: { name: "nova-3" }, diarizer: { arch: "v1" } });
+    const infos = h.ws.sent.filter((m) => m.type === "stt_info");
+    assert.deepEqual(infos, [
+      { type: "stt_info", model: { name: "nova-3" }, diarizer: { arch: "v1" } },
+    ]);
+    // **キーを明示して並べていることの固定。** `{ ...info }` にすると
+    // TypeScript の excess property check が効かず、SttInfo にフィールドが1つ増えた
+    // だけで型エラーゼロのままクライアントへ出ていく（request_id を出さない、という
+    // この変更の中心的な主張が型の網目を素通りする）
+    assert.deepEqual(Object.keys(infos[0]).sort(), ["diarizer", "model", "type"]);
   } finally {
     h.restore();
   }

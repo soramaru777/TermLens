@@ -128,7 +128,27 @@ export type ServerMessage =
   // **配る番号は 1 から**(0 はサーバー側カウンタの初期値で、クライアントには届かない)。
   // 再接続でサーバー側セッションが張り直されると 1 から振り直しになるが、クライアントは
   // 再接続の境界で必ずグループを切るので衝突しない。
-  | { type: "transcript"; text: string; isFinal: boolean; speaker: number | null; finalSeq?: number }
+  | {
+      type: "transcript";
+      text: string;
+      isFinal: boolean;
+      speaker: number | null;
+      finalSeq?: number;
+      /**
+       * このイベントの word 数(#46)。**整数1つだけ**載せる。
+       *
+       * `words` 配列そのものは載せない(WS ペイロードが約13倍になり、
+       * `localStorage` の復元が静かに劣化するという #19 の判断は崩さない。
+       * 理由は `src/stt/types.ts` の `TranscriptEvent.words` のコメント)。
+       * クライアントはこれを話者ごとの word 数の集計にだけ使うので、
+       * 必要なのは件数であって語そのものではない。
+       *
+       * interim には付かない(分割せず、話者統計の対象でもないため)。
+       * **旧サーバー互換のため optional** — 無い場合クライアントは割合の分母を
+       * 文字数へフォールバックし、どちらで計算したかを診断に明記する。
+       */
+      wordCount?: number;
+    }
   | { type: "cards"; cards: TermCard[] }
   // status は optional にしない。送り側(scheduler)では検証の結果として必ず決まるので、
   // 省略できる形にすると受け側が「変化なし」と「未指定」を区別できなくなる(#24)。
@@ -155,6 +175,22 @@ export type ServerMessage =
       rename?: CardRename;
     }
   | { type: "status"; state: "stt_connecting" | "stt_open" | "stt_closed" | "extracting" }
+  /**
+   * STT 側のモデル情報(#46)。話者分離の診断で「どの diarizer が動いていたか」を
+   * 記録するために送る。値が変わったときだけ届く(毎 Results 送っても中身は同じ)。
+   *
+   * **`request_id` は載せない。** 会話本文でも音声でもないが、**そのセッションを
+   * 一意に指す値**であり、診断ファイルは実機比較の結果として共有されうる。
+   * `public/diagnostics.js` の `TRACK_KEYS`(採用リスト)と同じ思想で、
+   * 診断に要るものだけを明示的に通す — Deepgram が metadata にキーを増やしても、
+   * ここへ書き足さない限り外へ出ない。
+   */
+  | {
+      type: "stt_info";
+      model?: { name?: string; version?: string; arch?: string };
+      /** diarizer が動いたときだけ入る。取れなければキーごと落とす */
+      diarizer?: { arch?: string; modelUuid?: string };
+    }
   | {
       type: "error";
       code: "auth_failed" | "stt_error" | "llm_error" | "bad_request";

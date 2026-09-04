@@ -59,6 +59,24 @@ export interface TranscriptEvent {
   speechFinal?: boolean;
 }
 
+/**
+ * STT 側のモデル情報(#46)。話者分離の診断で「どの diarizer がどのモデルで動いていたか」を
+ * 記録するために使う。
+ *
+ * **アダプタが取れた項目だけを持つ optional の集合**にしてある。Deepgram は
+ * `diarize_info` を diarizer が動いたときだけ返し、metadata 自体が来ないメッセージもある。
+ * 必須にすると「取れなかった」を表すためのダミー値が要る。
+ *
+ * **セッションを一意に指す値(`request_id` など)はここに入れない。** 診断ファイルは
+ * 実機比較の結果として共有されうるため、`src/protocol.ts` の `stt_info` と同じく
+ * 採用リストの発想で必要なものだけを通す。
+ */
+export interface SttInfo {
+  model?: { name?: string; version?: string; arch?: string };
+  /** diarizer が動いたときだけ入る */
+  diarizer?: { arch?: string; modelUuid?: string };
+}
+
 export interface SttAdapter {
   start(opts: { keywords: string[] }): Promise<void>;
   /** 16kHz mono PCM16 LE の音声チャンク */
@@ -75,6 +93,15 @@ export interface SttAdapter {
    * 相当する仕組みを持たないアダプタは空実装でよい（mock がそうしている）。
    */
   onUtteranceEnd(cb: () => void): void;
+  /**
+   * STT のモデル情報が分かった/変わったときに呼ばれる(#46)。
+   *
+   * **毎メッセージではなく変化時だけ**呼ぶ契約。Deepgram は Results ごとに同じ
+   * metadata を返すので、素通しするとクライアントへ同じ内容を数百回送ることになる。
+   *
+   * 相当する情報を持たないアダプタは空実装でよい(mock がそうしている)。
+   */
+  onSttInfo(cb: (info: SttInfo) => void): void;
   onError(cb: (err: Error) => void): void;
   onClose(cb: () => void): void;
 }
