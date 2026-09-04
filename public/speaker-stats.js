@@ -32,6 +32,11 @@
 // 表示用に speaker ラベルを補正した**コピー**を返すので、そちらから集計すると
 // 「表示補正と診断用 raw 統計が分離されている」という #46 の要件が静かに壊れる
 // (補正の効き具合を測るための統計が、補正後の値になってしまう)。
+//
+// **唯一の例外は「表示上の話者数」(#48)。** 補正後に speaker が何人へ減ったかは、
+// 定義上 raw からは出せない。`utterances.js` の `planDisplayCorrection()` が補正後の
+// コピーへこの関数を当てて数え、診断は raw の検出話者数と**別ラベルで併記**する
+// (raw が主、補正後が従)。それ以外の統計は raw から取ること。
 
 /**
  * 想定話者数の選択肢。**定義箇所はここだけ。**
@@ -81,16 +86,27 @@ export function expectedSpeakerCount(value) {
   return findOption(normalizeExpectedSpeakers(value)).count;
 }
 
-/** その値が「N人以上」の意味か。`4plus` だけ真。警告の組み立てからしか使わない */
-function expectedSpeakerAtLeast(value) {
+/**
+ * その値が「N人以上」の意味か。`4plus` だけ真。
+ *
+ * **`utterances.js` の island 補正(#48)もここから引く。** 「以上」は上限が定まらないので
+ * 補正を無効にする、という判断に使う。呼び出し側で `count === 4` と書くと、
+ * 「4人ちょうど」の選択肢を将来足したときに黙って壊れる。
+ */
+export function expectedSpeakerAtLeast(value) {
   return findOption(normalizeExpectedSpeakers(value)).atLeast;
 }
 
 /** 再接続の区切り印。発話ではないので集計に参加させない(`utterances.js` と同じ判定) */
 const isReconnect = (line) => line?.type === "reconnect";
 
-/** 有限な非負数だけ通す。壊れた値で合計を NaN に落とさない */
-function num(value) {
+/**
+ * 有限な非負数だけ通す。壊れた値で合計を NaN に落とさない。
+ *
+ * **export しているのは `utterances.js` の #48 が同じ規則で行の word 数を読むため。**
+ * 写しを置くと、片方だけ「負を許す」ように直したときに静かに食い違う。
+ */
+export function num(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
@@ -103,8 +119,12 @@ function num(value) {
  * 遷移キー(`${prev}>${speaker}`)も `>` を含む文字列で分解が破綻し、`speaker` の昇順ソートも
  * NaN で壊れる。信頼境界の外から来る値をここで無害化しておく
  * (`card-status.js` の `cardStatus()` が「必ず3値に丸める」のと同じ発想)。
+ *
+ * **export しているのは `utterances.js` の #48 が統合先を決めるときに同じ規則で判定するため。**
+ * 「整数でなければ話者不明」の定義が2箇所にあると、片方だけ緩めたときに、丸められなかった
+ * 値が統合先として診断 Markdown へ抜ける経路ができる。
  */
-function definedSpeaker(value) {
+export function definedSpeaker(value) {
   return typeof value === "number" && Number.isInteger(value);
 }
 

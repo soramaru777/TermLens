@@ -29,9 +29,12 @@ import {
   captureModeLabel,
   normalizeCaptureMode,
 } from "./capture-mode.js";
-// 発話グループの組み立て(話者 jitter の補正 + 同一話者の結合)は utterances.js が唯一の
-// 定義箇所(#36)。ここでまとめ直すと、画面と Markdown エクスポートで補正結果が食い違う。
-import { groupUtterances } from "./utterances.js";
+// 発話グループの組み立て(話者 jitter の補正 + minor island の補正 + 同一話者の結合)は
+// utterances.js が唯一の定義箇所(#36 / #48)。ここでまとめ直すと、画面と Markdown
+// エクスポートで補正結果が食い違う。
+// **groupUtterances() の2箇所には必ず同じ引数を渡すこと** — 片方だけ想定話者数を
+// 渡すと画面と Markdown で話者ラベルが割れ、しかも例外は出ない。
+import { groupUtterances, planDisplayCorrection } from "./utterances.js";
 // 話者統計の集計・想定話者数の選択肢は speaker-stats.js が唯一の定義箇所(#46)。
 // **集計は raw の finalLines に対して行う**(groupUtterances() の結果ではない) —
 // 表示補正の効き具合を測るための統計が、補正後の値になってしまうため。
@@ -291,6 +294,11 @@ saveSettingsBtn.addEventListener("click", () => {
     restoreBanner.hidden = true;
   }
   homeError.hidden = true;
+  // **想定話者数を変えたら文字起こしを描き直す(#48)。** 表示補正は毎描画で
+  // `getExpectedSpeakers()` を読むので、設定だけ変えて再描画しないと、画面と
+  // 診断・エクスポートで違う話者ラベルが出る。今は設定画面へ入る導線がホームだけなので
+  // 表示中のセッションに当たることは無いが、導線が増えたときに黙って割れる形にしない
+  renderTranscript();
   showHome();
 });
 
@@ -886,7 +894,7 @@ function speakerLabel(speaker) {
 // カード追加時のハイライト反映も兼ねる。
 function renderTranscript() {
   finalText.textContent = "";
-  for (const group of groupUtterances(finalLines)) {
+  for (const group of groupUtterances(finalLines, { expectedSpeakers: getExpectedSpeakers() })) {
     if (group.type === "reconnect") {
       finalText.append(el("div", "reconnect-marker", "― 再接続(以降の話者ラベルは振り直し)―"));
       continue;
@@ -1251,7 +1259,7 @@ function buildTranscriptMarkdown() {
     "---",
     "",
   ];
-  for (const group of groupUtterances(finalLines)) {
+  for (const group of groupUtterances(finalLines, { expectedSpeakers: getExpectedSpeakers() })) {
     if (group.type === "reconnect") {
       out.push("---", "", "*再接続しました。以降の話者ラベルは振り直しです。*", "");
       continue;
@@ -1276,6 +1284,15 @@ function renderDiagnostics() {
   // toggle から呼ぶので、表示される内容は変わらない
   if (!diagPanel.open) return;
   diagTable.textContent = "";
+  // **統計は raw から(#46)、表示補正の計画は `planDisplayCorrection()` から(#48)。**
+  // 計画を raw の finalLines に直接当ててはいけない — 表示に効くのは jitter 補正を
+  // 通した後の行に対する計画なので、raw から立てると診断の件数が表示とずれる
+  // (詳細は utterances.js の planDisplayCorrection() のコメント)。
+  // ここと buildDiagnosticsMd() は同じ形にすること
+  const speakerStats = collectSpeakerStats(finalLines);
+  const { plan: islandPlan, displayDetected } = planDisplayCorrection(finalLines, {
+    expectedSpeakers: getExpectedSpeakers(),
+  });
   const rows = [
     // 収音側はマイクを開いた区間の値。話者統計は finalLines に紐づく別のライフタイムなので、
     // 片方が空でももう片方は出す(復元セッションでは話者統計だけが出る)(#46)
@@ -1291,9 +1308,11 @@ function renderDiagnostics() {
         // という主張が崩れる
         [["収音の統計", "(取得できませんでした)"]]),
     ...speakerDiagRows({
-      speakerStats: collectSpeakerStats(finalLines),
+      speakerStats,
       expectedSpeakers: getExpectedSpeakers(),
       sttInfo,
+      islandPlan,
+      displayDetected,
     }),
   ];
   for (const [label, value] of rows) {
@@ -1312,6 +1331,15 @@ diagPanel.addEventListener("toggle", () => {
 function buildDiagnosticsMd() {
   const started = sessionStartedAt ?? new Date();
   const ended = sessionEndedAt ?? new Date();
+  // **統計は raw から(#46)、表示補正の計画は `planDisplayCorrection()` から(#48)。**
+  // 計画を raw の finalLines に直接当ててはいけない — 表示に効くのは jitter 補正を
+  // 通した後の行に対する計画なので、raw から立てると診断の件数が表示とずれる
+  // (詳細は utterances.js の planDisplayCorrection() のコメント)。
+  // ここと renderDiagnostics() は同じ形にすること
+  const speakerStats = collectSpeakerStats(finalLines);
+  const { plan: islandPlan, displayDetected } = planDisplayCorrection(finalLines, {
+    expectedSpeakers: getExpectedSpeakers(),
+  });
   // 整形は diagnostics.js の純関数に任せる(テストから読めるようにするため)。
   // trackSettings は既に採用リストを通してあるが、整形側でももう一度通る
   return buildDiagnosticsMarkdown({
@@ -1327,9 +1355,11 @@ function buildDiagnosticsMd() {
     stats: diag?.stats,
     // **raw の finalLines から集計する。** groupUtterances() の結果を渡すと、
     // 表示補正の効き具合を測るための統計が補正後の値になる(#46)
-    speakerStats: collectSpeakerStats(finalLines),
+    speakerStats,
     expectedSpeakers: getExpectedSpeakers(),
     sttInfo,
+    islandPlan,
+    displayDetected,
   });
 }
 

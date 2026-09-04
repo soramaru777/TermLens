@@ -98,24 +98,36 @@ test("Markdown エクスポートは純関数に委譲する", () => {
 // ---- 発話グループ（#36） ----
 
 /**
- * **画面と Markdown エクスポートは同じ `groupUtterances()` を通る。**
+ * **画面と Markdown エクスポートは同じ `groupUtterances()` を、同じ引数で通る。**
  *
  * 片方が自前で `finalLines` をまとめ直すと、jitter 補正の効いた画面と効かない
  * エクスポートに割れる（AC「画面表示と Markdown export で同じ補正結果になる」が
  * 静かに落ちる。純関数のテストは全部緑のまま）。
+ *
+ * **引数が同じであることまで固定する**（#48）。想定話者数を片方にだけ渡すと、
+ * 画面と Markdown で話者ラベルが割れる — これも例外は出ない。
  */
-test("表示とエクスポートは同じ groupUtterances() を通す", () => {
+const GROUP_CALL = "groupUtterances(finalLines, { expectedSpeakers: getExpectedSpeakers() })";
+
+test("表示とエクスポートは同じ groupUtterances() を同じ引数で通す", () => {
   assert.match(APP, /from "\.\/utterances\.js"/, "utterances.js を import していない");
   // 呼び出しは描画（renderTranscript）とエクスポート（buildTranscriptMarkdown）の2箇所だけ
   const calls = CODE.match(/groupUtterances\(/g) ?? [];
   assert.equal(calls.length, 2, `groupUtterances の呼び出しが ${calls.length} 箇所ある`);
+  // **同じ形の呼び出しが2箇所ある**ことを数で固定する。総数が2で、この形が2なら、
+  // 2箇所は必ず同一（片方だけ引数を変えるとどちらかの数が合わなくなる）
+  assert.equal(
+    CODE.split(GROUP_CALL).length - 1,
+    2,
+    `2箇所が同じ引数で groupUtterances() を呼んでいない: ${GROUP_CALL}`,
+  );
   const render = CODE.slice(CODE.indexOf("function renderTranscript"), CODE.indexOf("function el("));
-  assert.match(render, /groupUtterances\(finalLines\)/, "描画がグループ化を通していない");
+  assert.ok(render.includes(GROUP_CALL), "描画がグループ化を通していない");
   const md = CODE.slice(
     CODE.indexOf("function buildTranscriptMarkdown"),
     CODE.indexOf("function buildTranscriptMarkdown") + 1500,
   );
-  assert.match(md, /groupUtterances\(finalLines\)/, "エクスポートがグループ化を通していない");
+  assert.ok(md.includes(GROUP_CALL), "エクスポートがグループ化を通していない");
   // app.js 側に定義が残っていると、import した純関数が使われないまま古い挙動で動く
   assert.doesNotMatch(CODE, /function groupUtterances\(/, "app.js に定義が残っている");
 });
@@ -154,6 +166,43 @@ test("話者統計は raw の finalLines から集計する", () => {
   }
   // app.js 側に集計を書き直すと、import した純関数が使われないまま別の定義で動く
   assert.doesNotMatch(CODE, /function collectSpeakerStats\(/, "app.js に定義が残っている");
+});
+
+/**
+ * **表示補正の計画（#48）も、画面パネルと Markdown が同じ形で作る。**
+ *
+ * `renderDiagnostics()` と `buildDiagnosticsMd()` で計画の作り方が割れると、
+ * 画面に出る補正件数と Markdown の補正件数が食い違う（例外は出ない）。
+ *
+ * **計画は `planDisplayCorrection()` から取る。`planMinorIslandMerges()` を raw の
+ * `finalLines` に直接当ててはいけない。** 表示に効くのは jitter 補正（#36）を通した後の
+ * 行に対する計画なので、raw から立てると診断の件数が表示と**両方向にずれる**
+ * （jitter が島を潰していれば過大に、jitter が島を作っていれば 0 件と出る）。
+ * その件数は「実データを見て閾値を決める」ための唯一の材料なので、ずれた数字は無意味。
+ */
+const ISLAND_WIRING = [
+  "const speakerStats = collectSpeakerStats(finalLines);",
+  "const { plan: islandPlan, displayDetected } = planDisplayCorrection(finalLines, {",
+];
+
+test("診断の2箇所は表示補正の計画を同じ形で作る", () => {
+  const panel = fnBody("renderDiagnostics");
+  const md = fnBody("buildDiagnosticsMd");
+  for (const stmt of ISLAND_WIRING) {
+    assert.ok(panel.includes(stmt), `診断パネルに無い: ${stmt}`);
+    assert.ok(md.includes(stmt), `診断 Markdown に無い: ${stmt}`);
+    // ファイル全体でもこの2箇所だけ。3箇所目ができると同期の対象が増える
+    assert.equal(CODE.split(stmt).length - 1, 2, `${stmt} が2箇所ではない`);
+  }
+  // 計画も表示上の話者数も純関数側（utterances.js）の定義を使う
+  assert.doesNotMatch(CODE, /function planDisplayCorrection\(/, "app.js に定義が残っている");
+  // **raw の finalLines に直接計画を当てていないこと。** これが残っていると、
+  // 表示に効いた補正と診断の件数がずれる（上のコメント参照）
+  assert.doesNotMatch(
+    CODE,
+    /planMinorIslandMerges\(/,
+    "app.js が raw から直接計画を立てている（planDisplayCorrection を通すこと）",
+  );
 });
 
 test("想定話者数の選択肢は EXPECTED_SPEAKER_OPTIONS から組み立てる", () => {

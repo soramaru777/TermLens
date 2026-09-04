@@ -16,7 +16,7 @@ sources:
   - public/speaker-stats.js
 related: [[termlens-architecture]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-deployment]], [[termlens-testing]]
 confidence: high
-updated: 2026-09-04
+updated: 2026-09-05
 ---
 
 # TermLens STT パイプライン
@@ -247,6 +247,121 @@ diarizer の metadata だけ。**会話本文・音声・絶対時刻・`request
 「偽 speaker の可能性」「潰れている可能性」と断定しない形にしてある。閾値
 （`MINOR_SPEAKER_RATIO` = 0.05 / `DOMINANT_SPEAKER_RATIO` = 0.90）は暫定値で、
 実データを集めてから判断する（[[termlens-open-issues]]）。
+
+#### 想定話者数を超えた少数 speaker の島を寄せる（Issue #48）
+
+**表示側の補正は 2 段になった。** どちらも raw の `finalLines` は書き換えず、表示・
+エクスポート用コピーの `speaker` ラベルだけを直す。テキストも行数も変えない。
+
+```
+finalLines（raw / localStorage に保存されるのもこれ）
+  │
+  ├─ collectSpeakerStats(finalLines) ──▶ #46 の診断統計（raw）
+  │                                          │
+  │                          主要 speaker の選定に使う
+  │                                          ▼
+  └─ ① smoothSpeakerJitter()  ──▶ ② smoothMinorSpeakerIslands() ──▶ ③ mergeSameSpeaker()
+     #36 局所 jitter               #48 想定話者数つき minor island      既存
+```
+
+きっかけは実機の 1 サンプル（2 人の会話で 4 speaker 検出、
+`0: 646 word (78.7%) / 1: 11 (1.3%) / 2: 160 (19.5%) / 3: 4 (0.5%)`）。
+`0 → 1 → 0` のような島が複数回出る一方、`2 → 3 → 0` のように前後の主要 speaker が
+異なるケースもあった（[[termlens-open-issues]]）。
+
+##### ゲート（どれか 1 つでも当たれば 1 件も補正しない）
+
+| 条件 | `disabledBy` | 理由 |
+|---|---|---|
+| 想定話者数が「自動」 | `auto` | 人数の申告が無いので減らす根拠が無い |
+| 想定話者数が「N 人以上」 | `atLeast` | 上限が定まらない。**`count === 4` のハードコードにしない**（「4 人ちょうど」を将来足したときに黙って壊れる） |
+| 検出話者数 ≦ 想定話者数 | `detectedNotOver` | 検出が想定以下なら減らす理由が無い |
+| 総 word 数（または総文字数）< `MIN_TOTAL_WORDS_FOR_ISLANDS` | `tooFewWords` | 序盤は主要 speaker の順位が信用できない |
+
+**「効いていない」と「効いた結果 0 件」は別の事実**なので、ゲートで空にした理由は
+`disabledBy` として返し、診断に 1 行出す。
+
+##### 判定
+
+主要 speaker は統計の値の降順 → speaker 番号の昇順で上位 N 名。**tie-break を明示するのは
+純関数の決定性のため**で、同数が上位 N の境界にまたがると順位が不定になる。minor は
+「主要でない」かつ `ratio < MINOR_ISLAND_MAX_RATIO`。
+
+発話行を 1 パスで走査し、**同一 minor speaker が連続する run** を切り出す。run は別の
+speaker（主要でも別の minor でも）・話者不明・再接続の印で切れる。run 全体を寄せるのは
+次を全部満たすときだけで、満たさなかった run は理由別に数える（`skipped`）。
+
+1. run の前後に**確定 speaker つきの発話行**がある … 無ければ `edge`
+2. run と前後の間に再接続の印が無い … あれば `boundary`
+3. 前後の speaker が一致し、かつそれが主要 speaker … 違えば `mismatch`
+4. run の合計 word 数 ≦ `MINOR_ISLAND_MAX_WORDS` … 超えれば `tooLong`
+
+**run として切り出すことが要点。** 1 行ずつ判定すると `A → X → X → A` は
+「1 つ目の X の次が X、2 つ目の X の前が X」で**一度も発火しない**が、実データはこの形で出る。
+逆に **異なる minor が隣接したら run を切る** — `A → X → Y → A` の `X → Y` という遷移
+**そのものが観測された話者交代**であり、またいで両方を A へ寄せると観測事実を消してしまう。
+
+##### ①→② の順序が結果を変える
+
+```
+A → [jitter B] → minorX → A
+
+  ② を先にすると … prev が B なので「前後が同じ主要 speaker」に当たらず補正されない
+  ① を先にすると … B が A に直り、A → minorX → A が見えるので補正できる
+```
+
+どちらの段も自分の条件は緩めないまま、**後段が見える範囲だけが広がる**。順序は
+`groupUtterances()` の中に閉じてあり、呼び出し側の規律にはしていない
+（`tests/utterances.test.ts` に「順序を入れ替えたら落ちるテスト」がある）。
+
+##### 主要 speaker は raw の統計から選ぶ
+
+②に渡す統計は `collectSpeakerStats(finalLines)`、つまり**①を通す前の raw** から取る。
+`tests/app-wiring.test.ts` が「`collectSpeakerStats` は `finalLines` に対して呼ぶ」を
+固定しており（#46）、①通過後のコピーから取るとその不変条件が壊れる。実害の面でも、
+①が動かすのは 4 文字以下の行だけなので word 数の順位は動かない。
+
+##### 閾値（`public/utterances.js`。すべて 1 サンプル由来の暫定値）
+
+| 定数 | 暫定値 | 役割 |
+|---|---|---|
+| `MINOR_ISLAND_MAX_RATIO` | 0.03 | **機械が黙って統合してよい**線 |
+| `MINOR_ISLAND_MAX_WORDS` | 20 | 1 つの島として吸収してよい最大 word 数 |
+| `MIN_TOTAL_WORDS_FOR_ISLANDS` | 200 | これ未満では主要 speaker の順位を信用しない |
+
+**分母が文字数へ落ちるセッション（旧サーバー・#46 以前の保存データ）では補正しない**
+（`charsBasis` ゲート）。閾値は word 数で決めた値で、文字数に当てると意味が変わり、しかも
+**逆方向にずれる** — 日本語のおよそ 1 word ≒ 2 文字で見ると `MINOR_ISLAND_MAX_WORDS` は
+厳しくなって取りこぼし、`MIN_TOTAL_WORDS_FOR_ISLANDS` は**緩くなって危険側に外れる**。
+旧セッションのために補正精度を賭けない。
+
+**`speaker-stats.js` の `MINOR_SPEAKER_RATIO`（5%）とは別物。** あちらは「**人が見て疑うべき**」
+線で、診断の警告文（「偽 speaker の可能性」）にしか使わない。こちらは機械が自動で
+ラベルを書き換える線なので、当然もっと厳しくなる。役割が違うので**名前とファイルの両方で
+離してある** — 片方を実機データで動かしたときに、もう片方を触ったつもりにならないため。
+
+##### 診断への出方
+
+「話者分離の診断」に、raw の**検出話者数**と別ラベルで**表示上の話者数**（補正後の行から
+`collectSpeakerStats()` で数える）が並び、`### 表示補正（minor island）` として補正の
+`from → to` 表・主要/minor/対象外の顔ぶれ・**見送りの理由別件数**が出る。#46 の「診断は raw から」は
+崩していない（raw が主で、補正後は従の併記）。
+
+**診断は必ず `planDisplayCorrection()` を通す。`planMinorIslandMerges()` を raw の
+`finalLines` に直接当ててはいけない。** 表示に効くのは①jitter を通した後の行に対する計画なので、
+raw から立てた計画とは**両方向にずれる**:
+
+- jitter が先に島を潰していれば、raw の計画は #48 の手柄を過大に数える
+- jitter が島を作っていれば、raw の計画は 0 件なのに表示では補正が効く
+  （「表示補正 0 seg」と「表示上の話者数が減っている」が同じ節に並ぶ）
+
+どちらも `skipped` の理由別内訳を事実と違う値にする。その内訳は閾値を決めるための唯一の
+材料なので、ずれた数字は測定器の目盛りが狂っているのと同じ。**「統計を raw から取る」
+（#46 の不変条件。こちらは正しい）と「走査する行の配列」は別の話**で、揃えるのは後者。
+
+**見送りの内訳を出すのが要点。** 「`run が長い` が多い ⇒ `MINOR_ISLAND_MAX_WORDS` が狭すぎる」
+と実データから読める。これが無いと人が閾値を決められない。会話本文は 1 文字も出ず、
+出るのは speaker 番号・件数・word 数だけ。
 
 #### 残っている弱点: 段落内の連結は半角スペース
 
