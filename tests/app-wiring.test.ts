@@ -106,23 +106,30 @@ test("Markdown エクスポートは純関数に委譲する", () => {
  *
  * **引数が同じであることまで固定する**（#48）。想定話者数を片方にだけ渡すと、
  * 画面と Markdown で話者ラベルが割れる — これも例外は出ない。
+ *
+ * **3箇所目は診断の④（#52）。** テキスト完全性の「表示（段落結合後）」の文字数は、
+ * 画面に出ているのと同じグループから数えないと意味がない — 別の引数で呼ぶと、
+ * 画面に出ていない補正結果の文字数を診断が報告する。
  */
 const GROUP_CALL = "groupUtterances(finalLines, { expectedSpeakers: getExpectedSpeakers() })";
 
 test("表示とエクスポートは同じ groupUtterances() を同じ引数で通す", () => {
   assert.match(APP, /from "\.\/utterances\.js"/, "utterances.js を import していない");
-  // 呼び出しは描画（renderTranscript）とエクスポート（buildTranscriptMarkdown）の2箇所だけ
+  // 呼び出しは描画（renderTranscript）・エクスポート（buildTranscriptMarkdown）・
+  // 診断の④（textIntegrityStages、#52）の3箇所だけ
   const calls = CODE.match(/groupUtterances\(/g) ?? [];
-  assert.equal(calls.length, 2, `groupUtterances の呼び出しが ${calls.length} 箇所ある`);
-  // **同じ形の呼び出しが2箇所ある**ことを数で固定する。総数が2で、この形が2なら、
-  // 2箇所は必ず同一（片方だけ引数を変えるとどちらかの数が合わなくなる）
+  assert.equal(calls.length, 3, `groupUtterances の呼び出しが ${calls.length} 箇所ある`);
+  // **同じ形の呼び出しが3箇所ある**ことを数で固定する。総数が3で、この形が3なら、
+  // 3箇所は必ず同一（1箇所だけ引数を変えるとどちらかの数が合わなくなる）
   assert.equal(
     CODE.split(GROUP_CALL).length - 1,
-    2,
-    `2箇所が同じ引数で groupUtterances() を呼んでいない: ${GROUP_CALL}`,
+    3,
+    `3箇所が同じ引数で groupUtterances() を呼んでいない: ${GROUP_CALL}`,
   );
   const render = CODE.slice(CODE.indexOf("function renderTranscript"), CODE.indexOf("function el("));
   assert.ok(render.includes(GROUP_CALL), "描画がグループ化を通していない");
+  const stages = fnBody("textIntegrityStages");
+  assert.ok(stages.includes(GROUP_CALL), "診断の④が表示と同じグループから数えていない");
   const md = CODE.slice(
     CODE.indexOf("function buildTranscriptMarkdown"),
     CODE.indexOf("function buildTranscriptMarkdown") + 1500,
@@ -225,6 +232,130 @@ test("想定話者数の選択肢は EXPECTED_SPEAKER_OPTIONS から組み立て
     "想定話者数を丸めずに読んでいる",
   );
   assert.match(CODE, /localStorage\.setItem\("termlens\.expectedSpeakers"/, "保存していない");
+});
+
+// ---- STT テキスト完全性（#52） ----
+
+/**
+ * **③（受信）は raw の `finalLines`、④（表示）は `groupUtterances()` の出力から数える。**
+ *
+ * ③を `groupUtterances()` から数えると、②→③ の差が常に 0 になり「サーバーとクライアントの
+ * 差」を見る段が消える。逆に④を `finalLines` から数えると、③→④ の差が常に 0 になり
+ * 「表示補正がテキストを変えていないか」を見る段が消える。**どちらも例外は出ず、表は
+ * 埋まったまま**なので、数字を読んだ人は「一致している」と結論する — 測定器が壊れていても
+ * 壊れたと分からない形になる。
+ */
+test("テキスト完全性の③は raw、④は表示グループから数える", () => {
+  const stages = fnBody("textIntegrityStages");
+  assert.ok(
+    stages.includes('countTextChars(lines.filter((l) => l.type !== "reconnect").map((l) => l.text))'),
+    "③を raw の finalLines から数えていない",
+  );
+  assert.ok(stages.includes("countTextChars(displayedTexts)"), "④を表示グループから数えていない");
+  // 数え方の定義は diagnostics.js が唯一の定義箇所。app.js で数え直すと
+  // 「空白を除く」の定義が3つ目（サーバー / diagnostics.js / ここ）になる
+  assert.doesNotMatch(CODE, /function countTextChars\(/, "app.js に定義が残っている");
+  assert.doesNotMatch(CODE, /replace\(\/\\s\/g/, "app.js が空白を独自に数えている");
+});
+
+/**
+ * **③④はサーバーと同じ区間だけを数える。**
+ *
+ * ①②を持つサーバー側の `SplitIntegrity` は WS 1本ごとに作り直されるのに、クライアントは
+ * 再接続しても `finalLines` を保持する。境界で切らないと③④だけが前のセッションぶんを
+ * 含んだまま比較され、**②→③ に実在しない増加**が出る。再接続はアプリが正規に
+ * サポートする経路（指数バックオフで最大5回）なので、この計測が答えるべき場面で
+ * まさに表が読めなくなる。
+ */
+test("テキスト完全性の③④は最後の再接続以降だけを数える", () => {
+  const stages = fnBody("textIntegrityStages");
+  assert.ok(stages.includes("sinceLastReconnect(finalLines)"), "③を境界で切っていない");
+  assert.ok(
+    stages.includes("sinceLastReconnect(\n    groupUtterances(finalLines,"),
+    "④を境界で切っていない",
+  );
+  // **範囲を切るのはグループにしてから。** #48 の統合は全体の語数比で決まるので、
+  // 切った行から組み直すと画面に出ているのと違うグループを数えることになる
+  assert.doesNotMatch(
+    stages,
+    /groupUtterances\(\s*sinceLastReconnect/,
+    "切ってからグループにしている",
+  );
+  // 境界の印は #36 が入れたものと同じ。2つ目の印を作らない
+  assert.match(CODE, /finalLines\.push\(\{ type: "reconnect", t: Date\.now\(\) \}\)/);
+});
+
+/**
+ * **累計が来ていなければ表示パイプラインを回さない。** 呼び出し側は `textIntegrity` が
+ * 無ければ節ごと落とすので、結果は捨てられる（mock モードと、final がまだ1件も
+ * 来ていない間がこれに当たる）。開いたパネルの再描画のたびに全行を無駄に補正することになる。
+ */
+test("text_integrity が無ければ③④を数えない", () => {
+  const stages = fnBody("textIntegrityStages");
+  assert.ok(
+    stages.includes("if (!textIntegrity) return { received: null, displayed: null };"),
+    "累計が無くても計算している",
+  );
+});
+
+/**
+ * **画面パネルと Markdown は同じ1回の計算を共有する。** 別々に数えると、同じセッションから
+ * 段階別文字数の違う表が2つ出る（#48 の `planDisplayCorrection()` と同じ理由）。
+ */
+test("診断の2箇所はテキスト完全性の③④を1回の計算から取る", () => {
+  const panel = fnBody("renderDiagnostics");
+  const md = fnBody("buildDiagnosticsMd");
+  const stmt = "const stages = textIntegrityStages();";
+  assert.ok(panel.includes(stmt), `診断パネルに無い: ${stmt}`);
+  assert.ok(md.includes(stmt), `診断 Markdown に無い: ${stmt}`);
+  assert.equal(CODE.split(stmt).length - 1, 2, `${stmt} が2箇所ではない`);
+  // 1つの関数の中で2回呼ぶと、その間に届いた final の行が片方にだけ入り、
+  // ③と④が別々の時点の画面を指す
+  assert.equal(
+    // 定義行（`function textIntegrityStages()`）と区別するため、代入の形で数える
+    (CODE.match(/= textIntegrityStages\(\)/g) ?? []).length,
+    2,
+    "textIntegrityStages() の呼び出しが2箇所ではない",
+  );
+});
+
+/**
+ * **累計は localStorage に保存しない。** 復元した値はセッションをまたいだ集計になり、
+ * 同じ表に並ぶ③④（今の画面の行から数える）と対応しなくなる。
+ */
+test("テキスト完全性の累計は保存も持ち越しもしない", () => {
+  assert.match(CODE, /textIntegrity = \{/, "text_integrity を受け取っていない");
+  assert.doesNotMatch(CODE, /textIntegrity,\s*\n\s*savedAt/, "セッション保存に混ぜている");
+  assert.doesNotMatch(
+    CODE,
+    /localStorage\.setItem\("termlens\.integrity"/,
+    "累計を localStorage に保存している",
+  );
+  const reset = fnBody("resetSessionState");
+  assert.match(reset, /textIntegrity = null/, "開始のたびに初期化していない");
+});
+
+/**
+ * **再接続では累計も捨てる。**
+ *
+ * ①②を持つサーバー側の `SplitIntegrity` は新しい WS で 0 から数え直すのに、クライアントが
+ * 前のセッションの累計を保持したままだと、③④（再接続以降だけを数える）が 0 の状態で
+ * ①②だけが大きい表になる。判定文は「②→③ で N 文字減少 → クライアントが取りこぼしている」
+ * と言うが、**何も落ちていない**。新しい final が1件届くまで節ごと出さないのが正しい。
+ *
+ * ③④を境界で切るのと同じ問題の裏返しなので、**印を積む場所と同じ分岐で**捨てる。
+ */
+test("再接続したらテキスト完全性の累計も捨てる", () => {
+  const onMessage = fnBody("connectWs");
+  const push = 'finalLines.push({ type: "reconnect", t: Date.now() });';
+  const i = onMessage.indexOf(push);
+  assert.ok(i >= 0, "再接続の印を積む分岐が見つからない");
+  // 印を積む直後で捨てる。別の場所へ離すと、片方だけ通る経路を後から足せてしまう
+  assert.match(
+    onMessage.slice(i, i + 600),
+    /textIntegrity = null/,
+    "再接続の分岐で累計を捨てていない",
+  );
 });
 
 // ---- 収音モードと診断（#26） ----

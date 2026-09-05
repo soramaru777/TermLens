@@ -51,11 +51,13 @@ import {
 import {
   audioStatRows,
   buildDiagnosticsMarkdown,
+  countTextChars,
   emptyAudioStats,
   fmtElapsed,
   mergeAudioStats,
   pickTrackSettings,
   speakerDiagRows,
+  textIntegrityRows,
   trackSettingRows,
 } from "./diagnostics.js";
 
@@ -133,6 +135,16 @@ let diag = null;
  * Deepgram が metadata を返さなければ来ない)。
  */
 let sttInfo = null;
+/**
+ * STT テキスト完全性の累計(#52)。`ServerMessage.text_integrity` の中身をそのまま持つ。
+ *
+ * 累計が届くので**上書きでよい**(差分を積まない)。
+ *
+ * **`localStorage` に保存しない。** 復元した値はセッションをまたいだ集計になり、
+ * 同じ表に並ぶ③④(今の画面の行から数える)と対応しなくなる。診断が答えるのは
+ * 「今のセッションで何が起きたか」で、混ざった数字はその問いに答えられない。
+ */
+let textIntegrity = null;
 let stopping = false; // 停止操作によるクローズか(意図しない切断と区別する)
 // 再接続: 指数バックオフ 1s, 2s, 4s, 8s, 16s の最大5回。
 // マイクは掴んだまま(releaseCapture を呼ばない)、送信だけ止めて待つ
@@ -374,6 +386,9 @@ function resetSessionState() {
   // モデル情報も持ち越さない。前回のセッションの diarizer が今回の診断に残ると、
   // 「どの diarizer で録ったか」という記録そのものが嘘になる(#46)
   sttInfo = null;
+  // テキスト完全性の累計も持ち越さない(#52)。前回の final 数・文字数が残ると、
+  // ①②(サーバー累計)だけが前回ぶんを含み、③④(今の finalLines)と対応しなくなる
+  textIntegrity = null;
   diagPanel.hidden = true;
   renderDiagnostics();
   // 前回セッションの再接続待ちが万一残っていたら止める(持ち越さない)
@@ -516,6 +531,13 @@ function connectWs(token, glossary) {
         everReady = true;
         if (reconnectAttempt > 0) {
           finalLines.push({ type: "reconnect", t: Date.now() });
+          // **テキスト完全性の累計も捨てる**(#52)。①②を持つサーバー側の `SplitIntegrity` は
+          // この新しいセッションで 0 から数え直すのに、ここを残すと前のセッションの
+          // 大きい累計が①②に居座る。③④は再接続以降だけを数えるので、新しい final が
+          // 1件届くまで「①②＝前セッション分 / ③④＝0」という組み合わせが表示され、
+          // 判定文が「クライアントが取りこぼしている」と言う — **何も落ちていないのに**。
+          // null に戻せば次の1件が届くまで節ごと出ない（「0件」と「未取得」を混同しない）
+          textIntegrity = null;
           renderTranscript();
           scheduleSessionSave();
         }
@@ -562,6 +584,23 @@ function connectWs(token, glossary) {
       case "stt_info":
         // 変化したときだけ届く(サーバー側で判定済み)。type は捨てて中身だけ持つ
         sttInfo = { model: msg.model, diarizer: msg.diarizer };
+        renderDiagnostics();
+        break;
+      case "text_integrity":
+        // final ごとに**累計**が届く(#52)。差分を積まないので上書きでよい。
+        // **キーを明示して持つ** — サーバーがフィールドを足しても、ここへ書き足さない
+        // 限り診断には出ない(`stt_info` と同じ採用リストの発想)
+        textIntegrity = {
+          finals: msg.finals,
+          splitFinals: msg.splitFinals,
+          rawChars: msg.rawChars,
+          rawVisible: msg.rawVisible,
+          splitChars: msg.splitChars,
+          splitVisible: msg.splitVisible,
+          fallbacks: msg.fallbacks,
+          droppedEvents: msg.droppedEvents,
+          headDrops: msg.headDrops,
+        };
         renderDiagnostics();
         break;
       case "status":
@@ -621,6 +660,22 @@ function scheduleReconnect() {
 const finalLines = [];
 // 再接続の印は発言ではないので、件数を数えるときは除く
 const spokenLines = () => finalLines.filter((l) => l.type !== "reconnect");
+
+/**
+ * 最後の再接続の印より後ろだけを返す(#52)。印が無ければ全体。
+ *
+ * **テキスト完全性の ③④ にはこれが要る。** ①② を数えるサーバー側の `SplitIntegrity` は
+ * WS 1本ごとに作り直されるのに、クライアントは再接続しても `finalLines` を持ち続ける。
+ * 境界で切らないと ③④ だけが前のセッションぶんを含んだまま比較され、②→③ に
+ * 実在しない増加が出る。`finalSeq`(#36) が同じ問題を持たないのは、クライアントが
+ * この印を入れて番号の振り直しをそこで吸収しているから — 同じ印をここでも使う。
+ */
+const sinceLastReconnect = (items) => {
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i]?.type === "reconnect") return items.slice(i + 1);
+  }
+  return items;
+};
 
 // カードの元データ。DOM は新しい順に prepend するが、こちらは挿入順(古い順)を保つ。
 // エクスポートは登場順の方が読みやすいため、この Map を正とする。
@@ -1293,6 +1348,39 @@ function buildTranscriptMarkdown() {
 // 診断が1つでも出せる状態か。mock モードや復元経路ではマイクを開いていないので false
 const hasDiagnostics = () => diag !== null;
 
+/**
+ * テキスト完全性の③④をクライアント側で数える(#52)。
+ *
+ * **画面パネルと Markdown が同じ1回の計算を共有する。** 別々に数えると、同じセッションから
+ * 段階別文字数の違う表が2つ出る(#48 の `planDisplayCorrection()` と同じ理由)。
+ *
+ * - ③は raw の `finalLines`(サーバーから届いた text をそのまま積んだもの)
+ * - ④は `groupUtterances()` の出力。**表示・エクスポートと同じ引数で通すこと** —
+ *   別の引数で呼ぶと、画面に出ていない補正結果の文字数を診断が報告する
+ *
+ * 文字数の数え方(`countTextChars`)は `diagnostics.js` が定義箇所。ここで数え直すと
+ * 「空白を除く」の定義が3つ目になる。
+ */
+function textIntegrityStages() {
+  // **サーバーから累計が来ていなければ数えない。** 呼び出し側は `textIntegrity` が
+  // 無ければ節ごと落とすので、ここで表示パイプラインを1周しても結果は捨てられる
+  // (会議中ずっと、開いたパネルの再描画のたびに全行を無駄に補正することになる)
+  if (!textIntegrity) return { received: null, displayed: null };
+  const lines = sinceLastReconnect(finalLines);
+  const displayedTexts = [];
+  // **範囲を切るのはグループにしてから**(#52)。#48 の統合は全体の語数比で決まるので、
+  // 切った行に対して組み直すと画面に出ているのと違うグループを数えることになる
+  for (const group of sinceLastReconnect(
+    groupUtterances(finalLines, { expectedSpeakers: getExpectedSpeakers() }),
+  )) {
+    if (group.texts) displayedTexts.push(...group.texts);
+  }
+  return {
+    received: countTextChars(lines.filter((l) => l.type !== "reconnect").map((l) => l.text)),
+    displayed: countTextChars(displayedTexts),
+  };
+}
+
 function renderDiagnostics() {
   // **畳んだままなら描かない。** 統計は毎秒届くが、既定で閉じている <details> の
   // 中身を作り直しても誰も見ない(会議中ずっと捨てる仕事になる)。開いた瞬間に
@@ -1308,6 +1396,7 @@ function renderDiagnostics() {
   const { plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
     expectedSpeakers: getExpectedSpeakers(),
   });
+  const stages = textIntegrityStages();
   const rows = [
     // 収音側はマイクを開いた区間の値。話者統計は finalLines に紐づく別のライフタイムなので、
     // 片方が空でももう片方は出す(復元セッションでは話者統計だけが出る)(#46)
@@ -1329,6 +1418,13 @@ function renderDiagnostics() {
       islandPlan,
       unresolvedPlan,
       displayDetected,
+    }),
+    // テキスト完全性(#52)。サーバーから `text_integrity` を1件も受けていなければ
+    // 行ごと出ない(「0文字」と「未取得」を混同させない)
+    ...textIntegrityRows({
+      integrity: textIntegrity,
+      received: stages.received,
+      displayed: stages.displayed,
     }),
   ];
   for (const [label, value] of rows) {
@@ -1356,6 +1452,7 @@ function buildDiagnosticsMd() {
   const { plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
     expectedSpeakers: getExpectedSpeakers(),
   });
+  const stages = textIntegrityStages();
   // 整形は diagnostics.js の純関数に任せる(テストから読めるようにするため)。
   // trackSettings は既に採用リストを通してあるが、整形側でももう一度通る
   return buildDiagnosticsMarkdown({
@@ -1377,6 +1474,11 @@ function buildDiagnosticsMd() {
     islandPlan,
     unresolvedPlan,
     displayDetected,
+    // ③④は1回の計算から両方取る(#52)。2回呼ぶと、その間に届いた final の行が
+    // 片方にだけ入り、③と④が別々の時点の画面を指す
+    textIntegrity,
+    receivedChars: stages.received,
+    displayedChars: stages.displayed,
   });
 }
 

@@ -191,6 +191,42 @@ export type ServerMessage =
       /** diarizer が動いたときだけ入る。取れなければキーごと落とす */
       diarizer?: { arch?: string; modelUuid?: string };
     }
+  /**
+   * STT テキスト完全性のセッション累計(#52)。**final 1件ごとに届く**(累計なので
+   * クライアントは上書きするだけでよい)。
+   *
+   * **スロットルを入れていない。** 数値10個ほどのペイロードで、載せないと判断した
+   * `words` 配列(#19 で約13倍)とは桁が違う。間引くと「いつの時点の累計か」を持つ状態が
+   * 増えるだけで、読める事実は増えない。
+   *
+   * **会話本文は1文字も入らない。** 出るのは件数・文字数・差分・timing だけで、
+   * **本文を復元しうる hash も入れない**(短い発話は総当たりで復元されうる)。
+   * `IntegritySnapshot` にフィールドが増えても、この型と `session.ts` の両方へ
+   * 書き足さない限り外へ出ない(`stt_info` と同じ2層の採用リスト)。
+   *
+   * 判定に使うのは**空白を除いた文字数**(`rawVisible` / `splitVisible`)。話者分割は
+   * 切り出しに `.trim()` を掛け、フォールバックは `join("")` で語間の空白を落とすので、
+   * **正常に動いていても素の文字数は減る**(`src/stt/split.ts` の `visibleChars()`)。
+   */
+  | {
+      type: "text_integrity";
+      /** final の総数(transcript が空の Results は数えない) */
+      finals: number;
+      /** そのうち話者で分割された数 */
+      splitFinals: number;
+      /** ① Deepgram final の文字数の累計 */
+      rawChars: number;
+      rawVisible: number;
+      /** ② 話者分割後に発行したイベントの文字数の累計 */
+      splitChars: number;
+      splitVisible: number;
+      /** 切り出しに失敗して連結へフォールバックした回数 */
+      fallbacks: number;
+      /** 空で捨てられたセグメント数 */
+      droppedEvents: number;
+      /** そのうち先頭セグメントだったもの(＝発話の頭が丸ごと消えた回数) */
+      headDrops: number;
+    }
   | {
       type: "error";
       code: "auth_failed" | "stt_error" | "llm_error" | "bad_request";

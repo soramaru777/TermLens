@@ -63,6 +63,8 @@ interface Harness {
   utteranceEnd: () => void;
   /** STT がモデル情報を通知したことにする（#46） */
   sttInfo: (info: unknown) => void;
+  /** STT が final の分割計測を出したことにする（#52） */
+  splitDiag: (diag: unknown) => void;
   /** スケジューラに渡った発話のテキスト */
   utterances: string[];
   stop: () => Promise<void>;
@@ -88,6 +90,7 @@ async function harness(): Promise<Harness> {
   let transcriptCb: ((e: TranscriptEvent) => void) | undefined;
   let utteranceEndCb: (() => void) | undefined;
   let sttInfoCb: ((info: unknown) => void) | undefined;
+  let splitDiagCb: ((diag: unknown) => void) | undefined;
   spies.push(
     mock.method(MockSttAdapter.prototype, "onTranscript", (cb: (e: TranscriptEvent) => void) => {
       transcriptCb = cb;
@@ -99,6 +102,11 @@ async function harness(): Promise<Harness> {
     mock.method(MockSttAdapter.prototype, "onSttInfo", (cb: (info: unknown) => void) => {
       sttInfoCb = cb;
     }),
+    // mock は onSplitDiag も呼ばない（登録するだけ）。#52 の計測は実アダプタの
+    // 経路でしか出ないので、配線の有無はここで掴む
+    mock.method(MockSttAdapter.prototype, "onSplitDiag", (cb: (diag: unknown) => void) => {
+      splitDiagCb = cb;
+    }),
   );
 
   const ws = new FakeWs();
@@ -108,6 +116,7 @@ async function harness(): Promise<Harness> {
   assert.ok(transcriptCb, "onTranscript が登録されていない");
   assert.ok(utteranceEndCb, "onUtteranceEnd が登録されていない");
   assert.ok(sttInfoCb, "onSttInfo が登録されていない");
+  assert.ok(splitDiagCb, "onSplitDiag が登録されていない");
   // Session が scheduler へ渡した配線をそのまま掴む。`card_update` の中継は
   // scheduler を動かさずにこのコールバックを叩けば確かめられる（#38）
   const scheduler = (session as unknown as { scheduler: ExtractionScheduler }).scheduler;
@@ -121,6 +130,7 @@ async function harness(): Promise<Harness> {
     transcript: (e) => transcriptCb!(e),
     utteranceEnd: () => utteranceEndCb!(),
     sttInfo: (info) => sttInfoCb!(info as never),
+    splitDiag: (diag) => splitDiagCb!(diag as never),
     stop: async () => {
       ws.clientSend({ type: "stop" });
       await settle();
@@ -475,3 +485,70 @@ test("stt_info はそのままクライアントへ中継する", async () => {
     h.restore();
   }
 });
+
+// ---- STT テキスト完全性（#52） ----
+
+/** 会話内容を持たない `SplitDiag`。省略したキーは「正常な素通し」の値になる。 */
+const DIAG = (over: Record<string, unknown> = {}) => ({
+  rawChars: 10,
+  rawVisible: 9,
+  splitChars: 10,
+  splitVisible: 9,
+  segments: 1,
+  events: 1,
+  fallback: false,
+  headDropped: false,
+  ...over,
+});
+
+const integrities = (ws: FakeWs) => ws.sent.filter((m) => m.type === "text_integrity");
+
+test("text_integrity は final ごとに累計として送る", async () => {
+  const h = await harness();
+  try {
+    h.splitDiag(DIAG());
+    h.splitDiag(DIAG({ segments: 3, events: 2, fallback: true, headDropped: true }));
+    const sent = integrities(h.ws);
+    assert.equal(sent.length, 2, "final ごとに送る（スロットルは入れていない）");
+    // 2件目は1件目を含む累計。差分を送ると、クライアントが取りこぼした瞬間に
+    // 表の数字が恒久的にずれる（累計なら次の1件で追いつく）
+    assert.equal(sent[1].finals, 2);
+    assert.equal(sent[1].splitFinals, 1);
+    assert.equal(sent[1].rawVisible, 18);
+    assert.equal(sent[1].fallbacks, 1);
+    assert.equal(sent[1].headDrops, 1);
+    assert.equal(sent[1].droppedEvents, 1);
+  } finally {
+    h.restore();
+  }
+});
+
+/**
+ * **キーを明示して並べていることの固定**（`stt_info` と同じ理由、#46 のレビュー）。
+ *
+ * `{ ...snapshot }` にするとオブジェクトリテラルへの excess property check が効かず、
+ * `IntegritySnapshot` にフィールドが1つ増えただけで**型エラーゼロのままクライアントへ
+ * 出ていく**。「診断に出るのは件数と文字数だけ」という主張が型の網目を素通りする。
+ */
+test("text_integrity のキーは採用リストで、余分な値を通さない", async () => {
+  const h = await harness();
+  try {
+    h.splitDiag(DIAG());
+    const sent = integrities(h.ws);
+    assert.deepEqual(Object.keys(sent[0]).sort(), [
+      "droppedEvents",
+      "fallbacks",
+      "finals",
+      "headDrops",
+      "rawChars",
+      "rawVisible",
+      "splitChars",
+      "splitFinals",
+      "splitVisible",
+      "type",
+    ]);
+  } finally {
+    h.restore();
+  }
+});
+

@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import type { SttAdapter, SttInfo, TranscriptEvent, TranscriptWord } from "./types.js";
+import type { SplitDiag, SttAdapter, SttInfo, TranscriptEvent, TranscriptWord } from "./types.js";
 import { buildFinalEvents } from "./split.js";
 import { config } from "../config.js";
 
@@ -46,24 +46,30 @@ export interface DeepgramAlternative {
  * 「分割してから同一話者を結合する」という組み合わせが噛み合わない。
  * 発話終端は「その Results の終わり」であって「各セグメントの終わり」ではない。
  *
+ * `diag`（#52 のテキスト完全性）は **final のときだけ**返す。interim は分割しないので
+ * 測るものが無く、返すと「interim も final も同じ器に積める」ように見えてしまう
+ * （interim は同じ発話を何度も出すので、積むと文字数が数倍に膨らむ）。
+ * transcript が空の Results も返さない — テキストが無い以上テキスト完全性に言うことは無く、
+ * 積むと `finals` が無音の Results を数える器になる。
+ *
  * export しているのは tests/transcript-events.test.ts から検証するため。
  */
 export function buildTranscriptEvents(
   alt: DeepgramAlternative | undefined,
   isFinal: boolean,
   speechFinal = false,
-): TranscriptEvent[] {
+): { events: TranscriptEvent[]; diag?: SplitDiag } {
   const text = alt?.transcript ?? "";
-  if (text.length === 0) return [];
+  if (text.length === 0) return { events: [] };
   const words = toTranscriptWords(alt?.words);
   if (!isFinal) {
-    return [{ text, isFinal: false, speaker: undefined, words }];
+    return { events: [{ text, isFinal: false, speaker: undefined, words }] };
   }
-  const events = buildFinalEvents(text, words);
+  const { events, diag } = buildFinalEvents(text, words);
   if (speechFinal && events.length > 0) {
     events[events.length - 1].speechFinal = true;
   }
-  return events;
+  return { events, diag };
 }
 
 /**
@@ -148,6 +154,7 @@ export class DeepgramSttAdapter implements SttAdapter {
   private transcriptCb: ((e: TranscriptEvent) => void) | null = null;
   private utteranceEndCb: (() => void) | null = null;
   private sttInfoCb: ((info: SttInfo) => void) | null = null;
+  private splitDiagCb: ((diag: SplitDiag) => void) | null = null;
   /**
    * 直近に通知した `SttInfo` の JSON。**変化の検出だけに使う。**
    * Deepgram は Results ごとに同じ metadata を返すので、素通しすると
@@ -185,6 +192,13 @@ export class DeepgramSttAdapter implements SttAdapter {
       // 騒がしい会議室ではこちらが発話終端の頼りになる。1000ms は公式の最小推奨値。
       // interim_results=true が前提だが上で有効にしてある。
       utterance_end_ms: "1000",
+      // **`vad_events` は足さない(#52)。** SpeechStarted で「VAD が発話開始と判断した時刻」と
+      // 「最初に認識された word の start」の差を測る案はあったが、(1) 公式ドキュメント自身が
+      // 「次の transcript の最初の語の開始時刻と必ずしも一致しない」と書いており差が欠落の
+      // 証拠にならない、(2) 日本語 + `diarize=true` で通るかを実接続で確認できておらず、
+      // #46 の `diarize` / `diarize_model` 同時指定と同じくハンドシェイクで弾かれれば
+      // `start()` が reject して**STT が一度も開始しない**、の2点で見送った。
+      // 判断の経緯は docs/wiki/termlens-stt-pipeline.md。
     });
     // nova-3 系は keyterm(日本語対応・最大約100語)、nova-2 以前は keywords でブースト
     const useKeyterm = config.deepgramModel.startsWith("nova-3");
@@ -224,13 +238,16 @@ export class DeepgramSttAdapter implements SttAdapter {
                 this.sttInfoCb?.(info);
               }
             }
-            const events = buildTranscriptEvents(
+            const { events, diag } = buildTranscriptEvents(
               msg.channel?.alternatives?.[0],
               msg.is_final === true,
               msg.speech_final === true,
             );
             // 1セグメント内で話者が変われば複数件になる。コールバックはその回数ぶん呼ぶ
             for (const e of events) this.transcriptCb?.(e);
+            // **transcript の後に呼ぶ**(#52)。診断は「この final までの累計」として読むので、
+            // 先に diag を渡すと、その final ぶんが乗る前の累計がクライアントへ出ていく
+            if (diag) this.splitDiagCb?.(diag);
             // transcript が空の Results に speech_final が立つことがある。イベントは
             // 発行できないが（空 transcript は送らない）、終端シグナルまで捨てると
             // 確定契機が1つ黙って消えるので、境界としてだけ伝える
@@ -297,6 +314,9 @@ export class DeepgramSttAdapter implements SttAdapter {
   }
   onSttInfo(cb: (info: SttInfo) => void): void {
     this.sttInfoCb = cb;
+  }
+  onSplitDiag(cb: (diag: SplitDiag) => void): void {
+    this.splitDiagCb = cb;
   }
   onError(cb: (err: Error) => void): void {
     this.errorCb = cb;
