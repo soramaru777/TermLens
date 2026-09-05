@@ -1,7 +1,8 @@
-// 発話グループの組み立て — 話者ラベルの揺れ(speaker jitter)の補正(#36)、
+// 発話グループの組み立て — 同じ final の中で語の途中に入った speaker 境界の平滑化(#55)、
+// 話者ラベルの揺れ(speaker jitter)の補正(#36)、
 // 想定話者数を超えて検出された少数 speaker の島の補正(#48)、
 // 統合先を決められなかった minor speaker の中立化(#50)、
-// そして連続する同一話者の結合。
+// そして連続する同一話者の結合と、段落内の連結子の出し分け(#55)。
 //
 // **app.js から切り出してあるのは、Node のテストから読めるようにするため**
 // (`card-status.js` / `terms-markdown.js` / `lowpass.js` と同じ理由)。app.js は
@@ -93,11 +94,63 @@ export const MINOR_ISLAND_MAX_WORDS = 20;
 /** これ未満の総 word 数では主要 speaker の順位が信用できないので補正しない */
 export const MIN_TOTAL_WORDS_FOR_ISLANDS = 200;
 
+// ---- speaker boundary の閾値(#55) ----
+//
+// **①jitter とは効く形が違う。** jitter は「同じ final の中で、前後が同じ話者に挟まれた島」を
+// 直す。こちらは「同じ final を話者で割った断片のうち、隣より極端に短いほう」を隣へ寄せる。
+// `A: テキ | B: ストを確認します` のように**後ろに元の話者が戻ってこない 2 行の形**は
+// 挟まれていないので①には当たらず、#52 で観測された「発話の冒頭が欠けて見える」の正体が
+// これだった(文字は 1 つも落ちておらず、語の途中で段落が切れている)。
+
+/**
+ * 断片と見なす最大文字数(#55)。
+ *
+ * `JITTER_CHAR_LIMIT`(4)より 1 小さい。⓪は「前後が同じ話者に挟まれている」という証拠が
+ * 1 つ少ないぶん、寄せてよい長さを狭く取る。ここを広げても**テキストは消えない**
+ * (寄せるのは speaker だけ)。広げすぎたときの害は、同じ final に混ざった相手の短い相槌が
+ * 隣の話者の段落へ入ること。
+ */
+export const BOUNDARY_FRAGMENT_CHAR_LIMIT = 3;
+
+/**
+ * 断片の末尾にあれば「閉じた独立発話」と見なす句読点(#55)。
+ * 「はい。」のように閉じていれば、短くても語の途中で切れたのではない。
+ */
+export const BOUNDARY_PUNCTUATION = "。、？！?!";
+
+/**
+ * 相槌として独立させる短い語彙(#55)。⓪が「同じ final の中の短い断片」を隣の話者へ寄せるとき、
+ * この語だけは寄せない。
+ *
+ * ⓪の証拠は「同じ final に入っている」ことだけで、①jitter のように前後で挟まれてはいない。
+ * 相手の相槌が endpointing の無音を挟まず同じ final に混ざると、証拠の上では
+ * 「語の途中で切れた断片」と区別が付かない。語彙で弾くのはそのための最後のゲート。
+ *
+ * **`BOUNDARY_FRAGMENT_CHAR_LIMIT` 以下の語だけを載せる。** それより長い語は長さのゲートで
+ * 先に落ちるので、ここに書いても効かない(書くと効いているように読める)。テストで固定している。
+ * ⓪の調整つまみ(文字数・句読点・語彙)はすべてこの節にまとめ、他のファイルに散らさない。
+ */
+export const BACKCHANNEL_WORDS = Object.freeze([
+  "はい",
+  "ええ",
+  "うん",
+  "そう",
+  "へえ",
+  "あー",
+  "えー",
+  "ん",
+  "はー",
+  "ほう",
+  "ふむ",
+]);
+
 /** 再接続の区切り印。発話ではないので結合にも補正にも参加させない。 */
 const isReconnect = (line) => line?.type === "reconnect";
 
 /** 話者が確定している行か。`speaker` は不明なら null / undefined で来る。 */
 const hasSpeaker = (line) => line != null && line.speaker != null;
+/** 行の長さ。**素の `length`**(空白を除かない)で、①の閾値も⓪の閾値も診断の文字数もこれで測る */
+const textLength = (line) => String(line?.text ?? "").length;
 
 /**
  * `line` が前後(`prev` / `next`)に挟まれた話者ラベルの揺れかどうか。
@@ -124,7 +177,7 @@ function isSpeakerJitter(prev, line, next) {
   if (prev.speaker !== next.speaker) return false;
   if (prev.speaker === line.speaker) return false;
   // 長い発話は、話者が本当に交代したと考えるほうが自然
-  if (String(line.text ?? "").length > JITTER_CHAR_LIMIT) return false;
+  if (textLength(line) > JITTER_CHAR_LIMIT) return false;
   return sameFinalish(prev, line, next);
 }
 
@@ -177,6 +230,172 @@ export function smoothSpeakerJitter(lines) {
   return out;
 }
 
+// ---- 第0段: 同じ final の中で語の途中に入った speaker 境界の平滑化(#55) ----
+//
+// 補正するのは speaker ラベルだけで、テキストも行数も変えない(#36 と同じ規律)。
+// **別の final は絶対に跨がない。** 別の final として届いた「はい」(endpointing の無音を
+// 挟んだ本物の相槌)は `seq` が違うので、①と同じ理由で構造的に吸収されない。
+
+/** 理由キーの列から 0 埋めの内訳を作る。②③⓪の「0 でも必ず全キーを出す」を 1 か所で満たす */
+const zeroCounts = (keys) => Object.fromEntries(keys.map((key) => [key, 0]));
+
+/**
+ * ⓪が見送った理由のキー。**順序も含めてここが定義箇所**(②の `emptySkipped()` と同じ流儀で、
+ * 表示名は `diagnostics.js` が持つ)。表示名の表がこの列と一致することはテストで固定する —
+ * 理由を足して表示名を付け忘れると、その件数が診断から黙って消えるため。
+ *
+ * - `ambiguous` … 両隣が同じ final の長い行で speaker が異なる(`A長 | X短 | B長`)
+ * - `shortNeighbor` … 隣も断片の長さで、どちらが本体か決められない(断片の連鎖)
+ * - `punctuated` … 末尾が句読点で閉じている
+ * - `backchannel` … 相槌語彙
+ * - `differentFinal` … 隣が別の final
+ * - `boundary` … 隣が再接続の印
+ * - `unknown` … 断片自身か隣の speaker が不明
+ * - `noSeq` … `seq` の無い旧セッションの行
+ *
+ * `ambiguous` と `shortNeighbor` を分けるのは、内訳が「閾値と語彙を決める唯一の材料」だから。
+ * 前者が多ければ文字種の連続性(案2)のような追加ゲートの検討材料、後者が多ければ 2 パス目の
+ * 検討材料で、混ぜると「寄せられなかった」としか読めない。
+ */
+const BOUNDARY_SKIP_REASONS = [
+  "ambiguous",
+  "shortNeighbor",
+  "punctuated",
+  "backchannel",
+  "differentFinal",
+  "boundary",
+  "unknown",
+  "noSeq",
+];
+const emptyBoundarySkipped = () => zeroCounts(BOUNDARY_SKIP_REASONS);
+
+/**
+ * 断片の長さか。**空文字は断片ではない**(寄せる文字が無い。`split.ts` は空を送らないので
+ * 復元データだけの経路だが、`chars: 0` の適用が診断に載ると読めない)。
+ */
+const isFragmentLength = (line) => {
+  const n = textLength(line);
+  return n > 0 && n <= BOUNDARY_FRAGMENT_CHAR_LIMIT;
+};
+
+/** `classifyNeighbor()` の戻り値: 同じ final の同じ話者の本体に接している(断片はその一部) */
+const ANCHOR = Object.freeze({ anchor: true });
+
+/**
+ * 断片 `line` から見た隣 `n` を 1 つ分類する。**隣に対する判定はここ 1 か所**で、
+ * `boundaryFragmentTarget()` は分類の組み合わせから結論を出すだけにする。
+ *
+ * - `null` … 境界ではない(端 / 同じ speaker の隣)。判定に参加しない
+ * - `ANCHOR` … 同じ final の同じ speaker の長い行。断片はその本体の一部で、寄せる対象外
+ * - `{ reason }` … 境界だが寄せ先にならない(理由は `BOUNDARY_SKIP_REASONS` のキー)
+ * - `{ to }` … 寄せ先の候補(同じ final の別 speaker の長い行)
+ *
+ * 判定順は **構造(seq・隣)を先に、内容(句読点・語彙)は呼び出し側で後に**。逆にすると
+ * 「別 final の『はい』」が `backchannel` に数えられ、語彙リストを調整するための件数が
+ * 構造上どのみち寄らないケースで水増しされる。内容ゲートの件数は「それが無ければ寄っていた」数だけ。
+ */
+function classifyNeighbor(line, n) {
+  if (n == null) return null;
+  if (isReconnect(n)) return { reason: "boundary" };
+  // `seq` の無い行(#36 以前に保存されたセッション)は「同じ final」を確かめられないので、
+  // 何とも同じ final にならない。時間窓へは落とさない — ⓪は挟まれていない分、①より弱い
+  // 証拠で動くため、緩い判定に落とすと本物の相槌を寄せる側へ倒れる
+  const sameFinal = typeof line.seq === "number" && n.seq === line.seq;
+  if (n.speaker === line.speaker) return sameFinal && !isFragmentLength(n) ? ANCHOR : null;
+  if (!sameFinal) return { reason: "differentFinal" };
+  if (!hasSpeaker(n)) return { reason: "unknown" };
+  if (isFragmentLength(n)) return { reason: "shortNeighbor" };
+  return { to: n.speaker };
+}
+
+/**
+ * `line` が「同じ final の中で語の途中に入った境界の断片」なら寄せ先の speaker を返す。
+ *
+ * 戻り値は 3 種類。
+ * - `{ to, chars }` … 寄せる(`to` は隣の長い行の speaker、`chars` は断片の文字数)
+ * - `{ reason }` … 断片ではあるが見送る(理由は `BOUNDARY_SKIP_REASONS` のキー)
+ * - `null` … そもそも判定の対象外(長い行 / 空 / 再接続の印 / 境界に立っていない /
+ *   同じ final の同じ話者の本体に接している)
+ *
+ * **長い行は「見送り」に数えない。** 数えると全行の大半が見送りになり、閾値を決めるための
+ * 内訳が読めなくなる。内訳に出るのは「断片の長さなのに寄せなかった行」だけ。
+ *
+ * **同じ final の同じ speaker の長い行に既に接していれば対象外(`ANCHOR`)。** `A長 | A短 | B長`
+ * (同じ seq)の `A短` は、反対側に別話者の長い行があっても A の本体の一部と見るのが自然で、
+ * それを B へ引き剥がす向きに動いてはいけない。raw からこの形が出るのは `split.ts` の
+ * 空セグメント除去や復元データに限られるが、ロジックの向きとして固定しておく。
+ *
+ * **両隣が同じ final の長い行で speaker が異なる**(`A長 | X短 | B長`)ならどちらへ寄せる根拠も
+ * 無いので `ambiguous`。`A長 | X短 | A長` は両方とも A なので寄せる(①jitter と同じ結果になり
+ * 矛盾しない)。
+ */
+function boundaryFragmentTarget(prev, line, next) {
+  if (isReconnect(line) || !isFragmentLength(line)) return null;
+  const sides = [prev, next].map((n) => classifyNeighbor(line, n)).filter((v) => v != null);
+  if (sides.length === 0 || sides.includes(ANCHOR)) return null;
+  if (typeof line.seq !== "number") return { reason: "noSeq" };
+  // 断片自身の speaker が不明なら寄せない。①は不明行を prev で上書きするが、あちらは
+  // 前後が同じ確定話者に挟まれている分だけ証拠が強い。こちらは「誰から」が無いまま
+  // 隣へ寄せることになるので、`from` を持たない適用は作らない
+  if (!hasSpeaker(line)) return { reason: "unknown" };
+  const targets = sides.filter((v) => "to" in v).map((v) => v.to);
+  if (targets.length === 0) return { reason: sides[0].reason };
+  if (targets.length === 2 && targets[0] !== targets[1]) return { reason: "ambiguous" };
+  const text = String(line.text);
+  if (BOUNDARY_PUNCTUATION.includes(text.at(-1))) return { reason: "punctuated" };
+  if (BACKCHANNEL_WORDS.includes(text)) return { reason: "backchannel" };
+  return { to: targets[0], chars: text.length };
+}
+
+/**
+ * 同じ final の中で語の途中に入った speaker 境界を平滑化した**コピー**と、その計画を返す。
+ * 引数の配列も要素も変更しない。**何も削除しない。** 直すのは `speaker` だけ。
+ *
+ * コピーは copy-on-write — 配列だけ複製し、寄せた行だけを新しいオブジェクトに差し替える。
+ * ⓪が書き換えるのは「3 文字以下で境界に立つ断片」だけで全行のごく一部なのに、
+ * `renderTranscript()`(final のたび)と `renderDiagnostics()`(毎秒)から呼ばれるパイプラインに
+ * 全行コピーをもう 1 段足す理由が無い(①が直後にどのみち全行コピーする)。
+ *
+ * 走査は左から 1 パスで、**補正済みの結果を次の判定に使う**(①と同じ規律)。
+ * 2 パス目は持たない — `A:テ | A:キ | B:スト…` のように断片が連なる形は、`キ` が B に
+ * 寄ったあと `テ` の隣が短い `キ` になるので寄らない。複数の断片の連鎖は証拠が弱く、
+ * 寄せるほど誤統合の面積が増えるため、診断に `shortNeighbor` として残すに留める。
+ * その `テ` を数えるため、寄せた直後に**直前の 1 行だけ**判定し直す(隣が変わったのは
+ * その行だけで、変わった隣は断片の長さなので判定し直しても寄ることはない)。直前の行が
+ * 既に数えられていれば(寄せた・見送った)判定し直さない — 二重計上しないのはこの 1 行だけ
+ * なので、状態は「直前の 1 行が判定済みか」の 1 ビットで足りる。
+ *
+ * @typedef {Record<string, number>} BoundarySkipped キーは `BOUNDARY_SKIP_REASONS`
+ * @typedef {{
+ *   applied: Array<{index:number, from:number, to:number, chars:number}>,
+ *   skipped: BoundarySkipped,
+ * }} BoundaryPlan
+ * @returns {{ lines: Array<Record<string, any>>, plan: BoundaryPlan }}
+ */
+export function smoothSpeakerBoundaries(lines) {
+  const out = lines.slice();
+  const applied = [];
+  const skipped = emptyBoundarySkipped();
+  const record = (i) => {
+    const verdict = boundaryFragmentTarget(out[i - 1], out[i], out[i + 1]);
+    if (!verdict) return null;
+    if ("to" in verdict) {
+      applied.push({ index: i, from: out[i].speaker, to: verdict.to, chars: verdict.chars });
+      out[i] = { ...out[i], speaker: verdict.to };
+    } else {
+      skipped[verdict.reason] += 1;
+    }
+    return verdict;
+  };
+  let prevDecided = false;
+  for (let i = 0; i < out.length; i++) {
+    const verdict = record(i);
+    if (verdict && "to" in verdict && i > 0 && !prevDecided) record(i - 1);
+    prevDecided = verdict != null;
+  }
+  return { lines: out, plan: { applied, skipped } };
+}
+
 // ---- 第2段: 想定話者数つきの minor speaker island 補正(#48) ----
 //
 // 実機で観測された形(2人の会話なのに4 speaker 検出、`0:78.7% / 1:1.3% / 2:19.5% / 3:0.5%`)では、
@@ -186,7 +405,7 @@ export function smoothSpeakerJitter(lines) {
 // 補正するのは speaker ラベルだけで、テキストも行数も変えない(#36 と同じ規律)。
 
 /** 補正を見送った理由の内訳。**0 でも必ず全キーを出す**(件数を比べられるようにするため) */
-const emptySkipped = () => ({ mismatch: 0, tooLong: 0, edge: 0, boundary: 0, unknown: 0 });
+const emptySkipped = () => zeroCounts(["mismatch", "tooLong", "edge", "boundary", "unknown"]);
 
 /** ゲートで弾かれたときの空の計画。`disabledBy` に理由を入れる */
 function disabledPlan(reason) {
@@ -539,15 +758,48 @@ function applyNeutralize(lines, plan) {
  *
  * ③(#50)で `unresolved` が立った行は、**通常の発話とは絶対に結合しない**。
  * 中立行どうしは「同じ raw speaker が続いたときだけ」まとまる(下のコメント参照)。
+ *
+ * グループは `texts`(行ごと。ハイライトも診断の④(#52)もこれを数える)と **`runs`**(#55)を持つ。
+ * `runs` は同じ final 由来の行を区切りなしで連結した文字列の列で、画面(`renderLine()`)と
+ * Markdown(`join(" ")`)は run の間にだけ半角スペースを置く。従来は行ごとにスペースを置いていた
+ * ので、⓪①が同じ段落へ入れた「1 つの final の 1 文が割れたもの」が `テキ ストを確認します` の
+ * ように**日本語の語の途中にスペースを挟んで**いた(speaker を揃えるだけでは表示が自然に
+ * ならない理由)。**連結子の規則をグループを作る場所で決める**のは、画面と Markdown の
+ * 2 箇所に書くと片方だけ直したときに割れるため。副次効果として、同じ final 由来の断片が
+ * またがる語(「テキスト」)にもハイライトが当たる。
  */
 export function mergeSameSpeaker(lines) {
   const groups = [];
+  // 発話グループの末尾(再接続の印を挟んだら null)と、そこに最後に足した行の `seq`
+  let last = null;
+  let lastSeq;
+  // **`texts` と `runs` へ書くのはここだけ。** `runs` は「同じ final 由来の行は区切りなし、
+  // 別の final は別 run」(#55)。判定は隣どうしの `seq` が**両方とも数値で一致する**ときだけで、
+  // `seq` の無い旧セッションの行は `undefined === undefined` で繋がず、従来どおり別 run(スペース連結)。
+  // 復元データは検証を通っていないので `text` が欠けうる。従来の `escMd(undefined)` は空に
+  // 落ちていたが、run の連結で `"a" + undefined` にすると "aundefined" が本文に出る
+  const append = (line) => {
+    last.texts.push(line.text);
+    const text = String(line.text ?? "");
+    if (last.runs.length > 0 && typeof line.seq === "number" && line.seq === lastSeq) {
+      last.runs[last.runs.length - 1] += text;
+    } else {
+      last.runs.push(text);
+    }
+    lastSeq = line.seq;
+  };
+  const start = (line, extra) => {
+    last = { speaker: line.speaker, ...extra, t: line.t, texts: [], runs: [] };
+    lastSeq = undefined;
+    groups.push(last);
+    append(line);
+  };
   for (const line of lines) {
     if (isReconnect(line)) {
       groups.push({ type: "reconnect", t: line.t });
+      last = null;
       continue;
     }
-    const last = groups[groups.length - 1];
     // **中立化した行は通常の発話と絶対に結合しない**(#50)。帰属不明であることを保つ。
     //
     // ただし**同じ raw speaker の中立行が続くときは1段落にまとめる**。run は
@@ -560,15 +812,14 @@ export function mergeSameSpeaker(lines) {
     // ここで崩さない。**`speaker` を残したまま印だけで判定するのが要点** —
     // `null` に潰すと `null === null` が成立し、この2つを区別できなくなる。
     if (line.unresolved) {
-      if (last?.unresolved && last.speaker === line.speaker) last.texts.push(line.text);
-      else groups.push({ speaker: line.speaker, unresolved: true, t: line.t, texts: [line.text] });
+      if (last?.unresolved && last.speaker === line.speaker) append(line);
+      else start(line, { unresolved: true });
       continue;
     }
     // 直前が中立化グループなら、speaker 番号が同じでも結合しない(上と同じ理由の裏返し。
     // 中立化した X の直後に通常の X が来たとき、後者まで中立チップの段落へ吸われてしまう)
-    if (last && last.type !== "reconnect" && !last.unresolved && last.speaker === line.speaker)
-      last.texts.push(line.text);
-    else groups.push({ speaker: line.speaker, t: line.t, texts: [line.text] });
+    if (last && !last.unresolved && last.speaker === line.speaker) append(line);
+    else start(line, {});
   }
   return groups;
 }
@@ -576,8 +827,8 @@ export function mergeSameSpeaker(lines) {
 /**
  * 表示・エクスポート用に speaker ラベルを補正した**コピー**を返す(グループ化の手前まで)。
  *
- * **①jitter → ②minor island → ③中立化 の順序が要点で、この順序を関数の中に閉じてある**
- * (呼び出し側の規律にしない)。①と②を逆にすると吸収できる island が減る:
+ * **⓪boundary → ①jitter → ②minor island → ③中立化 の順序が要点で、この順序を関数の中に
+ * 閉じてある**(呼び出し側の規律にしない)。①と②を逆にすると吸収できる island が減る:
  *
  * ```
  * A → [jitter B] → minorX → A
@@ -599,9 +850,12 @@ export function mergeSameSpeaker(lines) {
  * @param opts.expectedSpeakers 想定話者数の選択値(#48)。渡さなければ②は何もしない
  */
 function correctSpeakers(lines, opts) {
-  // **走査する配列は①通過後、統計は raw。** この2つの出どころは別物で、混同すると
+  // ⓪(#55)は「同じ final」という最も強い証拠だけで動くので先頭。①以降は⓪通過後の行を見る。
+  // ⓪は行数も並びも変えないので、②③が①通過後の配列に対して立てる添字はそのまま合う
+  const boundary = smoothSpeakerBoundaries(lines);
+  // **走査する配列は⓪①通過後、統計は raw。** この2つの出どころは別物で、混同すると
   // 表示と診断がずれる(下の `planDisplayCorrection()` のコメントを参照)
-  const jittered = smoothSpeakerJitter(lines);
+  const jittered = smoothSpeakerJitter(boundary.lines);
   const plan = planMinorIslandMerges(jittered, {
     expectedSpeakers: opts.expectedSpeakers,
     stats: collectSpeakerStats(lines), // ← raw から(#46)
@@ -609,13 +863,18 @@ function correctSpeakers(lines, opts) {
   // ③は②の計画から作る。**添字は①通過後の配列に対するもの**で、②の適用は行数も並びも
   // 変えない(`speaker` を書き換えるだけ)ので、そのまま合成後の配列にも当たる
   const unresolvedPlan = planUnresolvedMinors(plan);
-  return { plan, unresolvedPlan, corrected: applyNeutralize(applyMerges(jittered, plan), unresolvedPlan) };
+  return {
+    boundaryPlan: boundary.plan,
+    plan,
+    unresolvedPlan,
+    corrected: applyNeutralize(applyMerges(jittered, plan), unresolvedPlan),
+  };
 }
 
 /**
- * 表示・エクスポート用の発話グループを作る。**この4段の順序が要点**で、
+ * 表示・エクスポート用の発話グループを作る。**この5段の順序が要点**で、
  * 先に speaker ラベルを直してからでないと同一話者としてまとまらない
- * (①jitter → ②minor island → ③中立化 → ④同一話者の結合)。
+ * (⓪boundary → ①jitter → ②minor island → ③中立化 → ④同一話者の結合)。
  *
  * @param lines raw の `finalLines`（変更しない）
  * @param opts.expectedSpeakers 想定話者数の選択値(#48)
@@ -645,6 +904,7 @@ export function groupUtterances(lines, opts = {}) {
  * @param lines raw の `finalLines`（変更しない）
  * @param opts.expectedSpeakers 想定話者数の選択値。`groupUtterances()` と同じ引数を渡すこと
  * @returns {{
+ *   boundaryPlan: BoundaryPlan,
  *   plan: object,
  *   unresolvedPlan: {
  *     neutralized: Array<{speaker:number, segments:number, words:number, indexes:number[]}>,
@@ -655,7 +915,7 @@ export function groupUtterances(lines, opts = {}) {
  * }}
  */
 export function planDisplayCorrection(lines, opts = {}) {
-  const { plan, unresolvedPlan, corrected } = correctSpeakers(lines, opts);
+  const { boundaryPlan, plan, unresolvedPlan, corrected } = correctSpeakers(lines, opts);
   // **`displayDetected` は「表示上の通常話者数」**(#50)。中立化した speaker は
   // 画面にもエクスポートにも「話者C」としては出ないので、数に入れると
   // 「話者Cは表示されないのに表示上の話者数は3」という読めない値になる。
@@ -669,5 +929,5 @@ export function planDisplayCorrection(lines, opts = {}) {
   const forCount = corrected.map((l) => (l.unresolved ? { ...l, speaker: null } : l));
   // 補正後に speaker が何人へ減ったか。**計画の merges から引き算しない** —
   // 適用と数え方が別実装になり、片方だけ直したときに静かにずれる
-  return { plan, unresolvedPlan, displayDetected: collectSpeakerStats(forCount).detected };
+  return { boundaryPlan, plan, unresolvedPlan, displayDetected: collectSpeakerStats(forCount).detected };
 }

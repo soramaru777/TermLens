@@ -191,7 +191,9 @@ const ISLAND_WIRING = [
   "const speakerStats = collectSpeakerStats(finalLines);",
   // **③の計画（#50）も同じ1回の計算から受け取る。** 診断が別途 `planUnresolvedMinors()` を
   // 呼び直すと、中立化の件数が表示に効いたものとずれる（②の計画と同じ理由）
-  "const { plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {",
+  // **⓪の計画（#55）も同じ1回の計算から。** 別途 `smoothSpeakerBoundaries()` を呼び直すと
+  // 境界補正の件数が表示に効いたものとずれる（②③と同じ理由）
+  "const { boundaryPlan, plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {",
 ];
 
 test("診断の2箇所は表示補正の計画を同じ形で作る", () => {
@@ -1027,4 +1029,37 @@ test("speaker が付かない行の表示は #50 で変えない", () => {
     /if \(group\.unresolved\)[\s\S]*\} else if \(speaker != null\) \{/,
     "中立チップの分岐が speaker == null の経路を飲み込んでいる",
   );
+});
+
+// ---- 段落内の連結子（#55） ----
+
+/**
+ * **画面と Markdown は同じグループの `runs` を描く。**
+ *
+ * 同じ final 由来の行は区切りなし、別 final は半角スペース。連結子の規則は
+ * `mergeSameSpeaker()` がグループを作るときに決めるので、消費側は `runs` を描くだけでよい。
+ * 片方が `texts` を直接 `join(" ")` すると、画面では「テキストを確認します」なのに
+ * Markdown では「テキ ストを確認します」になる（例外は出ない）。純関数側のテストでは守れない配線。
+ */
+test("画面と Markdown はグループの runs で段落内を連結する", () => {
+  const render = CODE.slice(CODE.indexOf("function renderTranscript"), CODE.indexOf("function el("));
+  assert.ok(render.includes("for (const run of group.runs) div.append(renderLine(run));"), "画面が run 単位で描いていない");
+  const md = fnBody("buildTranscriptMarkdown");
+  assert.ok(md.includes('group.runs.map(escMd).join(" ")'), "Markdown が run 単位で連結していない");
+  // `texts` を直接連結する経路が残っていないこと
+  assert.doesNotMatch(CODE, /texts\.map\(escMd\)/, "Markdown が texts を直接連結している");
+  assert.doesNotMatch(CODE, /for \(const text of texts\)/, "画面が texts を直接描いている");
+});
+
+/**
+ * **⓪の計画（#55）も、画面パネルと Markdown が同じ1回の計算から受け取る。**
+ * 片方だけ渡し忘れると、画面には境界補正の行が出るのに Markdown には出ない（例外は出ない）。
+ */
+test("診断の2箇所は境界補正の計画を同じ形で受け渡す", () => {
+  for (const name of ["renderDiagnostics", "buildDiagnosticsMd"]) {
+    // 受け取り方（`planDisplayCorrection()` の分割代入）は上の「診断の2箇所は表示補正の計画を
+    // 同じ形で作る」が固定している。ここは受け取った計画をそのまま渡していることだけ見る
+    const body = fnBody(name);
+    assert.match(body, /\n\s+boundaryPlan,\n\s+islandPlan,\n/, `${name} が boundaryPlan を診断に渡していない`);
+  }
 });
