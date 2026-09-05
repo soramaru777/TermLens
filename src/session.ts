@@ -29,6 +29,8 @@ function createSttAdapter(): SttAdapter {
  */
 export class Session {
   private stt: SttAdapter | null = null;
+  /** stop 待機中に新しい STT が始まったかを見分けるための世代番号。 */
+  private sttGeneration = 0;
   private scheduler: ExtractionScheduler | null = null;
   private builder: UtteranceBuilder | null = null;
   private closed = false;
@@ -137,11 +139,12 @@ export class Session {
     this.builder = builder;
 
     const stt = createSttAdapter();
+    const generation = ++this.sttGeneration;
     this.stt = stt;
     // stop -> start が短時間に続くと、停止済みアダプタの start() 完了や
     // キュー済みイベントが新しいセッション開始後に届くことがある。
-    // フィールド上の現行アダプタと一致する間だけクライアントへ中継する。
-    const isCurrent = () => this.stt === stt;
+    // フィールド上の現行アダプタと世代が一致する間だけクライアントへ中継する。
+    const isCurrent = () => this.stt === stt && this.sttGeneration === generation;
     stt.onTranscript((e) => {
       if (!isCurrent()) return;
       this.send({
@@ -242,12 +245,20 @@ export class Session {
 
   private async stopSession(): Promise<void> {
     const stt = this.stt;
+    const generation = this.sttGeneration;
     const scheduler = this.scheduler;
     const builder = this.builder;
     this.stt = null;
     this.scheduler = null;
     this.builder = null;
-    if (stt) await stt.stop().catch(() => {});
+    if (stt) {
+      await stt.stop().catch(() => {});
+      // onClose は停止前に this.stt を外すため旧イベント扱いで抑止される。
+      // 代わりに、この stop の待機中に次世代 STT が始まっていない場合だけ正常終了を通知する。
+      if (this.stt === null && this.sttGeneration === generation) {
+        this.send({ type: "status", state: "stt_closed" });
+      }
+    }
     // builder → scheduler の順。逆にすると、未確定の発話がスケジューラに届く前に
     // バッファが処理されて最後の発話を取りこぼす
     builder?.flush();
