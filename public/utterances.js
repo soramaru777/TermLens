@@ -1,5 +1,6 @@
 // 発話グループの組み立て — 話者ラベルの揺れ(speaker jitter)の補正(#36)、
 // 想定話者数を超えて検出された少数 speaker の島の補正(#48)、
+// 統合先を決められなかった minor speaker の中立化(#50)、
 // そして連続する同一話者の結合。
 //
 // **app.js から切り出してあるのは、Node のテストから読めるようにするため**
@@ -30,6 +31,10 @@ import {
   expectedSpeakerCount,
   num,
 } from "./speaker-stats.js";
+// **`UNRESOLVED_SPEAKER_LABEL` はここでは import しない。** ③(#50)が立てるのは
+// 「この行を通常の話者として表示しない」という印(`unresolved`)だけで、表示名は付けない。
+// 文言を知るのは画面・Markdown・診断の側だけにしておくと、ラベルを変えても
+// このモジュールのテスト(段落の割れ方)が一切動かない。
 
 // ---- jitter 補正の閾値 ----
 //
@@ -185,7 +190,17 @@ const emptySkipped = () => ({ mismatch: 0, tooLong: 0, edge: 0, boundary: 0, unk
 
 /** ゲートで弾かれたときの空の計画。`disabledBy` に理由を入れる */
 function disabledPlan(reason) {
-  return { merges: [], skipped: emptySkipped(), majors: [], minors: [], others: [], disabledBy: reason };
+  return {
+    merges: [],
+    skipped: emptySkipped(),
+    // **空でも必ずキーを持たせる。** ③(#50)は `plan.skippedRuns` を走査するので、
+    // ゲートで弾かれた計画だけキーが無いと、そこだけ `undefined` の分岐が要る
+    skippedRuns: [],
+    majors: [],
+    minors: [],
+    others: [],
+    disabledBy: reason,
+  };
 }
 
 /**
@@ -201,6 +216,7 @@ function disabledPlan(reason) {
  * @returns {{
  *   merges: Array<{from:number, to:number, segments:number, words:number, indexes:number[]}>,
  *   skipped: {mismatch:number, tooLong:number, edge:number, boundary:number, unknown:number},
+ *   skippedRuns: Array<{reason:string, speaker:number, words:number, indexes:number[]}>,
  *   majors: number[], minors: number[], others: number[],
  *   disabledBy: "auto"|"atLeast"|"noStats"|"detectedNotOver"|"charsBasis"|"tooFewWords"|null,
  * }}
@@ -324,6 +340,23 @@ export function planMinorIslandMerges(lines, { expectedSpeakers, stats } = {}) {
   };
 
   const skipped = emptySkipped();
+  // **見送った run を「どの行だったか」まで残す(#50)。**
+  //
+  // ③(`planUnresolvedMinors()`)は「統合先を決められなかった run の行」を中立化するので、
+  // 件数だけでは足りず run の `indexes` が要る。**③の側で run を切り直させないため**に
+  // ここへ足してある — 切り直すと「同一 minor の連続を、別 speaker・話者不明・再接続で切る」
+  // という規則が2箇所に実装されることになり、片方だけ直したときに②の見送り件数と
+  // ③の中立化件数が静かに食い違う(どちらも診断の数字なので、気づく手掛かりが無い)。
+  //
+  // `skipped` の件数は据え置く(既存の呼び出し・テストとの互換)。両者は必ず
+  // 同じ `skip()` を通るので、件数と run 一覧がずれようがない形にしてある。
+  const skippedRuns = [];
+  const skip = (reason, run) => {
+    skipped[reason]++;
+    // `indexes` は複製して渡す。計画は純粋な**値**として扱うので、内部で組み立てた
+    // 配列を外へそのまま出さない(run はこの関数のローカルだが、共有しない形に揃えておく)
+    skippedRuns.push({ reason, speaker: run.speaker, words: run.words, indexes: [...run.indexes] });
+  };
   const merged = new Map();
   // **1つの run は1つの理由にしか計上しない。** 優先順位は
   // boundary → unknown → edge → mismatch → tooLong で、上にあるものほど
@@ -333,26 +366,26 @@ export function planMinorIslandMerges(lines, { expectedSpeakers, stats } = {}) {
     const prev = neighbor(run.start - 1, -1);
     const next = neighbor(run.end + 1, 1);
     if (prev?.boundary || next?.boundary) {
-      skipped.boundary++;
+      skip("boundary", run);
       continue;
     }
     if (prev?.unknown || next?.unknown) {
-      skipped.unknown++;
+      skip("unknown", run);
       continue;
     }
     if (!prev || !next) {
-      skipped.edge++;
+      skip("edge", run);
       continue;
     }
     // 前後が同じ主要 speaker でなければ島ではない。**統合先は必ず主要 speaker**
     // (minor へ寄せても speaker の数は減らず、誤りを別の誤りに置き換えるだけ)
     if (prev.speaker !== next.speaker || !majorSet.has(prev.speaker)) {
-      skipped.mismatch++;
+      skip("mismatch", run);
       continue;
     }
     // 長い区間は「誤割り当てされた本物の発話」でありうるので吸収しない
     if (run.words > MINOR_ISLAND_MAX_WORDS) {
-      skipped.tooLong++;
+      skip("tooLong", run);
       continue;
     }
     const key = `${run.speaker}>${prev.speaker}`;
@@ -371,7 +404,9 @@ export function planMinorIslandMerges(lines, { expectedSpeakers, stats } = {}) {
 
   // 並びを決めておく。決めないと同じデータから作った診断 Markdown が実行ごとに違う順序で出る
   const merges = [...merged.values()].sort((a, b) => a.from - b.from || a.to - b.to);
-  return { merges, skipped, majors, minors, others, disabledBy: null };
+  // `skippedRuns` は run の走査順(＝行の添字の昇順)のまま。走査が1パスなので決定的で、
+  // ③がここから作る `neutralized` の順序も入力だけで決まる
+  return { merges, skipped, skippedRuns, majors, minors, others, disabledBy: null };
 }
 
 /**
@@ -392,12 +427,118 @@ function applyMerges(lines, plan) {
   return out;
 }
 
+// ---- 第3段: 統合先を決められなかった minor speaker の中立化(#50) ----
+//
+// ②が見送った run のうち `mismatch`(前後の主要 speaker が違う ＝ `B → X → A`)は、
+// **表示上は minor X が「話者C」として残る**。2人の会話だと申告しているのに、実際には
+// 第三者が発言したように見える — これが #48 のあとに残った問題。
+//
+// 取る手は「A/B のどちらかへ推測で寄せる」ではなく、**通常の追加話者として表示しない**。
+// 前後が違う以上どちらへ寄せても根拠が無く、寄せた側の発言として本文が残るほうが、
+// 「誰の発言か決められなかった」と示すより誤解を生む。
+//
+// **`speaker` は書き換えない(`null` に潰さない)。** 潰すと2つ壊れる:
+// 1. `mergeSameSpeaker()` は `last.speaker === line.speaker` で結合するので、
+//    隣接した**異なる** minor が `null === null` で1段落に溶ける。`X → Y` という遷移
+//    そのものが観測された話者交代であり、②が run を切って守った不変条件をここで崩す
+// 2. 診断で追えなくなる。raw で speaker が付かなかった行(#46 の「話者不明のセグメント」)と
+//    「番号は付いたが統合先を決められなかった行」は別の事実で、後者だけが閾値の材料になる
+// 代わりに `unresolved: true` という印を立て、表示側がそれを見て中立チップにする。
+
+/** 中立化の対象にする見送り理由。**`mismatch` だけ**(#50 の確定事項) */
+const NEUTRALIZE_REASON = "mismatch";
+
+/**
+ * 中立化の計画。**何も変更しない純関数。** ②の計画を入力に取る。
+ *
+ * **ゲートは②と同一で、独自のゲートは足さない。** ②が無効なら中立化も無効
+ * (「想定話者数を超えて検出された」という前提そのものが無いところで、minor を
+ * 隠す根拠は無い)。ゲートを2組持つと「②は効いているのに③だけ無効」という
+ * 説明のつかない状態が作れてしまう。
+ *
+ * @param plan `planMinorIslandMerges()` の戻り
+ * @returns {{
+ *   neutralized: Array<{speaker:number, segments:number, words:number, indexes:number[]}>,
+ *   skippedRuns: Array<{reason:string, speaker:number, words:number, indexes:number[]}>,
+ *   disabledBy: string|null,
+ * }}
+ */
+export function planUnresolvedMinors(plan) {
+  // **計画は必須。** 渡されていないのを「有効・0件」と区別できないと、診断が
+  // 「中立化 0 seg」と言い切ってしまう(`minorIslandRows()` が `!islandPlan` を
+  // 節ごと出さない扱いにしているのと同じ理由)
+  if (!plan) return { neutralized: [], skippedRuns: [], disabledBy: "noPlan" };
+  const disabledBy = plan.disabledBy ?? null;
+  if (disabledBy) return { neutralized: [], skippedRuns: [], disabledBy };
+
+  const runs = Array.isArray(plan.skippedRuns) ? plan.skippedRuns : [];
+  // speaker ごとにまとめる。診断が `speaker 2 → 話者不明: 1 seg / 2 word` を出せる形
+  const grouped = new Map();
+  // 対象外にした run は**そのまま返す**。理由別の件数を診断が出せないと、
+  // `edge` / `unknown` を将来この段の対象に加えるべきかを判断する材料が無くなる
+  const skippedRuns = [];
+  for (const run of runs) {
+    if (run.reason !== NEUTRALIZE_REASON) {
+      skippedRuns.push(run);
+      continue;
+    }
+    // **長い run は中立化しない。** ②が `tooLong` で統合を見送るのと同じ理由 —
+    // 誤割り当てされた「本物の発話」でありうるので、隠すと発言者が消えたように見える。
+    //
+    // **ここで当て直さないと、この段だけ長さの安全弁が効かない。** ②の判定順は
+    // `mismatch → tooLong` なので、`B → X(長い) → A` は `mismatch` が先に立ち
+    // `tooLong` に到達しない。②の内訳では `mismatch` として出るため、そのまま
+    // 中立化すると**上限なしで**隠すことになる(Issue の「長い minor speaker は対象外」に反する)。
+    //
+    // 落とした run は `tooLong` に付け替えて返す。診断の「中立化の対象外」が
+    // ②の「表示補正の見送り」と違う数字になるのは、まさにこの差ぶんである
+    if (run.words > MINOR_ISLAND_MAX_WORDS) {
+      skippedRuns.push({ ...run, reason: "tooLong" });
+      continue;
+    }
+    const entry = grouped.get(run.speaker) ?? {
+      speaker: run.speaker,
+      segments: 0,
+      words: 0,
+      indexes: [],
+    };
+    entry.segments += run.indexes.length; // 行数
+    entry.words += run.words;
+    entry.indexes.push(...run.indexes);
+    grouped.set(run.speaker, entry);
+  }
+  // 並びを決めておく。決めないと同じデータから作った診断 Markdown が実行ごとに違う順序で出る
+  const neutralized = [...grouped.values()].sort((a, b) => a.speaker - b.speaker);
+  return { neutralized, skippedRuns, disabledBy: null };
+}
+
+/**
+ * 計画を適用した**コピー**を返す。引数の配列も要素も変更しない。**`speaker` は変えない。**
+ *
+ * 立てるのは `unresolved` の印だけ。テキストも行数も speaker 番号も入力のまま
+ * (#36 / #48 と同じ規律で、この段でも「何も削除しない」)。
+ */
+function applyNeutralize(lines, plan) {
+  // **復元データ由来の印は信じない。** `finalLines` は localStorage から**検証なしで**
+  // 復元される(`app.js` の `finalLines.push(...session.finalLines)`)ので、`unresolved` にも
+  // 任意の値が入りうる。素通りさせると、想定話者数が既定の `auto`(＝この段が無効)でも
+  // 画面には中立チップが出て、診断は「無効（想定話者数が自動）」と言う —
+  // **画面と診断が違う事実を語る**。印はこのパイプラインが立てたものだけを有効にする
+  // (`definedSpeaker()` / `num()` / `normalizeExpectedSpeakers()` と同じ、消費側で丸める規律)
+  const out = lines.map(({ unresolved, ...rest }) => rest);
+  for (const n of plan.neutralized) for (const i of n.indexes) out[i].unresolved = true;
+  return out;
+}
+
 /**
  * 連続する同一話者の発言を1つの段落にまとめる。
  *
  * `lines` には通常の発話行のほかに `{ type: "reconnect" }` という区切り印が混じる。
  * 区切りはそれ自身で1グループとし、直後の発話が直前の話者と同じでも絶対にまとめない
  * (再接続後は話者番号が振り直しなので、同じ番号でも別人の可能性がある)。
+ *
+ * ③(#50)で `unresolved` が立った行は、**通常の発話とは絶対に結合しない**。
+ * 中立行どうしは「同じ raw speaker が続いたときだけ」まとまる(下のコメント参照)。
  */
 export function mergeSameSpeaker(lines) {
   const groups = [];
@@ -407,7 +548,26 @@ export function mergeSameSpeaker(lines) {
       continue;
     }
     const last = groups[groups.length - 1];
-    if (last && last.type !== "reconnect" && last.speaker === line.speaker) last.texts.push(line.text);
+    // **中立化した行は通常の発話と絶対に結合しない**(#50)。帰属不明であることを保つ。
+    //
+    // ただし**同じ raw speaker の中立行が続くときは1段落にまとめる**。run は
+    // 「同一 minor の連続」を別 speaker・話者不明・再接続で切って作ってあるので、
+    // 隣接する中立行の speaker が同じなら**同じ run ＝ 1つの発話のかたまり**。ここで割ると
+    // #36 が正面から潰した「1発話が細切れに表示される」を、この段が作り直すことになる。
+    //
+    // 逆に `X → Y`(隣接した**異なる** minor)は speaker が違うので割れる。`X → Y` という
+    // 遷移そのものが観測された話者交代であり、②が run を切ってまで守った不変条件を
+    // ここで崩さない。**`speaker` を残したまま印だけで判定するのが要点** —
+    // `null` に潰すと `null === null` が成立し、この2つを区別できなくなる。
+    if (line.unresolved) {
+      if (last?.unresolved && last.speaker === line.speaker) last.texts.push(line.text);
+      else groups.push({ speaker: line.speaker, unresolved: true, t: line.t, texts: [line.text] });
+      continue;
+    }
+    // 直前が中立化グループなら、speaker 番号が同じでも結合しない(上と同じ理由の裏返し。
+    // 中立化した X の直後に通常の X が来たとき、後者まで中立チップの段落へ吸われてしまう)
+    if (last && last.type !== "reconnect" && !last.unresolved && last.speaker === line.speaker)
+      last.texts.push(line.text);
     else groups.push({ speaker: line.speaker, t: line.t, texts: [line.text] });
   }
   return groups;
@@ -416,8 +576,8 @@ export function mergeSameSpeaker(lines) {
 /**
  * 表示・エクスポート用に speaker ラベルを補正した**コピー**を返す(グループ化の手前まで)。
  *
- * **①jitter → ②minor island の順序が要点で、この順序を関数の中に閉じてある**
- * (呼び出し側の規律にしない)。逆にすると吸収できる island が減る:
+ * **①jitter → ②minor island → ③中立化 の順序が要点で、この順序を関数の中に閉じてある**
+ * (呼び出し側の規律にしない)。①と②を逆にすると吸収できる island が減る:
  *
  * ```
  * A → [jitter B] → minorX → A
@@ -426,6 +586,9 @@ export function mergeSameSpeaker(lines) {
  * ```
  *
  * どちらの段も自分の条件は緩めないまま、**後段が見える範囲だけが広がる**。
+ *
+ * ③は②の計画から作るので、②のあとでなければ成立しない(②が「統合先を決められなかった」と
+ * 判定した run が入力そのもの)。
  *
  * **主要 speaker の選定は raw の統計から取る。** `tests/app-wiring.test.ts` が
  * 「`collectSpeakerStats` は `finalLines` に対して呼ぶ」を固定しており(#46)、
@@ -443,12 +606,16 @@ function correctSpeakers(lines, opts) {
     expectedSpeakers: opts.expectedSpeakers,
     stats: collectSpeakerStats(lines), // ← raw から(#46)
   });
-  return { plan, corrected: applyMerges(jittered, plan) };
+  // ③は②の計画から作る。**添字は①通過後の配列に対するもの**で、②の適用は行数も並びも
+  // 変えない(`speaker` を書き換えるだけ)ので、そのまま合成後の配列にも当たる
+  const unresolvedPlan = planUnresolvedMinors(plan);
+  return { plan, unresolvedPlan, corrected: applyNeutralize(applyMerges(jittered, plan), unresolvedPlan) };
 }
 
 /**
- * 表示・エクスポート用の発話グループを作る。**この3段の順序が要点**で、
- * 先に speaker ラベルを直してからでないと同一話者としてまとまらない。
+ * 表示・エクスポート用の発話グループを作る。**この4段の順序が要点**で、
+ * 先に speaker ラベルを直してからでないと同一話者としてまとまらない
+ * (①jitter → ②minor island → ③中立化 → ④同一話者の結合)。
  *
  * @param lines raw の `finalLines`（変更しない）
  * @param opts.expectedSpeakers 想定話者数の選択値(#48)
@@ -477,11 +644,30 @@ export function groupUtterances(lines, opts = {}) {
  *
  * @param lines raw の `finalLines`（変更しない）
  * @param opts.expectedSpeakers 想定話者数の選択値。`groupUtterances()` と同じ引数を渡すこと
- * @returns {{ plan: object, displayDetected: number }}
+ * @returns {{
+ *   plan: object,
+ *   unresolvedPlan: {
+ *     neutralized: Array<{speaker:number, segments:number, words:number, indexes:number[]}>,
+ *     skippedRuns: Array<{reason:string, speaker:number, words:number, indexes:number[]}>,
+ *     disabledBy: string|null,
+ *   },
+ *   displayDetected: number,
+ * }}
  */
 export function planDisplayCorrection(lines, opts = {}) {
-  const { plan, corrected } = correctSpeakers(lines, opts);
+  const { plan, unresolvedPlan, corrected } = correctSpeakers(lines, opts);
+  // **`displayDetected` は「表示上の通常話者数」**(#50)。中立化した speaker は
+  // 画面にもエクスポートにも「話者C」としては出ないので、数に入れると
+  // 「話者Cは表示されないのに表示上の話者数は3」という読めない値になる。
+  //
+  // **`collectSpeakerStats()` には手を入れない**(#46 の raw 統計の定義箇所。
+  // あちらに「表示の都合」を持ち込むと、補正の効き具合を測るための統計が汚れる)。
+  // 数えるためだけのローカルなコピーで `unresolved` を speaker 不明へ落とす。
+  // **このコピーは表示には使わない** — 表示側は raw speaker を保持したままの
+  // `corrected` を見る(`groupUtterances()` 経由)。潰した配列を表示に回すと、
+  // `mergeSameSpeaker()` で隣接した異なる minor が `null === null` で1段落に溶ける
+  const forCount = corrected.map((l) => (l.unresolved ? { ...l, speaker: null } : l));
   // 補正後に speaker が何人へ減ったか。**計画の merges から引き算しない** —
   // 適用と数え方が別実装になり、片方だけ直したときに静かにずれる
-  return { plan, displayDetected: collectSpeakerStats(corrected).detected };
+  return { plan, unresolvedPlan, displayDetected: collectSpeakerStats(forCount).detected };
 }

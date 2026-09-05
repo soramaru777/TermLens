@@ -261,6 +261,10 @@ button.primary:disabled { opacity: 0.5; }
 .sp-3 { background: #8a4f9e; }
 .sp-4 { background: #2f7fb0; }
 .sp-5 { background: #a5405e; }
+/* 統合先を決められなかった minor speaker(#50)。**話者色とは別の中立色**にする。
+   sp-0〜sp-5 のどれかを流用すると「その番号の話者」に見え、隠したはずの追加話者が
+   別人として復活する。彩度の無いグレーで「誰か決められなかった」ことを示す */
+.speaker-chip-unresolved { background: #6b7280; }
 #transcript .hl {
   color: #e07000;
   font-weight: 700;

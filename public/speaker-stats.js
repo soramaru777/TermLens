@@ -81,6 +81,18 @@ export function expectedSpeakerLabel(value) {
   return findOption(normalizeExpectedSpeakers(value)).label;
 }
 
+/**
+ * 統合先を決められなかった minor speaker の表示名(#50)。画面・Markdown・診断が同じ文言を使う。
+ *
+ * **ここに置くのは `app.js`(画面・Markdown)と `diagnostics.js`(診断)の両方が既にこのファイルを
+ * import しているため**(`expectedSpeakerLabel()` と同じ形)。表示名を `utterances.js` に置くと
+ * 診断が補正ロジックのモジュールから文言だけを引くことになり、依存が1本増える。
+ *
+ * **`speakerLabel()` が作る「話者A/B/…」とは意味が違う。** あちらは speaker 番号の表示名で、
+ * こちらは「番号は分かっているが、それを通常の追加話者として見せない」という判断の表示名。
+ */
+export const UNRESOLVED_SPEAKER_LABEL = "話者不明";
+
 /** 比較に使う人数。`auto` は null(＝人数を申告していない) */
 export function expectedSpeakerCount(value) {
   return findOption(normalizeExpectedSpeakers(value)).count;

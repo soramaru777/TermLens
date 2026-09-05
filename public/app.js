@@ -29,8 +29,8 @@ import {
   captureModeLabel,
   normalizeCaptureMode,
 } from "./capture-mode.js";
-// 発話グループの組み立て(話者 jitter の補正 + minor island の補正 + 同一話者の結合)は
-// utterances.js が唯一の定義箇所(#36 / #48)。ここでまとめ直すと、画面と Markdown
+// 発話グループの組み立て(話者 jitter の補正 + minor island の補正 + 中立化 + 同一話者の結合)は
+// utterances.js が唯一の定義箇所(#36 / #48 / #50)。ここでまとめ直すと、画面と Markdown
 // エクスポートで補正結果が食い違う。
 // **groupUtterances() の2箇所には必ず同じ引数を渡すこと** — 片方だけ想定話者数を
 // 渡すと画面と Markdown で話者ラベルが割れ、しかも例外は出ない。
@@ -38,8 +38,10 @@ import { groupUtterances, planDisplayCorrection } from "./utterances.js";
 // 話者統計の集計・想定話者数の選択肢は speaker-stats.js が唯一の定義箇所(#46)。
 // **集計は raw の finalLines に対して行う**(groupUtterances() の結果ではない) —
 // 表示補正の効き具合を測るための統計が、補正後の値になってしまうため。
+// 中立ラベル(#50)もここが定義箇所。画面・Markdown・診断が同じ文言を使う
 import {
   EXPECTED_SPEAKER_OPTIONS,
+  UNRESOLVED_SPEAKER_LABEL,
   collectSpeakerStats,
   normalizeExpectedSpeakers,
 } from "./speaker-stats.js";
@@ -901,7 +903,14 @@ function renderTranscript() {
     }
     const { speaker, texts } = group;
     const div = el("div", "utterance");
-    if (speaker != null) {
+    // **中立化した行は話者色を付けない**(#50)。統合先を決められなかった minor speaker を
+    // 「話者C」として見せないための表示なので、通常の話者チップと同じ見た目にすると
+    // 「3人目がいる」という誤解が色付きのまま残る。
+    // **`speaker == null`(raw で speaker が付かなかった行)の経路は変えない** —
+    // あちらは従来どおりチップ無しで、こちらは中立チップ。原因が別なので見え方も分ける
+    if (group.unresolved) {
+      div.append(el("span", "speaker-chip speaker-chip-unresolved", UNRESOLVED_SPEAKER_LABEL));
+    } else if (speaker != null) {
       div.append(el("span", `speaker-chip sp-${speaker % 6}`, speakerLabel(speaker)));
     }
     for (const text of texts) div.append(renderLine(text));
@@ -1265,7 +1274,13 @@ function buildTranscriptMarkdown() {
       continue;
     }
     const { speaker, t, texts } = group;
-    const label = speaker != null ? speakerLabel(speaker) : "発言";
+    // 画面と同じ判断を同じ順で行う(#50)。**`speaker == null` の `発言` は据え置き** —
+    // raw で speaker が付かなかった行と、中立化した行は別の事実
+    const label = group.unresolved
+      ? UNRESOLVED_SPEAKER_LABEL
+      : speaker != null
+        ? speakerLabel(speaker)
+        : "発言";
     out.push(`**${label}** \`${fmtElapsed(t - started.getTime())}\``, "", texts.map(escMd).join(" "), "");
   }
   return out.join("\n");
@@ -1290,7 +1305,7 @@ function renderDiagnostics() {
   // (詳細は utterances.js の planDisplayCorrection() のコメント)。
   // ここと buildDiagnosticsMd() は同じ形にすること
   const speakerStats = collectSpeakerStats(finalLines);
-  const { plan: islandPlan, displayDetected } = planDisplayCorrection(finalLines, {
+  const { plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
     expectedSpeakers: getExpectedSpeakers(),
   });
   const rows = [
@@ -1312,6 +1327,7 @@ function renderDiagnostics() {
       expectedSpeakers: getExpectedSpeakers(),
       sttInfo,
       islandPlan,
+      unresolvedPlan,
       displayDetected,
     }),
   ];
@@ -1337,7 +1353,7 @@ function buildDiagnosticsMd() {
   // (詳細は utterances.js の planDisplayCorrection() のコメント)。
   // ここと renderDiagnostics() は同じ形にすること
   const speakerStats = collectSpeakerStats(finalLines);
-  const { plan: islandPlan, displayDetected } = planDisplayCorrection(finalLines, {
+  const { plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
     expectedSpeakers: getExpectedSpeakers(),
   });
   // 整形は diagnostics.js の純関数に任せる(テストから読めるようにするため)。
@@ -1359,6 +1375,7 @@ function buildDiagnosticsMd() {
     expectedSpeakers: getExpectedSpeakers(),
     sttInfo,
     islandPlan,
+    unresolvedPlan,
     displayDetected,
   });
 }

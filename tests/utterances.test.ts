@@ -11,7 +11,9 @@ import {
   MIN_TOTAL_WORDS_FOR_ISLANDS,
   groupUtterances,
   mergeSameSpeaker,
+  planDisplayCorrection,
   planMinorIslandMerges,
+  planUnresolvedMinors,
   smoothMinorSpeakerIslands,
   smoothSpeakerJitter,
 } from "../public/utterances.js";
@@ -888,4 +890,364 @@ test("A → X → ? → X → A は不一致ではなく「隣が話者不明」
   assert.deepEqual(plan.minors, [2]);
   assert.deepEqual(plan.merges, []);
   assert.deepEqual(plan.skipped, { mismatch: 0, tooLong: 0, edge: 0, boundary: 0, unknown: 2 });
+});
+
+// ---- 統合先を決められなかった minor speaker の中立化（#50） ----
+//
+// #48 は `A → X → A`（前後が同じ主要 speaker）だけを安全に統合し、`B → X → A`
+// （前後の主要 speaker が違う ＝ `skipped.mismatch`）は見送った。見送ったぶんは
+// **表示上「話者C」として残る** ので、2人だと申告した会話に第三者が現れる。
+//
+// 固定したいのは4つ。
+// 1. **対象は `mismatch` だけ** — `tooLong` / `boundary` / `edge` / `unknown` は残す
+//    （前者は「本物の発話かもしれない」、後者3つは「そもそも隣を見られなかった」）
+// 2. **`speaker` を潰さない** — `unresolved` の印を立てるだけ。潰すと `mergeSameSpeaker()` の
+//    `null === null` で隣接した異なる minor が1段落に溶け、観測された話者交代が消える
+// 3. **中立化した行は前とも後とも結合しない** — `{ type: "reconnect" }` と同じ独立グループ
+// 4. **②のゲートがそのまま③のゲート** — ②が無効なら③も無効（独自のゲートを足さない）
+//
+// fixture はここでも合成データ。文字列は長さにしか意味が無い。
+
+/**
+ * `0 → 2 → 1`。②は「前後の主要 speaker が違う」として見送り、③がその 2 を中立化する。
+ * **この Issue が扱う形そのもの。**
+ */
+const MISMATCH_SPEC: IslandSpec = [
+  [0, 150],
+  [1, 100],
+  [0, 50],
+  [2, 5],
+  [1, 60],
+];
+
+/** ③の計画。②の計画を入力に取る（本番の `groupUtterances()` と同じ経路） */
+function neutralPlanOf(lines: Line[], expectedSpeakers: string = EXPECTED_2) {
+  return planUnresolvedMinors(planOf(lines, expectedSpeakers));
+}
+
+/** グループが中立化されているかの列。段落の割れ方と一緒に見るために speaker と分けて取る */
+function unresolvedOf(groups: Array<Record<string, unknown>>): boolean[] {
+  return groups.map((g) => g.unresolved === true);
+}
+
+test("前後の主要 speaker が違う minor を中立化する（0 → 2 → 1）", () => {
+  const lines = islandLines(MISMATCH_SPEC);
+  const plan = planOf(lines);
+  // ②は見送る。**その run の行が③の入力になる**
+  assert.deepEqual(plan.merges, []);
+  assert.deepEqual(plan.skippedRuns, [{ reason: "mismatch", speaker: 2, words: 5, indexes: [3] }]);
+
+  const neutral = neutralPlanOf(lines);
+  assert.equal(neutral.disabledBy, null);
+  assert.deepEqual(neutral.neutralized, [{ speaker: 2, segments: 1, words: 5, indexes: [3] }]);
+  assert.deepEqual(neutral.skippedRuns, [], "mismatch 以外の run は無い fixture");
+
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
+    Record<string, unknown>
+  >;
+  // **speaker は 2 のまま。** 表示側が中立ラベルに差し替えるだけで、raw の番号は残す
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 2, 1]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, true, false]);
+});
+
+test("#48 が統合できる島（0 → 2 → 0）は中立化しない", () => {
+  // 統合先が決まるなら中立化する理由が無い。**②と③の担当が重ならないこと**の担保
+  const lines = islandLines([
+    [0, 150],
+    [1, 100],
+    [0, 50],
+    [2, 5],
+    [0, 50],
+    [1, 60],
+  ]);
+  assert.equal(planOf(lines).merges.length, 1);
+  assert.deepEqual(neutralPlanOf(lines).neutralized, []);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
+    Record<string, unknown>
+  >;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 1]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, false]);
+});
+
+/**
+ * **異なる minor が隣接しても1段落にしない。** `A → X → Y → B` の `X → Y` は
+ * 観測された話者交代そのもので、②が run を切ってまで守った不変条件。
+ * `speaker` を `null` へ潰すと `mergeSameSpeaker()` の `null === null` でここが溶ける。
+ */
+test("隣接した別々の minor を中立化しても1段落にならない", () => {
+  const lines = islandLines([
+    [0, 150],
+    [1, 100],
+    [0, 50],
+    [2, 3],
+    [3, 4],
+    [0, 50],
+    [1, 60],
+  ]);
+  const neutral = neutralPlanOf(lines);
+  // speaker ごとにまとめる（診断が `speaker 2 → 話者不明` を出せる形）
+  assert.deepEqual(neutral.neutralized, [
+    { speaker: 2, segments: 1, words: 3, indexes: [3] },
+    { speaker: 3, segments: 1, words: 4, indexes: [4] },
+  ]);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(groups.length, 7, "中立化した2行が1段落に溶けている");
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 2, 3, 0, 1]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, true, true, false, false]);
+});
+
+/**
+ * **同じ run の連続行は1段落にまとめる。** run は「同一 minor の連続」を別 speaker・
+ * 話者不明・再接続で切って作ってあるので、隣接する中立行の speaker が同じなら
+ * **同じ run ＝ 1つの発話のかたまり**。ここで割ると、#36 が正面から潰した
+ * 「1発話が細切れに表示される」をこの段が作り直すことになる。
+ *
+ * 上の「別々の minor」テストと対になっていて、**`speaker` を残しているからこの2つを
+ * 区別できる**（`null` に潰すとどちらも同じ判定になる）。
+ */
+test("同じ run の連続する中立行は1段落にまとまる", () => {
+  const lines = islandLines([
+    [0, 150],
+    [1, 100],
+    [0, 50],
+    [2, 3],
+    [2, 3],
+    [1, 60],
+  ]);
+  // run は1本（行は2つ）。②の見送りも1件
+  assert.deepEqual(neutralPlanOf(lines).neutralized, [
+    { speaker: 2, segments: 2, words: 6, indexes: [3, 4] },
+  ]);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(groups.length, 5, "同じ run が別々の段落へ割れている");
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 2, 1]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, true, false]);
+});
+
+/**
+ * **長い run は `mismatch` でも中立化しない。**
+ *
+ * ②の判定順は `mismatch → tooLong` なので、`B → X(長い) → A` は `mismatch` が先に立ち
+ * `tooLong` に到達しない。③で長さを当て直さないと「長い run は隠さない」という
+ * #48 から続く安全弁が**この段だけ効かず**、上限なしで隠すことになる。
+ */
+test("前後不一致でも run が長ければ中立化しない", () => {
+  const lines = islandLines([
+    [0, 600],
+    [1, 400],
+    [0, 100],
+    [2, MINOR_ISLAND_MAX_WORDS + 1],
+    [1, 100],
+  ]);
+  // ②の内訳では `mismatch`（`tooLong` に到達していない）
+  assert.deepEqual(planOf(lines).skipped, {
+    mismatch: 1,
+    tooLong: 0,
+    edge: 0,
+    boundary: 0,
+    unknown: 0,
+  });
+
+  const neutral = neutralPlanOf(lines);
+  assert.deepEqual(neutral.neutralized, [], "上限を超えた run を隠している");
+  // 落とした run は `tooLong` に付け替えて返す。診断の「中立化の対象外」が
+  // ②の「表示補正の見送り」と違う数字になるのは、この差ぶん
+  assert.deepEqual(neutral.skippedRuns, [
+    { reason: "tooLong", speaker: 2, words: MINOR_ISLAND_MAX_WORDS + 1, indexes: [3] },
+  ]);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+});
+
+/**
+ * **復元データ由来の印は信じない。** `finalLines` は `localStorage` から**検証なしで**
+ * 復元される（`app.js` の `finalLines.push(...session.finalLines)`）ので、`unresolved` にも
+ * 任意の値が入りうる。素通りさせると、想定話者数が既定の `auto`（＝この段が無効）でも
+ * 画面には中立チップが出て、診断は「無効（想定話者数が自動）」と言う —
+ * **画面と診断が違う事実を語る**。
+ */
+test("復元された finalLines の unresolved は表示へ抜けない", () => {
+  const lines = islandLines(MISMATCH_SPEC).map((l, i) =>
+    i === 1 ? { ...l, unresolved: true } : l,
+  ) as Line[];
+  const groups = groupUtterances(lines, { expectedSpeakers: "auto" }) as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(
+    unresolvedOf(groups).some(Boolean),
+    false,
+    "復元データの印がそのまま表示に効いている",
+  );
+});
+
+/**
+ * **前とも後とも結合しない。** speaker が同じでも独立させる（`{ type: "reconnect" }` と同じ扱い）。
+ * ここを `mergeSameSpeaker()` に直接当てるのは、パイプラインを通すと
+ * 「minor は主要と番号が違うので、そもそも結合条件に当たらない」という**別の理由**で
+ * 通ってしまい、ガードそのものを固定できないため。
+ */
+test("中立化した行は前後が同じ話者でも独立したグループになる", () => {
+  const groups = mergeSameSpeaker([
+    { text: "まえ", speaker: 0, t: 0 },
+    { text: "なか", speaker: 0, t: 1, unresolved: true },
+    { text: "うしろ", speaker: 0, t: 2 },
+  ]) as Array<Record<string, unknown>>;
+  assert.deepEqual(summary(groups), [
+    { speaker: 0, text: "まえ" },
+    { speaker: 0, text: "なか" },
+    { speaker: 0, text: "うしろ" },
+  ]);
+  assert.deepEqual(unresolvedOf(groups), [false, true, false]);
+});
+
+test("raw の finalLines は中立化でも書き換わらない（speaker も unresolved も付かない）", () => {
+  const lines = islandLines(MISMATCH_SPEC);
+  const snapshot = structuredClone(lines);
+  groupUtterances(lines, { expectedSpeakers: EXPECTED_2 });
+  planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.deepEqual(lines, snapshot, "localStorage に保存される raw が印で汚れてはいけない");
+  for (const l of lines) {
+    assert.equal("unresolved" in l, false, "raw に表示用の印が漏れている");
+  }
+});
+
+test("中立化でもテキストと行数は1つも変わらない", () => {
+  const lines = islandLines(MISMATCH_SPEC);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(
+    groups.flatMap((g) => g.texts as string[]).join(""),
+    lines.map((l) => l.text).join(""),
+  );
+  assert.equal(
+    groups.reduce((n: number, g) => n + (g.texts as string[]).length, 0),
+    lines.length,
+  );
+});
+
+/**
+ * **件数と run 一覧が食い違わないこと。** ③は `skippedRuns` から中立化する行を決めるので、
+ * ②の内訳（人が閾値を決めるための数字）とずれると、診断の2つの節が別の事実を語り出す。
+ */
+test("skipped の件数と skippedRuns の理由別件数が一致する", () => {
+  const lines = islandLines([
+    [2, 3], // 端
+    [0, 600],
+    [1, 400],
+    [0, 100],
+    [2, 3], // 前後不一致
+    [1, 100],
+    [0, 100],
+    [2, MINOR_ISLAND_MAX_WORDS + 1], // 長すぎる
+    [0, 100],
+    "reconnect",
+    [2, 3], // 再接続境界
+    [0, 100],
+    [null, 5],
+    [2, 3], // 隣が話者不明
+    [null, 5],
+    [0, 100],
+  ]);
+  const plan = planOf(lines);
+  for (const reason of ["mismatch", "tooLong", "edge", "boundary", "unknown"] as const) {
+    assert.equal(
+      plan.skippedRuns.filter((r: { reason: string }) => r.reason === reason).length,
+      plan.skipped[reason],
+      `${reason}: 件数と run 一覧が食い違っている`,
+    );
+  }
+  // 内訳そのものも固定しておく（run の切り出しが変われば両方が同時に動く）
+  assert.deepEqual(plan.skipped, { mismatch: 1, tooLong: 1, edge: 1, boundary: 1, unknown: 1 });
+});
+
+/**
+ * **中立化するのは `mismatch` だけ。** `tooLong` は「誤割り当てされた本物の発話」でありうるし、
+ * 残り3つは「そもそも隣を見られなかった」。どちらも「統合先を決められなかった」とは意味が違う。
+ */
+test("tooLong / boundary / edge / unknown の run は中立化しない", () => {
+  const lines = islandLines([
+    [2, 3], // 端
+    [0, 600],
+    [1, 400],
+    [0, 100],
+    [2, MINOR_ISLAND_MAX_WORDS + 1], // 長すぎる
+    [0, 100],
+    "reconnect",
+    [2, 3], // 再接続境界
+    [0, 100],
+    [null, 5],
+    [2, 3], // 隣が話者不明
+    [null, 5],
+    [0, 100],
+  ]);
+  const plan = planOf(lines);
+  assert.equal(plan.skipped.mismatch, 0, "fixture に mismatch が混ざっている");
+  const neutral = neutralPlanOf(lines);
+  assert.deepEqual(neutral.neutralized, []);
+  // 対象外にした run は**そのまま返す**。理由別の件数を診断が出せないと、
+  // `edge` / `unknown` を将来対象に加えるかどうかの材料が無くなる
+  assert.deepEqual(
+    neutral.skippedRuns.map((r: { reason: string }) => r.reason).sort(),
+    ["boundary", "edge", "tooLong", "unknown"],
+  );
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(unresolvedOf(groups).some(Boolean), false, "対象外の run まで中立化している");
+});
+
+test("想定話者数が自動なら中立化しない（②のゲートをそのまま引き継ぐ）", () => {
+  const lines = islandLines(MISMATCH_SPEC);
+  const neutral = neutralPlanOf(lines, "auto");
+  assert.equal(neutral.disabledBy, "auto", "「効いていない」と「効いた結果0件」が区別できない");
+  assert.deepEqual(neutral.neutralized, []);
+  // 既定（引数なし）も同じ。#36 までの呼び出し側は挙動が変わらない
+  const groups = groupUtterances(lines) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 2, 1]);
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+});
+
+test("検出が想定以下なら中立化しない（disabledBy: detectedNotOver）", () => {
+  const lines = islandLines(MISMATCH_SPEC);
+  const neutral = neutralPlanOf(lines, "3");
+  assert.equal(neutral.disabledBy, "detectedNotOver");
+  assert.deepEqual(neutral.neutralized, []);
+});
+
+/**
+ * **`displayDetected` は「表示上の通常話者数」**（#50 で意味が変わった）。中立化した
+ * speaker は画面にも Markdown にも「話者C」として出ないので、数え続けると
+ * 「話者Cは表示されないのに表示上の話者数は3」という読めない値になる。
+ */
+test("表示上の通常話者数は中立化した speaker を数えない", () => {
+  const lines = islandLines(MISMATCH_SPEC);
+  assert.equal(collectSpeakerStats(lines).detected, 3, "raw の検出数は 3 のまま");
+  const { displayDetected, unresolvedPlan } = planDisplayCorrection(lines, {
+    expectedSpeakers: EXPECTED_2,
+  });
+  assert.equal(displayDetected, 2);
+  // 計画も同じ1回の計算から返る（診断が別経路で立て直すと表示とずれる）
+  assert.deepEqual(unresolvedPlan.neutralized, [
+    { speaker: 2, segments: 1, words: 5, indexes: [3] },
+  ]);
+});
+
+test("#36 の fixture は中立化の印が1つも付かない（②が無効なら③も無効）", () => {
+  // fixture の行は `w` を持たず総量も小さいので②のゲートで必ず止まる。
+  // **#50 が #36 / #48 の判定へ滲み出していないこと**の担保
+  for (const c of cases) {
+    const lines = linesOf(c);
+    const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
+      Record<string, unknown>
+    >;
+    assert.equal(unresolvedOf(groups).some(Boolean), false, `${c.id}: 中立化されている`);
+    assert.notEqual(neutralPlanOf(lines).disabledBy, null, `${c.id}: ③が有効になっている`);
+  }
 });

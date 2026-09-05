@@ -240,6 +240,8 @@ const MD_ARGS = {
   sttInfo: null,
   // #48 の表示補正。既定では**計画を渡していない**状態（節ごと出ない）を表す
   islandPlan: null,
+  // #50 の中立化。同じく既定では計画を渡していない状態
+  unresolvedPlan: null,
   displayDetected: null,
 };
 
@@ -519,15 +521,24 @@ const SKIPPED_LINES = [
   line(1, 20, 40, 1_050_000),
 ];
 
-/** 診断の2箇所（画面パネル / Markdown）と同じ形で計画を立てる */
+/**
+ * 診断の2箇所（画面パネル / Markdown）と同じ形で計画を立てる。
+ *
+ * **②③の計画と表示上の通常話者数は、`planDisplayCorrection()` の1回の計算から取る。**
+ * `planMinorIslandMerges()` を raw の行へ直接当てると、表示に効くのは①jitter 通過後の
+ * 計画なので**両方向にずれる**（#48 のレビューで潰した形）。`app.js` も同じ形で、
+ * `tests/app-wiring.test.ts` がそれを固定している — ここで別の組み方をすると、
+ * テストヘルパーだけが潰したはずの形を再現することになる。
+ */
 function islandArgs(lines: ReturnType<typeof line>[], expectedSpeakers = "2") {
-  const speakerStats = collectSpeakerStats(lines);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers });
   return {
     ...SPEAKER_MD_ARGS,
-    speakerStats,
+    speakerStats: collectSpeakerStats(lines),
     expectedSpeakers,
-    islandPlan: planMinorIslandMerges(lines, { expectedSpeakers, stats: speakerStats }),
-    displayDetected: planDisplayCorrection(lines, { expectedSpeakers }).displayDetected,
+    islandPlan: correction.plan,
+    unresolvedPlan: correction.unresolvedPlan,
+    displayDetected: correction.displayDetected,
   };
 }
 
@@ -535,7 +546,7 @@ test("表示補正の件数・word 数・from/to が Markdown に出る", () => 
   const md = buildDiagnosticsMarkdown(islandArgs(ISLAND_LINES));
   // raw の検出数は主のまま。補正後は別ラベルで併記する（#46 の原則を崩さない）
   assert.match(md, /- 検出話者数: 3/);
-  assert.match(md, /- 表示上の話者数: 2/);
+  assert.match(md, /- 表示上の通常話者数: 2/);
   assert.match(md, /### 表示補正（minor island）/);
   assert.match(md, /- 表示補正: 1 seg \/ 3 word/);
   assert.match(md, /- 主要 speaker: 0, 1/);
@@ -572,7 +583,7 @@ test("計画を渡さなければ表示補正の節ごと出さない", () => {
   // 「補正0件」と紛れないよう、行ごと出さないことで区別する（復元経路などで計画が無い場合）
   const md = buildDiagnosticsMarkdown({ ...SPEAKER_MD_ARGS });
   assert.doesNotMatch(md, /### 表示補正（minor island）/);
-  assert.doesNotMatch(md, /- 表示上の話者数:/);
+  assert.doesNotMatch(md, /- 表示上の通常話者数:/);
   assert.match(md, /## 話者分離の診断/, "話者統計そのものは従来どおり出る");
 });
 
@@ -596,12 +607,92 @@ test("画面パネルにも表示補正の行が出る", () => {
   const args = islandArgs(ISLAND_LINES);
   const rows = speakerDiagRows(args) as Array<[string, string]>;
   const labels = rows.map(([k]) => k);
-  assert.ok(labels.includes("表示上の話者数"));
+  assert.ok(labels.includes("表示上の通常話者数"));
   assert.ok(labels.includes("表示補正"));
   assert.ok(labels.includes("表示補正の見送り"));
   // from/to の明細は Markdown では表、画面では1行ずつ（speaker ごとの行と同じ形）
   assert.deepEqual(
     rows.find(([k]) => k === "表示補正 2 → 0"),
     ["表示補正 2 → 0", "1 seg / 3 word"],
+  );
+});
+
+// ---- 中立化（#50） ----
+//
+// **見出しを「表示中立化」にするのは、既存の「話者不明のセグメント」（#46）と紛れないため。**
+// あちらは raw の時点で speaker が付かなかった行の量、こちらは「番号は付いたが統合先を
+// 決められないので通常の話者として表示しない」と判断した行の量。表示上はどちらも
+// 「話者不明」と出るが原因も対策も別で、同じ見出しに並ぶとどちらの数字か読めなくなる。
+
+/** 想定2人・検出3で、`0 → 2 → 1`（前後の主要 speaker が違う）が1つある合成セッション */
+const NEUTRALIZE_LINES = [
+  line(0, 120, 240, 1_010_000),
+  line(1, 76, 152, 1_020_000),
+  line(0, 20, 40, 1_030_000),
+  line(2, 3, 6, 1_040_000),
+  line(1, 20, 40, 1_050_000),
+];
+
+test("中立化の件数と speaker ごとの内訳が Markdown に出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(NEUTRALIZE_LINES));
+  // raw の検出数は主のまま。**「通常」話者数は中立化したぶんを数えない**（#50）
+  assert.match(md, /- 検出話者数: 3/);
+  assert.match(md, /- 表示上の通常話者数: 2/);
+  // ②は見送り、③が中立化する。両方の数字が同じ節に並ぶ
+  assert.match(md, /- 表示補正: 0 seg \/ 0 word/);
+  assert.match(md, /- 表示中立化: 1 seg \/ 3 word/);
+  assert.match(md, /- 表示中立化 2 → 話者不明: 1 seg \/ 3 word/);
+});
+
+/**
+ * **対象外の理由別件数を必ず出す。** `edge` / `unknown` を将来この段の対象に加えるかどうかの、
+ * 唯一の判断材料になる（件数が 0 のまま増えないなら加える意味が無い）。
+ * `mismatch` は③の**対象**そのものなので、対象外の欄には出さない。
+ */
+test("中立化の対象外を理由ごとに Markdown へ出す", () => {
+  // 端（前に確定 speaker が無い）が1件、前後不一致が1件
+  const md = buildDiagnosticsMarkdown(islandArgs(SKIPPED_LINES));
+  assert.match(md, /- 表示中立化: 1 seg \/ 3 word/);
+  assert.match(md, /- 中立化の対象外: run が長い 0 \/ 端 1 \/ 再接続境界 0 \/ 隣が話者不明 0/);
+  assert.doesNotMatch(md, /- 中立化の対象外:.*不一致/, "③の対象を対象外として数えている");
+});
+
+test("島が吸収できたセッションでは中立化が0件", () => {
+  // 「効いた結果0件」。**沈黙させない** — 行が出ないと「効いていない」と区別が付かない
+  const md = buildDiagnosticsMarkdown(islandArgs(ISLAND_LINES));
+  assert.match(md, /- 表示補正: 1 seg \/ 3 word/);
+  assert.match(md, /- 表示中立化: 0 seg \/ 0 word/);
+});
+
+test("②がゲートで無効なら③も無効と1行出す", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(NEUTRALIZE_LINES, "auto"));
+  assert.match(md, /- 表示補正: 無効（想定話者数が自動）/);
+  assert.match(md, /- 表示中立化: 無効（想定話者数が自動）/);
+  assert.doesNotMatch(md, /- 中立化の対象外:/, "無効のときに 0 件の内訳を並べない");
+});
+
+test("計画を渡さなければ中立化の行も出さない", () => {
+  const md = buildDiagnosticsMarkdown({ ...SPEAKER_MD_ARGS });
+  assert.doesNotMatch(md, /- 表示中立化:/);
+  assert.doesNotMatch(md, /- 中立化の対象外:/);
+});
+
+test("中立化の行に会話本文が混入しない", () => {
+  const marker = "このもじれつはほんぶんのしるし";
+  const lines = NEUTRALIZE_LINES.map((l) => ({ ...l, text: marker }));
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.equal(md.includes(marker), false);
+  assert.match(md, /- 表示中立化: /, "行そのものは出ている");
+});
+
+/** **画面パネルと Markdown は同じ行データから描く**（#46 からの規則） */
+test("画面パネルにも中立化の行が出る", () => {
+  const rows = speakerDiagRows(islandArgs(NEUTRALIZE_LINES)) as Array<[string, string]>;
+  const labels = rows.map(([k]) => k);
+  assert.ok(labels.includes("表示中立化"));
+  assert.ok(labels.includes("中立化の対象外"));
+  assert.deepEqual(
+    rows.find(([k]) => k === "表示中立化 2 → 話者不明"),
+    ["表示中立化 2 → 話者不明", "1 seg / 3 word"],
   );
 });

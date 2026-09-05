@@ -182,7 +182,9 @@ test("話者統計は raw の finalLines から集計する", () => {
  */
 const ISLAND_WIRING = [
   "const speakerStats = collectSpeakerStats(finalLines);",
-  "const { plan: islandPlan, displayDetected } = planDisplayCorrection(finalLines, {",
+  // **③の計画（#50）も同じ1回の計算から受け取る。** 診断が別途 `planUnresolvedMinors()` を
+  // 呼び直すと、中立化の件数が表示に効いたものとずれる（②の計画と同じ理由）
+  "const { plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {",
 ];
 
 test("診断の2箇所は表示補正の計画を同じ形で作る", () => {
@@ -851,4 +853,47 @@ test("セッション初期化で折りたたみの状態も戻す", () => {
   assert.match(body, /lowToggle = null/, "トグル行の参照が残る");
   assert.match(body, /lowExpanded = false/, "展開状態が残る");
   assert.match(body, /classList\.remove\("show-low"\)/, "#cards のクラスが残る");
+});
+
+// ---- 中立化した話者の表示（#50） ----
+
+/**
+ * **中立ラベルの定義箇所は `speaker-stats.js` の1つだけ。**
+ *
+ * 画面（`renderTranscript()`）と Markdown（`buildTranscriptMarkdown()`）のどちらかが
+ * 文言を書き写すと、ラベルを直したときに片方だけ変わる。例外は出ず、画面では
+ * 「話者不明」なのにエクスポートでは別の語、という形で静かに割れる
+ * （`groupUtterances()` を2箇所が共有しているのと同じ理由で、文言も共有させる）。
+ */
+test("中立ラベルは画面と Markdown が同じ定義を引く", () => {
+  assert.match(APP, /UNRESOLVED_SPEAKER_LABEL,/, "speaker-stats.js から import していない");
+  assert.ok(
+    fnBody("renderTranscript").includes("UNRESOLVED_SPEAKER_LABEL"),
+    "画面が中立ラベルを引いていない",
+  );
+  assert.ok(
+    fnBody("buildTranscriptMarkdown").includes("UNRESOLVED_SPEAKER_LABEL"),
+    "Markdown が中立ラベルを引いていない",
+  );
+  // 文言を書き写した箇所があれば定義が2つになる（コメントは CODE から落ちている）
+  assert.doesNotMatch(CODE, /"話者不明"/, "app.js に中立ラベルを書き写している");
+});
+
+/**
+ * **`speaker == null` の既存経路は変えない。**
+ *
+ * raw の時点で Deepgram が speaker を返さなかった行（画面はチップ無し / Markdown は
+ * `**発言**`）と、#50 が中立化した行は**別の事実**。前者は diarization そのものの問題で、
+ * 後者は #48 の統合条件の問題なので、同じ見た目にすると実機のログから原因を切り分けられない。
+ */
+test("speaker が付かない行の表示は #50 で変えない", () => {
+  const md = fnBody("buildTranscriptMarkdown");
+  assert.match(md, /: "発言";/, "speaker == null の Markdown 表記が変わっている");
+  // 中立化の分岐は `speaker != null` の**手前**に足す。同じ if に混ぜると、
+  // speaker が付かない行までチップが出る
+  assert.match(
+    fnBody("renderTranscript"),
+    /if \(group\.unresolved\)[\s\S]*\} else if \(speaker != null\) \{/,
+    "中立チップの分岐が speaker == null の経路を飲み込んでいる",
+  );
 });
