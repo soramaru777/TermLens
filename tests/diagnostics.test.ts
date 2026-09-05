@@ -17,6 +17,9 @@ import {
   trackSettingRows,
   fmtElapsed,
   speakerDiagRows,
+  textIntegrityRows,
+  textIntegrityStageRows,
+  textIntegrityVerdict,
 } from "../public/diagnostics.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
 // 表示補正の計画は utterances.js が唯一の定義箇所（#48）。**診断もそこを通る**ので、
@@ -243,6 +246,10 @@ const MD_ARGS = {
   // #50 の中立化。同じく既定では計画を渡していない状態
   unresolvedPlan: null,
   displayDetected: null,
+  // #52 のテキスト完全性。既定では**サーバーから累計を受けていない**状態（節ごと出ない）
+  textIntegrity: null,
+  receivedChars: null,
+  displayedChars: null,
 };
 
 test("Markdown にモード・設定・統計が載る", () => {
@@ -694,5 +701,206 @@ test("画面パネルにも中立化の行が出る", () => {
   assert.deepEqual(
     rows.find(([k]) => k === "表示中立化 2 → 話者不明"),
     ["表示中立化 2 → 話者不明", "1 seg / 3 word"],
+  );
+});
+
+// ---- STT テキスト完全性（#52） ----
+//
+// 「発話の冒頭が数文字欠けて見える」が本当に欠落なのか、話者分割の位置の問題なのかを
+// 実データで切り分けるための節。**判定文まで出す**のが要点で、表だけ出すと読み手が毎回
+// 「これは欠落か分割か」を考え直すことになる。
+
+/** サーバーから届く累計（`ServerMessage.text_integrity`）。会話本文は持たない。 */
+const INTEGRITY = (over: Record<string, unknown> = {}) => ({
+  finals: 87,
+  splitFinals: 12,
+  rawChars: 1234,
+  rawVisible: 1180,
+  splitChars: 1210,
+  splitVisible: 1180,
+  fallbacks: 0,
+  droppedEvents: 0,
+  headDrops: 0,
+  ...over,
+});
+
+/** クライアント側で数えた③④。既定は「全段一致」。 */
+const CLIENT_CHARS = { chars: 1210, visible: 1180 };
+
+const integrityArgs = (over: Record<string, unknown> = {}) => ({
+  ...MD_ARGS,
+  textIntegrity: INTEGRITY(),
+  receivedChars: CLIENT_CHARS,
+  displayedChars: CLIENT_CHARS,
+  ...over,
+});
+
+test("text_integrity を受けていなければ節ごと出さない", () => {
+  // **「0文字」と「未取得」を混同させない**（#48 の islandPlan と同じ扱い）。
+  // mock モードと旧サーバーではこの節がそもそも成立しない
+  const md = buildDiagnosticsMarkdown(MD_ARGS);
+  assert.doesNotMatch(md, /## STTテキスト完全性/);
+  // 他のセクションは従来どおり出る
+  assert.match(md, /## 入力の統計/);
+});
+
+test("段階別の文字数が1つの表になり、前段との差が出る", () => {
+  const md = buildDiagnosticsMarkdown(integrityArgs());
+  assert.match(md, /## STTテキスト完全性/);
+  assert.match(md, /\| ① Deepgram final \| 1234 \| 1180 \| — \|/);
+  assert.match(md, /\| ② 話者分割後 \| 1210 \| 1180 \| 0 \|/);
+  assert.match(md, /\| ③ クライアント受信 \| 1210 \| 1180 \| 0 \|/);
+  assert.match(md, /\| ④ 表示（段落結合後） \| 1210 \| 1180 \| 0 \|/);
+  assert.match(md, /- final 数: 87（うち分割が起きた: 12）/);
+  assert.match(md, /- 切り出し失敗（連結へフォールバック）: 0/);
+  assert.match(md, /- 空で捨てたセグメント: 0（うち先頭: 0）/);
+});
+
+/**
+ * **判定文を出すこと**が要点。表を見た人が毎回「これは欠落か分割か」を考え直さずに済む。
+ *
+ * 全段一致なら文字は1つも失われておらず、症状は分割位置（word 単位で助詞1語だけ話者が
+ * 変わる）による見えだと確定する。
+ */
+test("全段一致なら「欠落なし・分割位置による」と言い切る", () => {
+  const md = buildDiagnosticsMarkdown(integrityArgs());
+  assert.match(md, /- 判定: 空白除く文字数がすべての段で一致 → 欠落なし。冒頭欠落の見えは分割位置による/);
+});
+
+/**
+ * **判定文は plain text で組む。** 画面パネルは `el("td", null, value)` に素の文字列として
+ * 入れるので、`**` やバッククォートを混ぜるとアスタリスクがそのままセルに出る
+ * （Markdown 側の強調は節の注記が担っていて、判定文には要らない）。
+ */
+test("判定文に Markdown の記号を混ぜない（画面パネルにそのまま出るため）", () => {
+  const rows = textIntegrityStageRows({
+    integrity: INTEGRITY({ splitVisible: 1176 }),
+    received: { chars: 1206, visible: 1176 },
+    displayed: { chars: 1206, visible: 1176 },
+  });
+  for (const integrity of [INTEGRITY(), INTEGRITY({ fallbacks: 2 })]) {
+    const verdict = textIntegrityVerdict(rows, integrity) as string;
+    assert.doesNotMatch(verdict, /\*\*|`/, verdict);
+  }
+});
+
+test("①→② で減っていれば話者分割を指す判定になる", () => {
+  const md = buildDiagnosticsMarkdown(
+    integrityArgs({
+      textIntegrity: INTEGRITY({ splitVisible: 1176, droppedEvents: 3, headDrops: 1 }),
+      receivedChars: { chars: 1206, visible: 1176 },
+      displayedChars: { chars: 1206, visible: 1176 },
+    }),
+  );
+  assert.match(md, /①→② で 4 文字減少 → 話者分割で欠落している/);
+  assert.match(md, /- 空で捨てたセグメント: 3（うち先頭: 1）/);
+  assert.doesNotMatch(md, /欠落なし/);
+});
+
+test("③→④ で減っていれば表示側を指す判定になる", () => {
+  // #36 / #48 / #50 はラベルしか変えない設計なので、ここが減っていれば回帰
+  const md = buildDiagnosticsMarkdown(
+    integrityArgs({ displayedChars: { chars: 1205, visible: 1175 } }),
+  );
+  assert.match(md, /③→④ で 5 文字減少 → 表示側で欠落している/);
+});
+
+test("②→③ の差は前のセッションの行が残っている疑いとして読ませる", () => {
+  const md = buildDiagnosticsMarkdown(
+    integrityArgs({
+      receivedChars: { chars: 1250, visible: 1220 },
+      displayedChars: { chars: 1250, visible: 1220 },
+    }),
+  );
+  assert.match(md, /②→③ で 40 文字増加/);
+  assert.match(md, /③④ は最後の再接続より後ろの行だけを数えています/);
+});
+
+/**
+ * **フォールバックが絡む①→②の差は、減少・増加のどちらとしても読ませない。**
+ *
+ * フォールバックは `transcript` と `words\[\]` が食い違ったときにだけ起きるので、
+ * 連結で組み直した②は①と**別の文字列**であり、空白を除いた文字数も増減する。
+ * ここを普通の差として読ませると、切り出しも破棄も起きていないのに
+ * 「話者分割で欠落している」と断定し、存在しないバグを追わせることになる。
+ */
+test("切り出し失敗があるときの①→②の差はフォールバック由来として読ませる", () => {
+  const md = buildDiagnosticsMarkdown(
+    integrityArgs({
+      textIntegrity: INTEGRITY({ splitVisible: 1176, fallbacks: 2 }),
+      receivedChars: { chars: 1206, visible: 1176 },
+      displayedChars: { chars: 1206, visible: 1176 },
+    }),
+  );
+  assert.match(md, /①→② で 4 文字減少 → 切り出しに 2 回失敗して連結で組み直している/);
+  assert.doesNotMatch(md, /話者分割で欠落している/);
+  assert.match(md, /切り出し失敗が 0 でないときの ①→② の差は別扱いです/);
+});
+
+test("フォールバックで①→②が増えても「二重計上」とは言わない", () => {
+  const md = buildDiagnosticsMarkdown(
+    integrityArgs({
+      textIntegrity: INTEGRITY({ splitVisible: 1190, fallbacks: 1 }),
+      receivedChars: { chars: 1220, visible: 1190 },
+      displayedChars: { chars: 1220, visible: 1190 },
+    }),
+  );
+  assert.match(md, /①→② で 10 文字増加 → 切り出しに 1 回失敗して/);
+  assert.doesNotMatch(md, /二重計上/);
+});
+
+/**
+ * **判定基準を節の中に書く。** 表だけ残すと、別の日に読んだ人が「素の文字数が減っている
+ * から欠落だ」と読み違える — 切り出しの `trim` は正常動作でも素の文字数を減らす。
+ */
+test("「保存されていれば分割、減っていれば欠落」を節に書く", () => {
+  const md = buildDiagnosticsMarkdown(integrityArgs());
+  assert.match(md, /\*\*保存されていれば分割、減っていれば欠落\*\*/);
+});
+
+/**
+ * **節は名前を挙げたキーしか読まない。** サーバーが `text_integrity` にフィールドを足しても、
+ * ここへ書き足さない限り診断には出ない（`TRACK_KEYS` と同じ採用リストの発想）。
+ * 会話本文が新しい経路で流れ込む余地を、値ではなく構造で塞ぐ。
+ */
+test("テキスト完全性の節は知らないキーを出さない", () => {
+  const marker = "このもじれつはほんぶんのしるし";
+  const md = buildDiagnosticsMarkdown(
+    integrityArgs({
+      textIntegrity: INTEGRITY({ sampleText: marker, lastUtterance: marker }),
+      receivedChars: { chars: 1210, visible: 1180, sampleText: marker },
+      displayedChars: { chars: 1210, visible: 1180, sampleText: marker },
+    }),
+  );
+  assert.equal(md.includes(marker), false);
+  assert.match(md, /## STTテキスト完全性/, "節そのものは出ている");
+});
+
+test("テキスト完全性を足しても「会話本文と音声は含みません」は1行のまま", () => {
+  const md = buildDiagnosticsMarkdown(integrityArgs());
+  assert.equal(md.split("> 会話本文と音声は含みません。").length - 1, 1);
+});
+
+/** **画面パネルと Markdown は同じ行データから描く**（#46 からの規則） */
+test("画面パネルにもテキスト完全性の行が出る", () => {
+  const rows = textIntegrityRows({
+    integrity: INTEGRITY(),
+    received: CLIENT_CHARS,
+    displayed: CLIENT_CHARS,
+  }) as Array<[string, string]>;
+  const labels = rows.map(([k]) => k);
+  assert.deepEqual(labels.slice(0, 4), [
+    "① Deepgram final",
+    "② 話者分割後",
+    "③ クライアント受信",
+    "④ 表示（段落結合後）",
+  ]);
+  assert.ok(labels.includes("判定"), "画面パネルにも判定文を出す");
+});
+
+test("画面パネルも text_integrity が無ければ行を出さない", () => {
+  assert.deepEqual(
+    textIntegrityRows({ integrity: null, received: CLIENT_CHARS, displayed: CLIENT_CHARS }),
+    [],
   );
 });

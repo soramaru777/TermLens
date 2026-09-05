@@ -1,4 +1,4 @@
-import type { SttAdapter, SttInfo, TranscriptEvent, TranscriptWord } from "./types.js";
+import type { SplitDiag, SttAdapter, SttInfo, TranscriptEvent, TranscriptWord } from "./types.js";
 import { MOCK_SCRIPT, type MockLine } from "./mock-script.js";
 import { buildFinalEvents } from "./split.js";
 
@@ -216,7 +216,9 @@ export class MockSttAdapter implements SttAdapter {
         const chunks = chunkMockWords(words, MOCK_WORDS_PER_FINAL);
         for (const [i, chunk] of chunks.entries()) {
           const isLast = i === chunks.length - 1;
-          const evs = buildFinalEvents(chunk.map(mockSurface).join(""), chunk);
+          // `diag`(#52)は捨てる。mock は1行1話者で常に素通しになるため、積んでも
+          // 「分割で落ちるか」は1件も観測できない。計測は実アダプタの経路でだけ意味を持つ
+          const { events: evs } = buildFinalEvents(chunk.map(mockSurface).join(""), chunk);
           for (const [j, e] of evs.entries()) {
             // speechFinal を立てるのは行の最後のチャンクの、さらに最後の1件だけ。
             // deepgram.ts と同じ規則（全件に立てると話者分割ごとに発話が閉じる）。
@@ -263,6 +265,15 @@ export class MockSttAdapter implements SttAdapter {
    * 「(取得できませんでした)」と出る(`tests/diagnostics.test.ts` が固定)。
    */
   onSttInfo(_cb: (info: SttInfo) => void): void {
+    // 何もしない
+  }
+  /**
+   * mock は分割の計測を出さないので**登録するだけで呼ばない**(#52)。
+   * 上のとおり1行1話者で常に素通しになるため、積んでも分割経路の計測にはならない。
+   * クライアントは `text_integrity` が来なくても壊れず、診断は節ごと出ない
+   * (`tests/diagnostics.test.ts` が固定)。
+   */
+  onSplitDiag(_cb: (diag: SplitDiag) => void): void {
     // 何もしない
   }
   onError(cb: (err: Error) => void): void {

@@ -141,27 +141,38 @@ function wordsOf(pairs: Array<[surface: string, speaker: number | undefined]>): 
   }));
 }
 
+/**
+ * 分割の観点は `events` だけを見る。`diag`（#52 のテキスト完全性）は下の専用ブロックで見る。
+ *
+ * **ヘルパで包むのは「戻り値の形が変わった」を全テストに散らさないため**であって、
+ * `diag` を見ない口実ではない — 見ない観点をここに閉じ込め、見る観点を1箇所に集める。
+ */
+const eventsOf = (text: string, words?: TranscriptWord[]) => buildFinalEvents(text, words).events;
+
+/** 計測だけを取り出す。 */
+const diagOf = (text: string, words?: TranscriptWord[]) => buildFinalEvents(text, words).diag;
+
 test("buildFinalEvents: text が空なら何も返さない", () => {
-  assert.deepEqual(buildFinalEvents("", wordsFrom([0, 1])), []);
-  assert.deepEqual(buildFinalEvents(""), []);
+  assert.deepEqual(eventsOf("", wordsFrom([0, 1])), []);
+  assert.deepEqual(eventsOf(""), []);
 });
 
 test("buildFinalEvents: words が無ければ text を素通しし speaker は undefined", () => {
-  const events = buildFinalEvents("words なし");
+  const events = eventsOf("words なし");
   assert.deepEqual(events, [
     { text: "words なし", isFinal: true, speaker: undefined, words: undefined, segIndex: 0 },
   ]);
 });
 
 test("buildFinalEvents: words が空配列でも words は undefined に畳まない", () => {
-  const events = buildFinalEvents("空配列", []);
+  const events = eventsOf("空配列", []);
   assert.equal(events.length, 1);
   assert.deepEqual(events[0].words, []);
 });
 
 test("buildFinalEvents: 単一話者なら分割せず words も全体を載せる", () => {
   const words = wordsFrom([0, 0, 0]);
-  const events = buildFinalEvents("そのままの文字列", words);
+  const events = eventsOf("そのままの文字列", words);
   assert.equal(events.length, 1);
   assert.equal(events[0].text, "そのままの文字列");
   assert.equal(events[0].speaker, 0);
@@ -182,7 +193,7 @@ test("buildFinalEvents: 分割時も transcript の語間の空白を保つ", ()
     ["はい、", 1],
     ["なるほど。", 1],
   ]);
-  const events = buildFinalEvents(transcript, words);
+  const events = eventsOf(transcript, words);
   assert.deepEqual(
     events.map((e) => e.text),
     ["これは AWS Lambda です。", "はい、なるほど。"],
@@ -203,7 +214,7 @@ test("buildFinalEvents: 分割時も transcript の語間の空白を保つ", ()
 
 test("buildFinalEvents: 分割された text は transcript の部分文字列になっている", () => {
   const transcript = "1 2 3 4";
-  const events = buildFinalEvents(
+  const events = eventsOf(
     transcript,
     wordsOf([
       ["1", 0],
@@ -223,7 +234,7 @@ test("buildFinalEvents: 分割された text は transcript の部分文字列�
 
 /** 切り出せない（transcript と words が食い違う）ときは連結にフォールバックする。 */
 test("buildFinalEvents: transcript と words が食い違えば連結で再構成する", () => {
-  const events = buildFinalEvents(
+  const events = eventsOf(
     "まったく別の文字列",
     wordsOf([
       ["あ", 0],
@@ -237,7 +248,7 @@ test("buildFinalEvents: transcript と words が食い違えば連結で再構�
 });
 
 test("buildFinalEvents: 再構成しても空の text は送らない", () => {
-  const events = buildFinalEvents(
+  const events = eventsOf(
     "別の文字列",
     wordsOf([
       ["", 0],
@@ -256,7 +267,7 @@ test("buildFinalEvents: punctuatedWord が無ければ word を使って切り�
     { word: "うえ", start: 0.5, end: 1, confidence: 0.9, speaker: 1 },
   ];
   assert.deepEqual(
-    buildFinalEvents("あいうえ", words).map((e) => e.text),
+    eventsOf("あいうえ", words).map((e) => e.text),
     ["あい", "うえ"],
   );
 });
@@ -270,7 +281,7 @@ test("buildFinalEvents: punctuatedWord が無ければ word を使って切り�
 test("buildFinalEvents: 分割しない final にも segIndex 0 が付く", () => {
   // ここが欠けると session.ts の採番規則（segIndex === 0 で進める）が
   // 「undefined でも進める」側の枝でしか通らなくなり、分割時との整合が崩れる
-  const events = buildFinalEvents("そのまま", wordsFrom([0, 0]));
+  const events = eventsOf("そのまま", wordsFrom([0, 0]));
   assert.deepEqual(
     events.map((e) => e.segIndex),
     [0],
@@ -278,7 +289,7 @@ test("buildFinalEvents: 分割しない final にも segIndex 0 が付く", () =
 });
 
 test("buildFinalEvents: 分割した final には 0 起点の連番が付く", () => {
-  const events = buildFinalEvents(
+  const events = eventsOf(
     "あいうえお",
     wordsOf([
       ["あ", 0],
@@ -302,7 +313,7 @@ test("buildFinalEvents: 分割した final には 0 起点の連番が付く", (
  * 別々の final がクライアント側で1発話として結合されうる（#36）。
  */
 test("buildFinalEvents: 空の text を捨てても segIndex は 0 から連番になる", () => {
-  const events = buildFinalEvents(
+  const events = eventsOf(
     "別の文字列",
     wordsOf([
       ["", 0],
@@ -317,4 +328,143 @@ test("buildFinalEvents: 空の text を捨てても segIndex は 0 から連番�
       { text: "う", segIndex: 1 },
     ],
   );
+});
+
+// ---- テキスト完全性の計測（#52） ----
+//
+// 「発話の冒頭が数文字欠けて見える」が本当に欠落なのかを実データで切り分けるための計測。
+// **判定に使うのは空白を除いた文字数**（`rawVisible` / `splitVisible`）で、素の `length` では
+// ない — 切り出しは `.trim()` を掛けるので **正常に動いていても素の文字数は減る**。
+// 素の数で比べると正常な差と欠落が混ざって読めない。
+//
+// **ただし保存されるのは切り出しに成功したときだけ。** フォールバックは transcript と
+// words が食い違ったときにだけ起きるので、組み直したテキストは別の文字列であり、
+// 空白を除いた文字数も増減する（下の2本がその両方向を固定する）。
+
+test("SplitDiag: 素通し（分割なし）は transcript の文字数がそのまま出る", () => {
+  // **実測値と突き合わせる。** 実装は素通しの枝で `splitChars: rawChars` と同じ値を
+  // 代入するので、`rawChars === splitChars` を見るだけでは何を壊しても通ってしまう。
+  // 固定すべきは「素通しの枝に入り、transcript の文字数がそのまま出ること」
+  const text = "そのままの 文字列";
+  const diag = diagOf(text, wordsFrom([0, 0, 0]));
+  assert.equal(diag.segments, 1);
+  assert.equal(diag.events, 1);
+  assert.equal(diag.splitChars, text.length, "素通しは空白も落ちない");
+  assert.equal(diag.splitVisible, text.replace(/\s/g, "").length);
+  assert.equal(diag.fallback, false);
+  assert.equal(diag.headDropped, false);
+});
+
+test("SplitDiag: words が無い素通しは segments 0 / events 1（捨てた件数を負にしないための形）", () => {
+  // `SplitIntegrity` 側の `Math.max(0, segments - events)` を外すと、ここが -1 として積まれる
+  const diag = diagOf("words なし");
+  assert.equal(diag.segments, 0);
+  assert.equal(diag.events, 1);
+  assert.equal(diag.rawVisible, diag.splitVisible);
+});
+
+test("SplitDiag: 切り出し成功なら空白除く文字数が保存される（素の文字数は trim ぶん減ってよい）", () => {
+  const transcript = "これは AWS Lambda です。 はい、なるほど。";
+  const diag = diagOf(
+    transcript,
+    wordsOf([
+      ["これは", 0],
+      ["AWS", 0],
+      ["Lambda", 0],
+      ["です。", 0],
+      ["はい、", 1],
+      ["なるほど。", 1],
+    ]),
+  );
+  assert.equal(diag.fallback, false, "切り出しに成功しているはず");
+  assert.equal(diag.rawVisible, diag.splitVisible, "空白除く文字数は保存される");
+  // **素の文字数は減る。** セグメント境界の空白が `.trim()` で落ちるため。
+  // この差を「欠落」と読ませないことが、空白を除いて測る理由そのもの
+  assert.ok(diag.splitChars < diag.rawChars, "素の文字数は境界の空白ぶん減る");
+});
+
+test("SplitDiag: フォールバックでは空白除く文字数が保存されない（減る側）", () => {
+  // **フォールバックは transcript と words が食い違ったときにだけ起きる。** 組み直した
+  // テキストは words 側の文字列なので、transcript とは別物。「空白除く文字数は必ず
+  // 保存される」と読むと、ここを話者分割の欠落と誤診する（診断は fallbacks > 0 のとき
+  // ①→②の差を別扱いにする。public/diagnostics.js の INTEGRITY_FALLBACK_VERDICT）
+  const diag = diagOf(
+    "まったく別の文字列",
+    wordsOf([
+      ["あ い", 0],
+      ["う え", 1],
+    ]),
+  );
+  assert.equal(diag.fallback, true);
+  assert.equal(diag.segments, 2);
+  assert.equal(diag.events, 2);
+  assert.equal(diag.splitVisible, 4, "あ/い/う/え の4文字");
+  assert.equal(diag.rawVisible, 9, "transcript 側は9文字");
+  assert.ok(diag.splitVisible < diag.rawVisible, "切り出しも破棄も起きていないのに減る");
+  assert.equal(diag.headDropped, false);
+});
+
+test("SplitDiag: フォールバックでは空白除く文字数が保存されない（増える側）", () => {
+  // 逆向きも起きる。**増加を「二重計上」と読ませないため**に固定しておく
+  const diag = diagOf(
+    "10時",
+    wordsOf([
+      ["10", 0],
+      ["時です", 1],
+    ]),
+  );
+  assert.equal(diag.fallback, true);
+  assert.equal(diag.rawVisible, 3);
+  assert.equal(diag.splitVisible, 5, "words 側のほうが多い");
+});
+
+test("SplitDiag: 先頭セグメントが空なら headDropped が立ち、捨てた件数も出る", () => {
+  // **「発話の頭が丸ごと消える」を構造的に説明できる唯一の経路**（#52 の調査）。
+  // 件数（segments - events）だけだと、落ちたのが先頭かどうかが読めない
+  const diag = diagOf(
+    "別の文字列",
+    wordsOf([
+      ["", 0],
+      ["い", 1],
+      ["う", 0],
+    ]),
+  );
+  assert.equal(diag.headDropped, true);
+  assert.equal(diag.segments, 3);
+  assert.equal(diag.events, 2);
+  assert.equal(diag.splitVisible, 2, "残った2文字ぶんだけが出る");
+  // ここが raw より減っている＝本物の欠落。判定はこの差で行う
+  assert.ok(diag.splitVisible < diag.rawVisible);
+});
+
+test("SplitDiag: 末尾だけが空なら headDropped は立たない（捨てた件数だけ増える）", () => {
+  const diag = diagOf(
+    "別の文字列",
+    wordsOf([
+      ["あ", 0],
+      ["", 1],
+    ]),
+  );
+  assert.equal(diag.headDropped, false);
+  assert.equal(diag.segments, 2);
+  assert.equal(diag.events, 1);
+});
+
+test("SplitDiag: text が空なら segments も 0（捨てた件数を汚さない）", () => {
+  // 呼び出し側（deepgram.ts）は空 transcript で diag を配らないが、純関数の戻りの形は
+  // 常に `{ events, diag }` であること。片方だけ undefined になる形を作らない。
+  //
+  // **`segments` を words の分割数で埋めない。** `SplitIntegrity` は `segments - events`
+  // を「空で捨てたセグメント」として積むので、1件も発行していない final で件数だけが
+  // 増える（不変条件を呼び出し側にだけ置かない）
+  assert.deepEqual(diagOf("", wordsFrom([0, 1])), {
+    rawChars: 0,
+    rawVisible: 0,
+    splitChars: 0,
+    splitVisible: 0,
+    segments: 0,
+    events: 0,
+    fallback: false,
+    headDropped: false,
+  });
 });

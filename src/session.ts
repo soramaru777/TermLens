@@ -4,6 +4,7 @@ import { MockSttAdapter } from "./stt/mock.js";
 import { DeepgramSttAdapter } from "./stt/deepgram.js";
 import { ExtractionScheduler } from "./extract/scheduler.js";
 import { UtteranceBuilder } from "./stt/utterance.js";
+import { SplitIntegrity } from "./stt/integrity.js";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
 import { config } from "./config.js";
 
@@ -43,6 +44,14 @@ export class Session {
    * 再接続の境界で必ずグループを切るので衝突しない。
    */
   private lastFinalSeq = 0;
+  /**
+   * STT テキスト完全性の累計(#52)。
+   *
+   * **`lastFinalSeq` と同じく WS 1本の生存期間を通じて持ち、stop → start で作り直さない。**
+   * クライアントは届いた累計で上書きするだけなので、作り直すと画面の数字が途中で
+   * 巻き戻り、「どこで文字が減ったか」を読むための表が同じセッション内で2本混ざる。
+   */
+  private readonly integrity = new SplitIntegrity();
 
   constructor(private ws: WebSocket) {
     ws.on("message", (data, isBinary) => this.onMessage(data, isBinary));
@@ -147,6 +156,30 @@ export class Session {
       if (e.isFinal) builder.addFinal(e);
     });
     stt.onUtteranceEnd(() => builder.utteranceEnd());
+    // final ごとに累計へ足して、そのまま送る(#52)。
+    //
+    // **スプレッド(`...snapshot`)にしないこと。** `stt_info` とまったく同じ理由で、
+    // オブジェクトリテラルへのスプレッドには TypeScript の excess property check が
+    // 効かないため、`IntegritySnapshot` にフィールドが1つ増えると `ServerMessage` の型に
+    // 書かなくても**型エラーゼロのままクライアントへ出ていく**。「診断に出るのは件数と
+    // 文字数だけ」という主張は、型に書き・ここにも書くまで進まないと外へ出ないという
+    // 2層で守る
+    stt.onSplitDiag((diag) => {
+      this.integrity.add(diag);
+      const s = this.integrity.snapshot();
+      this.send({
+        type: "text_integrity",
+        finals: s.finals,
+        splitFinals: s.splitFinals,
+        rawChars: s.rawChars,
+        rawVisible: s.rawVisible,
+        splitChars: s.splitChars,
+        splitVisible: s.splitVisible,
+        fallbacks: s.fallbacks,
+        droppedEvents: s.droppedEvents,
+        headDrops: s.headDrops,
+      });
+    });
     // モデル情報はアダプタが「変わったときだけ」呼ぶ契約なので、ここは素通しでよい(#46)。
     //
     // **スプレッド(`...info`)にしないこと。** オブジェクトリテラルへのスプレッドには

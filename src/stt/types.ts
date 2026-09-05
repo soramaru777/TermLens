@@ -1,3 +1,33 @@
+/**
+ * 1つの final を分割したときに、その場で分かる計測値（#52）。`split.ts` が返す。
+ *
+ * **並走する計測関数を作らずに戻り値へ足したのが要点。** `split.ts` の冒頭にあるとおり
+ * 同じ規則を2か所に書くと片方だけ直したときに静かに食い違う。`measureFinalSplit()` の
+ * ような関数を別に置くと、切り出しの規則が2実装になり「計測器のほうが古い」状態を作れる。
+ *
+ * **型をここに置くのは、`split.ts` の import を `./types.js` の型だけに保つため。**
+ * `split.ts` 側で定義すると types が split を import し返し、`split.ts` 冒頭の規律
+ * （types が下位レイヤ）が崩れる。
+ *
+ * 会話本文は1文字も持たない。件数・文字数・boolean だけ。
+ */
+export interface SplitDiag {
+  /** 分割前の transcript */
+  rawChars: number;
+  rawVisible: number;
+  /** 分割後に発行したイベントの合計 */
+  splitChars: number;
+  splitVisible: number;
+  /** `splitBySpeaker()` が返したセグメント数（1以下なら素通し、0 は words なし） */
+  segments: number;
+  /** 発行したイベント数。`segments` より少なければ空で捨てられている */
+  events: number;
+  /** `sliceFromTranscript()` が undefined を返し連結へ落ちた */
+  fallback: boolean;
+  /** 先頭セグメントが空で捨てられた（＝発話の頭が丸ごと消えた） */
+  headDropped: boolean;
+}
+
 /** 単語単位の認識結果。話者分割・誤認識補正の材料として使う。 */
 export interface TranscriptWord {
   /** 認識された素の表記 */
@@ -102,6 +132,20 @@ export interface SttAdapter {
    * 相当する情報を持たないアダプタは空実装でよい(mock がそうしている)。
    */
   onSttInfo(cb: (info: SttInfo) => void): void;
+  /**
+   * final を1つ組み立てるたびに、その場で分かるテキスト完全性の計測を渡す(#52)。
+   *
+   * **`onTranscript` とは別経路にしてある。** 計測は「1つの Results 全体」に対する量で、
+   * 分割後のイベント1件ずつに割り当てられる値ではない。`TranscriptEvent` に載せると
+   * 分割された final で同じ計測が件数ぶん重複し、受け側が「先頭の1件だけ数える」という
+   * 暗黙の規律を持つことになる。
+   *
+   * **transcript が空の Results では呼ばない。** テキストが無い以上テキスト完全性に
+   * 言うことは無く、呼ぶと `finals` が無音の Results を数える器になる。
+   *
+   * 相当する情報を持たないアダプタは空実装でよい(mock がそうしている)。
+   */
+  onSplitDiag(cb: (diag: SplitDiag) => void): void;
   onError(cb: (err: Error) => void): void;
   onClose(cb: () => void): void;
 }

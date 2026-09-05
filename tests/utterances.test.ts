@@ -18,6 +18,9 @@ import {
   smoothSpeakerJitter,
 } from "../public/utterances.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
+// 文字数の数え方は diagnostics.js が唯一の定義箇所（#52）。ここで数え直すと、
+// 診断が読む数と、この不変条件が守る数が別物になる
+import { countTextChars } from "../public/diagnostics.js";
 
 /**
  * 表示・エクスポート用の発話グループ（`public/utterances.js`、#36）。
@@ -1250,4 +1253,79 @@ test("#36 の fixture は中立化の印が1つも付かない（②が無効な
     assert.equal(unresolvedOf(groups).some(Boolean), false, `${c.id}: 中立化されている`);
     assert.notEqual(neutralPlanOf(lines).disabledBy, null, `${c.id}: ③が有効になっている`);
   }
+});
+
+// ---- 表示補正を通しても文字数が変わらない（#52） ----
+//
+// #36 / #48 / #50 はいずれも `speaker` ラベルだけを直す設計なので、**空白を除いた
+// 文字数は④まで保存されるはず**。テキスト完全性の表で③→④ に差が出たらそれは回帰であり、
+// この不変条件がその判定の根拠そのものになる。
+//
+// **「テキストが変わらない」は既に固定してあるが、文字数の観点は別**。診断が読むのは
+// `countTextChars()` を通した数で、そこに空白の扱い（`visibleChars`）が入る。表の④が
+// 何を数えているのかを、表示側のパイプライン込みでここに固定しておく。
+
+/** ④（`groupUtterances()` の出力）を診断と同じやり方で数える。 */
+function displayedChars(lines: Line[], expectedSpeakers?: string) {
+  const groups = groupUtterances(lines, { expectedSpeakers }) as Array<Record<string, unknown>>;
+  return countTextChars(groups.flatMap((g) => (g.texts as string[] | undefined) ?? []));
+}
+
+/** ③（raw の `finalLines`）を診断と同じやり方で数える。再接続の印はテキストを持たない。 */
+function receivedChars(lines: Line[]) {
+  return countTextChars(lines.filter((l) => l.type !== "reconnect").map((l) => l.text));
+}
+
+test("#36 の jitter 補正を通しても③と④の文字数が一致する", () => {
+  for (const c of cases) {
+    const lines = linesOf(c);
+    assert.deepEqual(
+      displayedChars(lines),
+      receivedChars(lines),
+      `${c.id}: 表示補正で文字数が変わっている`,
+    );
+  }
+});
+
+test("#48 の island 補正を通しても③と④の文字数が一致する", () => {
+  const lines = islandLines([
+    [0, 150],
+    [1, 100],
+    [0, 50],
+    [2, 5],
+    [0, 50],
+    [1, 60],
+  ]);
+  assert.deepEqual(displayedChars(lines, EXPECTED_2), receivedChars(lines));
+});
+
+test("#50 の中立化を通しても③と④の文字数が一致する", () => {
+  const lines = islandLines(MISMATCH_SPEC);
+  assert.deepEqual(displayedChars(lines, EXPECTED_2), receivedChars(lines));
+});
+
+/**
+ * **空白は表示側で落ちない。** サーバー側の切り出し（`.trim()`）とフォールバック
+ * （`join("")`）が空白を落とすのは①→②だけで、③→④ では素の文字数も保存される。
+ * ここが崩れると「素の文字数の差は正常」という診断の注記が④まで広がってしまう。
+ */
+test("語間の空白も表示側では落ちない（素の文字数まで保存される）", () => {
+  const lines = [
+    { text: "これは AWS Lambda です。", speaker: 0, t: 0, seq: 1, w: 4 },
+    { text: "はい、 なるほど。", speaker: 1, t: 1, seq: 2, w: 2 },
+  ] as Line[];
+  const received = receivedChars(lines);
+  assert.deepEqual(displayedChars(lines, EXPECTED_2), received);
+  assert.ok(received.visible < received.chars, "この fixture には空白が含まれている");
+});
+
+test("再接続を挟んでも③と④の文字数が一致する", () => {
+  // 再接続の印はテキストを持たないので、③④のどちらの数にも入らない
+  const lines = [
+    line("あい", 0, { seq: 1 }),
+    reconnect(),
+    line("うえ", 0, { seq: 1 }),
+  ];
+  assert.deepEqual(displayedChars(lines), receivedChars(lines));
+  assert.equal(receivedChars(lines).visible, 4);
 });

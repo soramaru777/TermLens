@@ -603,6 +603,196 @@ function speakerSection({
   ];
 }
 
+// ---- STT テキスト完全性(#52) ----
+//
+// 「発話の冒頭が数文字欠けて見える」が**本当に文字の欠落なのか、話者分割の位置の問題なのか**
+// を実データで切り分けるための節。段階ごとの文字数を1つの表に並べ、**どの段で減ったか**を
+// 判定文にして出す。
+//
+// 出るのは件数・文字数・差分だけで、会話本文は1文字も入らない。
+// **本文を復元しうる hash も入れない**(短い発話は総当たりで復元されうる)。
+
+/**
+ * 空白を除いた文字数。**判定に使うのはこちらで、素の `length` ではない**(#52)。
+ *
+ * サーバー側の話者分割は切り出しに `.trim()` を掛けるので、**正常に動いていても素の
+ * 文字数は減る**。素の数で段階を比べると「正常な空白の消失」と「本物の欠落」が混ざって
+ * 読めなくなる。
+ *
+ * **判定式(`/\s/g`)は `src/stt/split.ts` の `visibleChars()` と同じもの。** 言語境界を
+ * またぐので実装は2つになるが、`tests/integrity.test.ts` が全角空白・タブ・改行まで含めて
+ * 両者の一致を突き合わせている(片方だけ直すと段階別の文字数が意味を失う)。
+ */
+export function visibleChars(s) {
+  return typeof s === "string" ? s.replace(/\s/g, "").length : 0;
+}
+
+/**
+ * 文字列の配列を1段階ぶんの `{ chars, visible }` に畳む(#52)。
+ *
+ * `finalLines` は `localStorage` から**検証なしで**復元されるので、文字列でない `text` も
+ * 混じりうる。`visibleChars()` 側で 0 に丸め、ここでは長さだけ同じ判定を通す
+ * (`definedSpeaker()` / `normalizeCaptureMode()` と同じ、消費側で丸める規律)。
+ */
+export function countTextChars(texts) {
+  let chars = 0;
+  let visible = 0;
+  for (const t of texts ?? []) {
+    if (typeof t !== "string") continue;
+    chars += t.length;
+    visible += visibleChars(t);
+  }
+  return { chars, visible };
+}
+
+/** 段階の見出し。**この配列が表の行順そのもの**で、差分は1つ上の段との比較。 */
+const INTEGRITY_STAGE_LABELS = [
+  "① Deepgram final",
+  "② 話者分割後",
+  "③ クライアント受信",
+  "④ 表示（段落結合後）",
+];
+
+/**
+ * 段ごとの差(空白除く)に対する読み。**「どこを直せばよいか」まで書く**のが要点で、
+ * 表だけ出すと読み手が毎回「これは欠落か分割か」を考え直すことになる。
+ */
+const INTEGRITY_STEP_VERDICTS = [
+  {
+    lost: "①→② で {n} 文字減少 → 話者分割で欠落している（src/stt/split.ts の切り出し／空セグメントの破棄）",
+    gained: "①→② で {n} 文字増加 → 分割後のほうが多い。二重計上を疑う（同じ Results を2回積んでいないか）",
+  },
+  {
+    lost: "②→③ で {n} 文字減少 → サーバーが送った final をクライアントが取りこぼしている",
+    gained: "②→③ で {n} 文字増加 → クライアント側に前のセッションの行が残っている",
+  },
+  {
+    lost: "③→④ で {n} 文字減少 → 表示側で欠落している（#36 / #48 / #50 の補正と段落結合。どれもラベルしか変えない設計なので、減っていれば回帰）",
+    gained: "③→④ で {n} 文字増加 → 表示側が行を複製している",
+  },
+];
+
+/**
+ * ①→② にフォールバックが絡んだときの読み(#52)。**減少・増加の別より優先する。**
+ *
+ * フォールバックは `sliceFromTranscript()` が失敗したとき、すなわち `transcript` と
+ * `words[]` が**食い違う文字列だった**ときにだけ起きる。連結で組み直した ② は ① と
+ * 別の文字列なので、空白を除いた文字数すら増減しうる。ここを普通の減少・増加として
+ * 読ませると、存在しないバグ(二重計上や切り出しの欠落)へ読み手を送ることになる。
+ */
+const INTEGRITY_FALLBACK_VERDICT =
+  "①→② で {n} 文字{dir} → 切り出しに {f} 回失敗して連結で組み直しているため、②は①と別の文字列。この差は欠落とは限らない";
+
+/**
+ * 「STTテキスト完全性」の段階表と判定を組み立てる(#52)。
+ *
+ * **サーバーから `text_integrity` を1件も受けていなければ空を返す**(呼び出し側が節ごと
+ * 落とす)。「0件」と「未取得」を混同させないため — mock モードと旧サーバーでは
+ * この節がそもそも成立しない(#48 の `islandPlan` と同じ扱い)。
+ *
+ * @param integrity `ServerMessage.text_integrity` の中身(累計)
+ * @param received ③ クライアントが積んだ `finalLines` の文字数(`countTextChars()`)
+ * @param displayed ④ `groupUtterances()` の出力の文字数(`countTextChars()`)
+ */
+export function textIntegrityStageRows({ integrity, received, displayed }) {
+  if (!integrity) return [];
+  const stages = [
+    { chars: integrity.rawChars, visible: integrity.rawVisible },
+    { chars: integrity.splitChars, visible: integrity.splitVisible },
+    received ?? { chars: 0, visible: 0 },
+    displayed ?? { chars: 0, visible: 0 },
+  ];
+  return stages.map((s, i) => ({
+    label: INTEGRITY_STAGE_LABELS[i],
+    chars: s.chars,
+    visible: s.visible,
+    // 先頭に前段は無い。0 と「比較対象なし」を取り違えないよう null を返す
+    diff: i === 0 ? null : s.visible - stages[i - 1].visible,
+  }));
+}
+
+/**
+ * 段階表から読める判定の文(#52)。**表と同じ配列から作る**ので、表と判定が食い違わない。
+ *
+ * 全段一致なら「欠落なし」と言い切る — 分割は文字数を保存するので、保存されていれば
+ * 症状は分割位置（word 単位で助詞1語だけ話者が変わる）による見えであって欠落ではない。
+ */
+export function textIntegrityVerdict(rows, integrity) {
+  if (rows.length === 0) return null;
+  const fallbacks = integrity?.fallbacks ?? 0;
+  const steps = rows.slice(1).flatMap((r, i) => {
+    if (r.diff === 0) return [];
+    const n = String(Math.abs(r.diff));
+    if (i === 0 && fallbacks > 0) {
+      return [
+        INTEGRITY_FALLBACK_VERDICT.replace("{n}", n)
+          .replace("{dir}", r.diff < 0 ? "減少" : "増加")
+          .replace("{f}", String(fallbacks)),
+      ];
+    }
+    const v = INTEGRITY_STEP_VERDICTS[i];
+    return [(r.diff < 0 ? v.lost : v.gained).replace("{n}", n)];
+  });
+  if (steps.length === 0) {
+    return "空白除く文字数がすべての段で一致 → 欠落なし。冒頭欠落の見えは分割位置による";
+  }
+  return steps.join(" / ");
+}
+
+/**
+ * 節の本文行(画面パネルと Markdown が同じ配列から描く)。
+ *
+ * **値は plain text で組む。** 画面側は `el("td", null, value)` に素の文字列として
+ * 入るので、判定文に `**` やバッククォートを混ぜるとパネルに記号がそのまま出る。
+ */
+export function textIntegrityRows({ integrity, received, displayed }) {
+  const rows = textIntegrityStageRows({ integrity, received, displayed });
+  if (rows.length === 0) return [];
+  return [
+    ...rows.map((r) => [
+      r.label,
+      `${r.chars} 文字 / 空白除く ${r.visible}${r.diff === null ? "" : `（前段との差 ${r.diff}）`}`,
+    ]),
+    ["final 数", `${integrity.finals}（うち分割が起きた: ${integrity.splitFinals}）`],
+    ["切り出し失敗（連結へフォールバック）", String(integrity.fallbacks)],
+    ["空で捨てたセグメント", `${integrity.droppedEvents}（うち先頭: ${integrity.headDrops}）`],
+    ["判定", textIntegrityVerdict(rows, integrity)],
+  ];
+}
+
+/**
+ * 「STTテキスト完全性」セクション(#52)。**`text_integrity` を受けていなければ節ごと出さない。**
+ */
+function textIntegritySection({ integrity, received, displayed }) {
+  const rows = textIntegrityStageRows({ integrity, received, displayed });
+  if (rows.length === 0) return [];
+  return [
+    "## STTテキスト完全性",
+    "",
+    "| 段階 | 文字数 | 空白除く | 前段との差(空白除く) |",
+    "|---|---:|---:|---:|",
+    ...rows.map(
+      (r) => `| ${r.label} | ${r.chars} | ${r.visible} | ${r.diff === null ? "—" : r.diff} |`,
+    ),
+    "",
+    `- final 数: ${integrity.finals}（うち分割が起きた: ${integrity.splitFinals}）`,
+    `- 切り出し失敗（連結へフォールバック）: ${integrity.fallbacks}`,
+    `- 空で捨てたセグメント: ${integrity.droppedEvents}（うち先頭: ${integrity.headDrops}）`,
+    `- 判定: ${textIntegrityVerdict(rows, integrity)}`,
+    "",
+    // **判定基準を節の中に書く。** 表だけ残すと、別の日に読んだ人が
+    // 「素の文字数が減っているから欠落だ」と読み違える
+    "> 切り出しに成功しているかぎり、空白除く文字数は分割で保存されます（`trim` が落とすのは空白だけ）。",
+    "> **保存されていれば分割、減っていれば欠落**です。素の文字数の差は正常でも生じます。",
+    // フォールバックは transcript と words が食い違うときにだけ起きるので、
+    // 連結で組み直した ② は ① と別の文字列になる。ここを書かないと、
+    // 「切り出し失敗 N 件」と「①→② の差」が別々の事実として読まれる
+    "> ただし切り出し失敗が 0 でないときの ①→② の差は別扱いです。連結で組み直した ② は ① と別の文字列なので、空白除く文字数も増減しえます。",
+    "> ③④ は最後の再接続より後ろの行だけを数えています（①② はサーバー側のセッション単位の累計なので、境界を揃えないと比較になりません）。",
+    "",
+  ];
+}
+
 /**
  * 収音診断の Markdown を組み立てる(#26)。
  *
@@ -631,6 +821,9 @@ function speakerSection({
  * @param islandPlan `planMinorIslandMerges()` の戻り(#48)。渡さなければ節ごと出ない
  * @param unresolvedPlan `planUnresolvedMinors()` の戻り(#50)。渡さなければ中立化の行が出ない
  * @param displayDetected 表示上の**通常**話者数(`planDisplayCorrection()`、#48 / #50)
+ * @param textIntegrity `ServerMessage.text_integrity` の中身(#52)。渡さなければ節ごと出ない
+ * @param receivedChars ③ `finalLines` の文字数(`countTextChars()` の戻り、#52)
+ * @param displayedChars ④ `groupUtterances()` の出力の文字数(`countTextChars()` の戻り、#52)
  */
 export function buildDiagnosticsMarkdown({
   modeLabel,
@@ -646,6 +839,9 @@ export function buildDiagnosticsMarkdown({
   islandPlan,
   unresolvedPlan,
   displayDetected,
+  textIntegrity,
+  receivedChars,
+  displayedChars,
 }) {
   const settingRows = trackSettingRows(trackSettings, contextSampleRate);
   const statRows = audioStatRows(stats);
@@ -681,6 +877,11 @@ export function buildDiagnosticsMarkdown({
       islandPlan,
       unresolvedPlan,
       displayDetected,
+    }),
+    ...textIntegritySection({
+      integrity: textIntegrity,
+      received: receivedChars,
+      displayed: displayedChars,
     }),
     "> 会話本文と音声は含みません。",
     "",
