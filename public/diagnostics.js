@@ -12,6 +12,7 @@
 // 話者統計の集計と閾値は speaker-stats.js が唯一の定義箇所(#46)。
 // ここで割合を計算し直すと、画面と Markdown で別の基準の数字が出る。
 import {
+  UNRESOLVED_SPEAKER_LABEL,
   expectedSpeakerLabel,
   pct1,
   ratioBasisView,
@@ -369,6 +370,65 @@ function minorIslandRows(islandPlan, ratioBasis) {
   ];
 }
 
+// ---- 中立化(#50)の診断 ----
+//
+// **見出しを「表示中立化」にするのは、既存の「話者不明のセグメント」(#46)と紛れないため。**
+// あちらは raw の時点で Deepgram が speaker を返さなかった行の量で、こちらは
+// 「speaker 番号は付いたが、統合先を決められないので通常の話者として表示しない」と
+// 判断した行の量。表示上はどちらも「話者不明」と出るが、**原因も対策も別**
+// (前者は diarization そのものの問題、後者は #48 の統合条件の問題)。同じ見出しで並べると、
+// 実データを見た人がどちらの数字を見ているのか分からなくなる。
+
+/**
+ * 中立化の対象外にした理由の表示名。**`ISLAND_SKIP_LABELS` から `mismatch` を除いて作る。**
+ * 語を書き写すと、②の理由を1つ足したときに③の内訳にだけ現れない理由ができる。
+ * `mismatch` を除くのは、それが③の**対象**そのものだから(対象外の欄に出しても意味が無い)。
+ */
+const NEUTRALIZE_SKIP_LABELS = ISLAND_SKIP_LABELS.filter(([key]) => key !== "mismatch");
+
+/**
+ * 中立化の見出し行。**画面パネルと Markdown が同じ配列から描く**(既存の規則)。
+ * 出るのは speaker 番号・件数・word 数・理由名だけで、会話本文は1文字も入らない。
+ */
+function unresolvedRows(unresolvedPlan, ratioBasis) {
+  // 計画そのものを渡されていない(古い呼び出し)なら何も出さない
+  if (!unresolvedPlan) return [];
+  // ②が無効なら③も無効。**「効いていない」と「効いた結果0件」を区別する**
+  // (`minorIslandRows()` と同じ規律。理由の表示名も同じ表から引く)
+  if (unresolvedPlan.disabledBy) {
+    const why = Object.hasOwn(ISLAND_DISABLED_LABELS, unresolvedPlan.disabledBy)
+      ? ISLAND_DISABLED_LABELS[unresolvedPlan.disabledBy]
+      : unresolvedPlan.disabledBy;
+    return [["表示中立化", `無効（${why}）`]];
+  }
+  const view = ratioBasisView(ratioBasis);
+  const neutralized = unresolvedPlan.neutralized ?? [];
+  const segments = neutralized.reduce((n, x) => n + x.segments, 0);
+  const words = neutralized.reduce((n, x) => n + x.words, 0);
+  const skippedRuns = unresolvedPlan.skippedRuns ?? [];
+  return [
+    ["表示中立化", `${segments} seg / ${words} ${view.unit}`],
+    // speaker ごとの明細。どの speaker が何回中立化されたかは、
+    // 「本当に偽 speaker だったのか」を実データで確かめるための材料になる
+    ...neutralized.map((x) => [
+      `表示中立化 ${x.speaker} → ${UNRESOLVED_SPEAKER_LABEL}`,
+      `${x.segments} seg / ${x.words} ${view.unit}`,
+    ]),
+    // **対象外の理由別件数を必ず出す。** `edge` / `unknown` を将来この段の対象に
+    // 加えるかどうかを実データで判断するための材料(件数が0のまま増えないなら加える意味が無い)。
+    //
+    // **②の「表示補正の見送り」と同じ数字にはならない。** ③は `mismatch` のうち
+    // 長すぎる run を `tooLong` へ落とし直すので、その差ぶんだけ `tooLong` が増える
+    // (②の判定順では `mismatch` が先に立ち、`tooLong` に到達しないため)
+    [
+      "中立化の対象外",
+      NEUTRALIZE_SKIP_LABELS.map(
+        ([key, label]) => `${label} ${skippedRuns.filter((r) => r.reason === key).length}`,
+      ).join(" / "),
+    ],
+  ];
+}
+
 /**
  * 話者統計の見出し行。**画面の診断パネルと Markdown が同じ配列から描く**
  * (収音側の `trackSettingRows()` / `audioStatRows()` と同じ規則)。
@@ -383,8 +443,14 @@ export function speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo, di
     ["想定話者数", expectedSpeakerLabel(expectedSpeakers)],
     ["検出話者数", String(speakerStats.detected)],
     // **raw の検出数と別ラベルで併記する**(#48)。#46 の「診断は raw から」の原則は
-    // 崩さない — 主は raw の統計で、こちらは表示補正を通した後の従の値
-    ...(typeof displayDetected === "number" ? [["表示上の話者数", String(displayDetected)]] : []),
+    // 崩さない — 主は raw の統計で、こちらは表示補正を通した後の従の値。
+    //
+    // **「通常」を付けたのは値の意味が変わったため**(#50)。中立化した speaker は
+    // 画面にもエクスポートにも「話者C」としては出ないので数に入らない。旧ラベルのまま
+    // 意味だけ変えると、実機の記録を読み比べたときに同じ名前の別の数字が並ぶ
+    ...(typeof displayDetected === "number"
+      ? [["表示上の通常話者数", String(displayDetected)]]
+      : []),
     // **どちらの分母で割合を出したかを必ず書く。** 旧サーバー/旧セッションでは
     // word 数が無く文字数へ落ちるので、書いておかないと数値どうしを比較できない
     ["比率の基準", ratioBasisView(speakerStats.ratioBasis).basisLabel],
@@ -421,6 +487,7 @@ export function speakerDiagRows({
   expectedSpeakers,
   sttInfo,
   islandPlan,
+  unresolvedPlan,
   displayDetected,
 }) {
   if (!speakerStats || speakerStats.totalSegments <= 0) return [];
@@ -439,6 +506,8 @@ export function speakerDiagRows({
   for (const m of merges) {
     rows.push([`表示補正 ${m.from} → ${m.to}`, `${m.segments} seg / ${m.words} ${view.unit}`]);
   }
+  // 中立化(#50)は②の明細の後。**同じ計画から描く**ので Markdown と数字が割れることはない
+  rows.push(...unresolvedRows(unresolvedPlan, speakerStats.ratioBasis));
   for (const w of speakerWarnings(speakerStats, expectedSpeakers)) rows.push(["警告", w]);
   return rows;
 }
@@ -461,11 +530,13 @@ function speakerSection({
   sttInfo,
   startedAtMs,
   islandPlan,
+  unresolvedPlan,
   displayDetected,
 }) {
   if (!speakerStats || speakerStats.totalSegments <= 0) return [];
   const warnings = speakerWarnings(speakerStats, expectedSpeakers);
   const islandRows = minorIslandRows(islandPlan, speakerStats.ratioBasis);
+  const neutralRows = unresolvedRows(unresolvedPlan, speakerStats.ratioBasis);
   const view = ratioBasisView(speakerStats.ratioBasis);
   const rows = speakerStats.speakers.map((s) => [
     String(s.speaker),
@@ -506,7 +577,9 @@ function speakerSection({
       : []),
     // **表示補正の節は「行データ」を画面パネルと共有する**(見出し行は同じ配列から描き、
     // from/to の明細だけ Markdown では表にする — speaker の表と同じ形)。
-    // 計画を渡されていなければ節ごと出さない(「補正0件」と紛れないため)
+    // 計画を渡されていなければ節ごと出さない(「補正0件」と紛れないため)。
+    // **②の行だけで判定してよい**: ②③の計画は `planDisplayCorrection()` の1回の計算から
+    // 来るので、「②は無いが③はある」という組み合わせは作れない
     ...(islandRows.length
       ? [
           "### 表示補正（minor island）",
@@ -522,6 +595,9 @@ function speakerSection({
                 ...islandPlan.merges.map((m) => `| ${m.from} | ${m.to} | ${m.segments} | ${m.words} |`),
                 "",
               ]),
+          // 中立化(#50)は②の明細の後。**画面パネルと同じ行データ**から描く
+          ...neutralRows.map(([k, v]) => `- ${k}: ${v}`),
+          ...(neutralRows.length ? [""] : []),
         ]
       : []),
   ];
@@ -553,7 +629,8 @@ function speakerSection({
  * @param expectedSpeakers 想定話者数の選択値(#46)
  * @param sttInfo `ServerMessage.stt_info` の中身(#46)
  * @param islandPlan `planMinorIslandMerges()` の戻り(#48)。渡さなければ節ごと出ない
- * @param displayDetected 表示補正後の話者数(`displaySpeakerCount()`、#48)
+ * @param unresolvedPlan `planUnresolvedMinors()` の戻り(#50)。渡さなければ中立化の行が出ない
+ * @param displayDetected 表示上の**通常**話者数(`planDisplayCorrection()`、#48 / #50)
  */
 export function buildDiagnosticsMarkdown({
   modeLabel,
@@ -567,6 +644,7 @@ export function buildDiagnosticsMarkdown({
   expectedSpeakers,
   sttInfo,
   islandPlan,
+  unresolvedPlan,
   displayDetected,
 }) {
   const settingRows = trackSettingRows(trackSettings, contextSampleRate);
@@ -601,6 +679,7 @@ export function buildDiagnosticsMarkdown({
       sttInfo,
       startedAtMs,
       islandPlan,
+      unresolvedPlan,
       displayDetected,
     }),
     "> 会話本文と音声は含みません。",
