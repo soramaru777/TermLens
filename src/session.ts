@@ -138,7 +138,12 @@ export class Session {
 
     const stt = createSttAdapter();
     this.stt = stt;
+    // stop -> start が短時間に続くと、停止済みアダプタの start() 完了や
+    // キュー済みイベントが新しいセッション開始後に届くことがある。
+    // フィールド上の現行アダプタと一致する間だけクライアントへ中継する。
+    const isCurrent = () => this.stt === stt;
     stt.onTranscript((e) => {
+      if (!isCurrent()) return;
       this.send({
         type: "transcript",
         text: e.text,
@@ -155,7 +160,9 @@ export class Session {
       });
       if (e.isFinal) builder.addFinal(e);
     });
-    stt.onUtteranceEnd(() => builder.utteranceEnd());
+    stt.onUtteranceEnd(() => {
+      if (isCurrent()) builder.utteranceEnd();
+    });
     // final ごとに累計へ足して、そのまま送る(#52)。
     //
     // **スプレッド(`...snapshot`)にしないこと。** `stt_info` とまったく同じ理由で、
@@ -165,6 +172,7 @@ export class Session {
     // 文字数だけ」という主張は、型に書き・ここにも書くまで進まないと外へ出ないという
     // 2層で守る
     stt.onSplitDiag((diag) => {
+      if (!isCurrent()) return;
       this.integrity.add(diag);
       const s = this.integrity.snapshot();
       this.send({
@@ -189,21 +197,31 @@ export class Session {
     // 「型に書き、ここにも書く」まで進まないと外へ出ない
     // (`toSttInfo()` の採用リストと合わせて2層。`diagnostics.js` の `TRACK_KEYS` が
     // `pickTrackSettings()` と `trackSettingRows()` の2層で守っているのと同じ密度にする)
-    stt.onSttInfo((info) =>
-      this.send({ type: "stt_info", model: info.model, diarizer: info.diarizer }),
-    );
+    stt.onSttInfo((info) => {
+      if (isCurrent()) {
+        this.send({ type: "stt_info", model: info.model, diarizer: info.diarizer });
+      }
+    });
     stt.onError((err) => {
+      if (!isCurrent()) return;
       console.error("[session] STT error:", err);
       this.send({ type: "error", code: "stt_error", message: err.message });
     });
-    stt.onClose(() => this.send({ type: "status", state: "stt_closed" }));
+    stt.onClose(() => {
+      if (isCurrent()) this.send({ type: "status", state: "stt_closed" });
+    });
 
     this.send({ type: "status", state: "stt_connecting" });
     try {
       await stt.start({ keywords: glossary });
+      // start 待機中に stopSession() がこのアダプタを外していたら、旧セッションの
+      // stt_open / ready を送らない。送ると新セッションが準備前に音声送信を始める。
+      if (!isCurrent()) return;
       this.send({ type: "status", state: "stt_open" });
       this.send({ type: "ready" });
     } catch (err) {
+      // 停止済みの start が遅れて失敗しても、新しいセッションへエラーを混ぜない。
+      if (!isCurrent()) return;
       console.error("[session] STT start failed:", err);
       this.stt = null;
       this.send({ type: "error", code: "stt_error", message: (err as Error).message });
