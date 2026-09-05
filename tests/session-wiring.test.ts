@@ -233,6 +233,58 @@ test("stop したとき、閉じる発話が無ければ何も渡さない", asy
   }
 });
 
+test("接続開始中に stop -> start しても旧 STT の ready とイベントを混ぜない", async () => {
+  let releaseFirstStart!: () => void;
+  const firstStart = new Promise<void>((resolve) => {
+    releaseFirstStart = resolve;
+  });
+  let startCount = 0;
+  const transcriptCallbacks: Array<(e: TranscriptEvent) => void> = [];
+  const spies: Array<{ mock: { restore: () => void } }> = [
+    mock.method(MockSttAdapter.prototype, "start", async () => {
+      startCount++;
+      if (startCount === 1) await firstStart;
+    }),
+    mock.method(MockSttAdapter.prototype, "stop", async () => {}),
+    mock.method(MockSttAdapter.prototype, "onTranscript", (cb: (e: TranscriptEvent) => void) => {
+      transcriptCallbacks.push(cb);
+    }),
+  ];
+  const ws = new FakeWs();
+  new Session(ws as never);
+
+  try {
+    ws.clientSend({ type: "start", glossary: [] });
+    await settle();
+    assert.equal(startCount, 1, "最初の STT 接続待ちに入っていない");
+
+    ws.clientSend({ type: "stop" });
+    await settle();
+    ws.clientSend({ type: "start", glossary: [] });
+    await settle();
+
+    assert.equal(ws.sent.filter((m) => m.type === "ready").length, 1, "新 STT の ready が無い");
+    transcriptCallbacks[0]!(fin("旧セッションの遅延イベント", 0));
+    assert.equal(
+      ws.sent.filter((m) => m.type === "transcript").length,
+      0,
+      "停止済み STT のイベントが新セッションへ混入した",
+    );
+
+    releaseFirstStart();
+    await settle();
+    assert.equal(
+      ws.sent.filter((m) => m.type === "ready").length,
+      1,
+      "停止済み STT の start 完了が ready を二重送信した",
+    );
+  } finally {
+    releaseFirstStart();
+    ws.emit("close");
+    for (const spy of spies) spy.mock.restore();
+  }
+});
+
 // ---- finalSeq の採番（#36） ----
 //
 // クライアントは「同じ final 由来か」を `finalSeq` だけで判定し、話者ラベルの揺れで
@@ -551,4 +603,3 @@ test("text_integrity のキーは採用リストで、余分な値を通さな�
     h.restore();
   }
 });
-
