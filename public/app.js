@@ -531,6 +531,13 @@ function connectWs(token, glossary) {
         everReady = true;
         if (reconnectAttempt > 0) {
           finalLines.push({ type: "reconnect", t: Date.now() });
+          // **テキスト完全性の累計も捨てる**(#52)。①②を持つサーバー側の `SplitIntegrity` は
+          // この新しいセッションで 0 から数え直すのに、ここを残すと前のセッションの
+          // 大きい累計が①②に居座る。③④は再接続以降だけを数えるので、新しい final が
+          // 1件届くまで「①②＝前セッション分 / ③④＝0」という組み合わせが表示され、
+          // 判定文が「クライアントが取りこぼしている」と言う — **何も落ちていないのに**。
+          // null に戻せば次の1件が届くまで節ごと出ない（「0件」と「未取得」を混同しない）
+          textIntegrity = null;
           renderTranscript();
           scheduleSessionSave();
         }

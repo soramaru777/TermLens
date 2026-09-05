@@ -335,6 +335,29 @@ test("テキスト完全性の累計は保存も持ち越しもしない", () =>
   assert.match(reset, /textIntegrity = null/, "開始のたびに初期化していない");
 });
 
+/**
+ * **再接続では累計も捨てる。**
+ *
+ * ①②を持つサーバー側の `SplitIntegrity` は新しい WS で 0 から数え直すのに、クライアントが
+ * 前のセッションの累計を保持したままだと、③④（再接続以降だけを数える）が 0 の状態で
+ * ①②だけが大きい表になる。判定文は「②→③ で N 文字減少 → クライアントが取りこぼしている」
+ * と言うが、**何も落ちていない**。新しい final が1件届くまで節ごと出さないのが正しい。
+ *
+ * ③④を境界で切るのと同じ問題の裏返しなので、**印を積む場所と同じ分岐で**捨てる。
+ */
+test("再接続したらテキスト完全性の累計も捨てる", () => {
+  const onMessage = fnBody("connectWs");
+  const push = 'finalLines.push({ type: "reconnect", t: Date.now() });';
+  const i = onMessage.indexOf(push);
+  assert.ok(i >= 0, "再接続の印を積む分岐が見つからない");
+  // 印を積む直後で捨てる。別の場所へ離すと、片方だけ通る経路を後から足せてしまう
+  assert.match(
+    onMessage.slice(i, i + 600),
+    /textIntegrity = null/,
+    "再接続の分岐で累計を捨てていない",
+  );
+});
+
 // ---- 収音モードと診断（#26） ----
 
 test("getUserMedia の constraints は capture-mode.js から取る", () => {
