@@ -324,6 +324,16 @@ const ISLAND_DISABLED_LABELS = {
 };
 
 /**
+ * 見送り理由の内訳を `<表示名> <件数> / …` の 1 セルにする。②③⓪の 3 つの内訳が同じ形で
+ * 出るのは、ここ 1 か所で整形しているから(区切りや欠損時の扱いを変えるときに 3 か所を直さない)。
+ * @param labels 順序付きの `[key, label]` の列
+ * @param countOf キー → 件数
+ */
+function skipBreakdown(labels, countOf) {
+  return labels.map(([key, label]) => `${label} ${countOf(key)}`).join(" / ");
+}
+
+/**
  * 見送った理由の表示名。**順序も含めてここが定義箇所。**
  * 内訳を出さないと「`run が長い` が多い ⇒ `MINOR_ISLAND_MAX_WORDS` が狭すぎる」のような
  * 読み方ができず、人が実データから閾値を決められない。
@@ -365,8 +375,52 @@ function minorIslandRows(islandPlan, ratioBasis) {
     ...(islandPlan.others?.length ? [["対象外 speaker", islandPlan.others.join(", ")]] : []),
     [
       "表示補正の見送り",
-      ISLAND_SKIP_LABELS.map(([key, label]) => `${label} ${skipped[key] ?? 0}`).join(" / "),
+      skipBreakdown(ISLAND_SKIP_LABELS, (key) => skipped[key] ?? 0),
     ],
+  ];
+}
+
+// ---- 表示補正(speaker boundary)の診断(#55) ----
+//
+// ⓪は想定話者数のゲートを持たないので「無効」の行は無い。**計画を渡されていなければ
+// 行ごと出さない**(「補正0件」と紛れないため。②と同じ規律)。
+// 単位は常に文字数 — 行に `w` があっても断片の一部を word 数では表せない。
+
+/**
+ * 見送った理由の表示名。**順序も含めて `[key, label]` の列**(②の `ISLAND_SKIP_LABELS` と同じ形)。
+ * キーの定義箇所は `utterances.js` の `BOUNDARY_SKIP_REASONS` で、この表がそれと一致することは
+ * `tests/diagnostics.test.ts` が `smoothSpeakerBoundaries([]).plan.skipped` のキー列と突き合わせて
+ * 固定する(理由を足して表示名を付け忘れると、その件数が診断から黙って消えるため)。
+ *
+ * `曖昧` が多ければ両隣が長い形(`A長 | X短 | B長`)が多く追加ゲート(文字種の連続性)の検討材料、
+ * `隣も断片` が多ければ断片の連鎖が多く 2 パス目の検討材料、`相槌語彙` が多ければ語彙リストが
+ * 効いている、のように**実データから閾値と語彙を決めるための材料**なので、内訳を必ず出す。
+ * 長い行は断片候補にならないだけで内訳には入らない(`boundaryFragmentTarget()` のコメント参照)。
+ */
+export const BOUNDARY_SKIP_LABELS = Object.freeze([
+  ["ambiguous", "曖昧"],
+  ["shortNeighbor", "隣も断片"],
+  ["punctuated", "句読点で閉じている"],
+  ["backchannel", "相槌語彙"],
+  ["differentFinal", "隣が別 final"],
+  ["boundary", "再接続境界"],
+  ["unknown", "話者不明"],
+  ["noSeq", "seq なし"],
+]);
+
+/**
+ * 境界平滑化の見出し行。**画面パネルと Markdown が同じ配列から描く**(既存の規則)。
+ * 出るのは件数・文字数・理由名だけで、会話本文も speaker 番号の明細も出さない
+ * (speaker ごとの明細は②と違って閾値決めの材料にならない)。
+ * 計画は `planDisplayCorrection()` の同じ計算からしか来ず永続化もされないので、
+ * `applied` / `skipped` の欠損は想定しない(②の `?? {}` は保存データ由来の経緯があるが、⓪は新規)。
+ */
+function boundaryRows(boundaryPlan) {
+  if (!boundaryPlan) return [];
+  const chars = boundaryPlan.applied.reduce((n, a) => n + a.chars, 0);
+  return [
+    ["表示補正（speaker boundary）", `${boundaryPlan.applied.length} seg / ${chars} 文字`],
+    ["境界補正の見送り", skipBreakdown(BOUNDARY_SKIP_LABELS, (key) => boundaryPlan.skipped[key])],
   ];
 }
 
@@ -422,9 +476,7 @@ function unresolvedRows(unresolvedPlan, ratioBasis) {
     // (②の判定順では `mismatch` が先に立ち、`tooLong` に到達しないため)
     [
       "中立化の対象外",
-      NEUTRALIZE_SKIP_LABELS.map(
-        ([key, label]) => `${label} ${skippedRuns.filter((r) => r.reason === key).length}`,
-      ).join(" / "),
+      skipBreakdown(NEUTRALIZE_SKIP_LABELS, (key) => skippedRuns.filter((r) => r.reason === key).length),
     ],
   ];
 }
@@ -486,6 +538,7 @@ export function speakerDiagRows({
   speakerStats,
   expectedSpeakers,
   sttInfo,
+  boundaryPlan,
   islandPlan,
   unresolvedPlan,
   displayDetected,
@@ -499,6 +552,8 @@ export function speakerDiagRows({
       `${pct1(s.ratio)} (${view.value(s)} ${view.unit} / ${s.segments} seg)`,
     ]);
   }
+  // ⓪(#55)はパイプラインの順に②の前。**②の有無で⓪を判定しない**(⓪にはゲートが無い)
+  rows.push(...boundaryRows(boundaryPlan));
   rows.push(...minorIslandRows(islandPlan, speakerStats.ratioBasis));
   // Markdown は from/to を表で出すが、画面パネルには表が無いので1行ずつ出す
   // (speaker ごとの行と同じ扱い。**同じ計画から描く**ので数字が割れることはない)
@@ -518,6 +573,11 @@ function table(rows) {
   return ["| 項目 | 値 |", "|---|---|", ...rows.map(([k, v]) => `| ${k} | ${v} |`), ""];
 }
 
+/** 見出し行(`[label, value]`)を Markdown の箇条書きにする。画面パネルと同じ配列から描く規則の Markdown 側 */
+function bullets(rows) {
+  return rows.map(([k, v]) => `- ${k}: ${v}`);
+}
+
 /**
  * 「話者分離の診断」セクション(#46)。**発話が1件も無ければセクションごと出さない。**
  *
@@ -529,12 +589,14 @@ function speakerSection({
   expectedSpeakers,
   sttInfo,
   startedAtMs,
+  boundaryPlan,
   islandPlan,
   unresolvedPlan,
   displayDetected,
 }) {
   if (!speakerStats || speakerStats.totalSegments <= 0) return [];
   const warnings = speakerWarnings(speakerStats, expectedSpeakers);
+  const bRows = boundaryRows(boundaryPlan);
   const islandRows = minorIslandRows(islandPlan, speakerStats.ratioBasis);
   const neutralRows = unresolvedRows(unresolvedPlan, speakerStats.ratioBasis);
   const view = ratioBasisView(speakerStats.ratioBasis);
@@ -550,9 +612,7 @@ function speakerSection({
   return [
     "## 話者分離の診断",
     "",
-    ...speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo, displayDetected }).map(
-      ([k, v]) => `- ${k}: ${v}`,
-    ),
+    ...bullets(speakerSummaryRows({ speakerStats, expectedSpeakers, sttInfo, displayDetected })),
     "",
     ...(warnings.length ? [...warnings, ""] : []),
     "| speaker | words | 割合 | 文字数 | segments | 初出 | 最終 |",
@@ -580,11 +640,14 @@ function speakerSection({
     // 計画を渡されていなければ節ごと出さない(「補正0件」と紛れないため)。
     // **②の行だけで判定してよい**: ②③の計画は `planDisplayCorrection()` の1回の計算から
     // 来るので、「②は無いが③はある」という組み合わせは作れない
+    // ⓪(#55)は②の手前。**②の節の有無で⓪の節を判定しない** — ⓪は想定話者数のゲートが
+    // 無いので、②が無効(想定話者数が自動)でも⓪は出る。画面パネルと同じ行データから描く
+    ...(bRows.length ? ["### 表示補正（speaker boundary）", "", ...bullets(bRows), ""] : []),
     ...(islandRows.length
       ? [
           "### 表示補正（minor island）",
           "",
-          ...islandRows.map(([k, v]) => `- ${k}: ${v}`),
+          ...bullets(islandRows),
           "",
           ...(islandPlan.disabledBy || islandPlan.merges.length === 0
             ? []
@@ -596,7 +659,7 @@ function speakerSection({
                 "",
               ]),
           // 中立化(#50)は②の明細の後。**画面パネルと同じ行データ**から描く
-          ...neutralRows.map(([k, v]) => `- ${k}: ${v}`),
+          ...bullets(neutralRows),
           ...(neutralRows.length ? [""] : []),
         ]
       : []),
@@ -818,6 +881,7 @@ function textIntegritySection({ integrity, received, displayed }) {
  * @param speakerStats `collectSpeakerStats()` の戻り(#46)
  * @param expectedSpeakers 想定話者数の選択値(#46)
  * @param sttInfo `ServerMessage.stt_info` の中身(#46)
+ * @param boundaryPlan `planDisplayCorrection()` の `boundaryPlan`(#55)。渡さなければ節ごと出ない
  * @param islandPlan `planMinorIslandMerges()` の戻り(#48)。渡さなければ節ごと出ない
  * @param unresolvedPlan `planUnresolvedMinors()` の戻り(#50)。渡さなければ中立化の行が出ない
  * @param displayDetected 表示上の**通常**話者数(`planDisplayCorrection()`、#48 / #50)
@@ -836,6 +900,7 @@ export function buildDiagnosticsMarkdown({
   speakerStats,
   expectedSpeakers,
   sttInfo,
+  boundaryPlan,
   islandPlan,
   unresolvedPlan,
   displayDetected,
@@ -874,6 +939,7 @@ export function buildDiagnosticsMarkdown({
       expectedSpeakers,
       sttInfo,
       startedAtMs,
+      boundaryPlan,
       islandPlan,
       unresolvedPlan,
       displayDetected,
