@@ -103,7 +103,7 @@ export const MIN_TOTAL_WORDS_FOR_ISLANDS = 200;
 // これだった(文字は 1 つも落ちておらず、語の途中で段落が切れている)。
 
 /**
- * 断片と見なす最大文字数(#55)。
+ * 通常断片と見なす最大文字数(#55)。
  *
  * `JITTER_CHAR_LIMIT`(4)より 1 小さい。⓪は「前後が同じ話者に挟まれている」という証拠が
  * 1 つ少ないぶん、寄せてよい長さを狭く取る。ここを広げても**テキストは消えない**
@@ -113,22 +113,46 @@ export const MIN_TOTAL_WORDS_FOR_ISLANDS = 200;
 export const BOUNDARY_FRAGMENT_CHAR_LIMIT = 3;
 
 /**
- * 断片の末尾にあれば「閉じた独立発話」と見なす句読点(#55)。
- * 「はい。」のように閉じていれば、短くても語の途中で切れたのではない。
+ * 拡張断片(4〜5 文字)の上限(#57)。この長さの行は、同じ final に**これより長い本体(anchor)**が
+ * あって、境目の文字種の連続性が「中」以上のときだけ寄せられる。通常断片より証拠を 1 つ多く要求する。
+ * `JITTER_CHAR_LIMIT`(4)を超えるので、同じ final の中で長い同じ話者に挟まれた 4 文字の島は
+ * ⓪が先に寄せ、①の出番が減る(結果の speaker は同じで矛盾しない)。
+ */
+export const BOUNDARY_EXTENDED_CHAR_LIMIT = 5;
+
+/**
+ * 1 つの chain / run でまとめて寄せる行の総文字数の上限(#57)。「短い語の応酬」を丸ごと
+ * 隣の話者へ吸う事故を止める総量ゲート。超えたら `chainTooLong` に数える。
+ */
+export const BOUNDARY_CHAIN_MAX_CHARS = 8;
+
+/**
+ * 文字種の連続性(`continuity()`)を「語の途中」と認める最低の強さ(#57)。4〜5 文字の断片と
+ * 句読点で閉じた行にだけ効く。表の中で最も緩い「ひらがな → ひらがな」もこの値に含まれるので、
+ * 診断の `4〜5文字` の適用が不自然に多ければ、語彙より先にここを `strong` へ上げることを検討する。
+ */
+export const BOUNDARY_CONTINUITY_MIN = "medium";
+
+/**
+ * 「閉じた独立発話」の印になる句読点(#55)。#57 で**絶対条件ではなくなった** — 語の途中で
+ * speaker が切れてその後半に句読点が付く形(`専門スキ | ルです。`)があるため、句読点で閉じた行は
+ * 「直前の行との文字種の連続性」を語尾の証拠として要求する(無ければ従来どおり `punctuated`)。
+ * 相槌語彙の判定はこの句読点を剥がしてから行う。
  */
 export const BOUNDARY_PUNCTUATION = "。、？！?!";
 
 /**
- * 相槌として独立させる短い語彙(#55)。⓪が「同じ final の中の短い断片」を隣の話者へ寄せるとき、
- * この語だけは寄せない。
+ * 相槌・独立短文として独立させる語彙(#55 / #57)。⓪が「同じ final の中の短い行」を隣の話者へ
+ * 寄せるとき、この語だけは寄せない。**末尾の句読点を剥がして完全一致で引く**(`はい。` → `はい`)。
  *
  * ⓪の証拠は「同じ final に入っている」ことだけで、①jitter のように前後で挟まれてはいない。
  * 相手の相槌が endpointing の無音を挟まず同じ final に混ざると、証拠の上では
  * 「語の途中で切れた断片」と区別が付かない。語彙で弾くのはそのための最後のゲート。
  *
- * **`BOUNDARY_FRAGMENT_CHAR_LIMIT` 以下の語だけを載せる。** それより長い語は長さのゲートで
+ * **`BOUNDARY_EXTENDED_CHAR_LIMIT` 以下の語だけを載せる。** それより長い語は長さのゲートで
  * 先に落ちるので、ここに書いても効かない(書くと効いているように読める)。テストで固定している。
- * ⓪の調整つまみ(文字数・句読点・語彙)はすべてこの節にまとめ、他のファイルに散らさない。
+ * 4〜5 文字の語(#57 で追加)は暫定の初期リストで、実機の診断を見て調整する。
+ * ⓪の調整つまみ(文字数・総量・句読点・語彙・連続性)はすべてこの節にまとめ、他のファイルに散らさない。
  */
 export const BACKCHANNEL_WORDS = Object.freeze([
   "はい",
@@ -142,6 +166,24 @@ export const BACKCHANNEL_WORDS = Object.freeze([
   "はー",
   "ほう",
   "ふむ",
+  "なるほど",
+  "そうです",
+  "そうですね",
+  "はいはい",
+  "了解です",
+  "ですよね",
+  "わかった",
+  "ありがとう",
+  "お疲れ様",
+  // 以下はひらがなだけの頻出相槌(#57 レビュー)。文字種の表で「ひらがな → ひらがな」を「中」に
+  // しているため、語彙に無いと 6 文字以上のひらがな始まりの行が同じ final にあるだけで寄ってしまう
+  "うんうん",
+  "そうそう",
+  "たしかに",
+  "ちょっと",
+  "えっと",
+  "えーと",
+  "あのー",
 ]);
 
 /** 再接続の区切り印。発話ではないので結合にも補正にも参加させない。 */
@@ -149,8 +191,10 @@ const isReconnect = (line) => line?.type === "reconnect";
 
 /** 話者が確定している行か。`speaker` は不明なら null / undefined で来る。 */
 const hasSpeaker = (line) => line != null && line.speaker != null;
+/** 行のテキスト。復元データで `text` が欠けた行は空文字として扱う */
+const lineText = (line) => String(line?.text ?? "");
 /** 行の長さ。**素の `length`**(空白を除かない)で、①の閾値も⓪の閾値も診断の文字数もこれで測る */
-const textLength = (line) => String(line?.text ?? "").length;
+const textLength = (line) => lineText(line).length;
 
 /**
  * `line` が前後(`prev` / `next`)に挟まれた話者ラベルの揺れかどうか。
@@ -230,11 +274,24 @@ export function smoothSpeakerJitter(lines) {
   return out;
 }
 
-// ---- 第0段: 同じ final の中で語の途中に入った speaker 境界の平滑化(#55) ----
+// ---- 第0段: 同じ final の中で語の途中に入った speaker 境界の平滑化(#55 / #57) ----
 //
 // 補正するのは speaker ラベルだけで、テキストも行数も変えない(#36 と同じ規律)。
 // **別の final は絶対に跨がない。** 別の final として届いた「はい」(endpointing の無音を
 // 挟んだ本物の相槌)は `seq` が違うので、①と同じ理由で構造的に吸収されない。
+//
+// #57 で判定の単位を「1 行」から「同じ final の中で連続する短い行の run(chain)」に変えた。
+// 判定は 2 段で、(a) が成立すれば (b) は走らない。
+//
+//   (a) `BOUNDARY_EXTENDED_CHAR_LIMIT` より長い行を anchor とし、その間の chain をまとめて判定する。
+//       4〜5 文字の行(拡張断片)も chain の一員 = 寄せられる側になる
+//   (b) (a) で寄せ先が決まらなければ、4 文字以上の行を本体・3 文字以下の行だけを断片とする
+//       #55 の規則に落とす。断片の連鎖(run)はまとめて寄せる
+//
+// (a) は「6 文字以上の本体が同じ final にある」という #55 より強い証拠を要求しているので、
+// 両者の結果が食い違う形(`A長 | B:4〜5文字 | A:短`)では (a) を優先する。(b) を残すのは
+// **4〜5 文字の行を一律に断片にすると #55 で本体だった行が断片になる**ため — `今日は | 晴れですね`
+// のような「短い断片 + 4〜5 文字の本体」は (b) で従来どおり寄る。
 
 /** 理由キーの列から 0 埋めの内訳を作る。②③⓪の「0 でも必ず全キーを出す」を 1 か所で満たす */
 const zeroCounts = (keys) => Object.fromEntries(keys.map((key) => [key, 0]));
@@ -244,22 +301,28 @@ const zeroCounts = (keys) => Object.fromEntries(keys.map((key) => [key, 0]));
  * 表示名は `diagnostics.js` が持つ)。表示名の表がこの列と一致することはテストで固定する —
  * 理由を足して表示名を付け忘れると、その件数が診断から黙って消えるため。
  *
- * - `ambiguous` … 両隣が同じ final の長い行で speaker が異なる(`A長 | X短 | B長`)
- * - `shortNeighbor` … 隣も断片の長さで、どちらが本体か決められない(断片の連鎖)
- * - `punctuated` … 末尾が句読点で閉じている
- * - `backchannel` … 相槌語彙
+ * **既存のキーは改名しない**(#57)。過去セッションの診断 Markdown と件数を比べられなくなる。
+ *
+ * - `ambiguous` … 両側の anchor が別 speaker で、chain が「既に割れている」形でもない
+ * - `unresolvedChain` … 両側に寄せ先が無い run(隣がすべて断片、または final の全体が断片)。
+ *   #55 の `shortNeighbor` を置き換えた(断片の連鎖は run として判定するので「隣も断片」は理由にならない)
+ * - `chainTooLong` … 寄せる行の総文字数が `BOUNDARY_CHAIN_MAX_CHARS` を超えた
+ * - `weakContinuity` … 4〜5 文字の断片で、境目の文字種の連続性が「中」に届かない
+ * - `punctuated` … 句読点で閉じていて、前の語の続きである証拠(直前との連続性)が無い
+ * - `backchannel` … 相槌・独立短文の語彙(句読点を剥がして一致)
  * - `differentFinal` … 隣が別の final
  * - `boundary` … 隣が再接続の印
  * - `unknown` … 断片自身か隣の speaker が不明
  * - `noSeq` … `seq` の無い旧セッションの行
  *
- * `ambiguous` と `shortNeighbor` を分けるのは、内訳が「閾値と語彙を決める唯一の材料」だから。
- * 前者が多ければ文字種の連続性(案2)のような追加ゲートの検討材料、後者が多ければ 2 パス目の
- * 検討材料で、混ぜると「寄せられなかった」としか読めない。
+ * 内訳は「閾値と語彙を決める唯一の材料」。理由ごとの読み方は Wiki(`termlens-stt-pipeline` の
+ * ⓪の節)に 1 か所だけ書く。
  */
 const BOUNDARY_SKIP_REASONS = [
   "ambiguous",
-  "shortNeighbor",
+  "unresolvedChain",
+  "chainTooLong",
+  "weakContinuity",
   "punctuated",
   "backchannel",
   "differentFinal",
@@ -270,25 +333,244 @@ const BOUNDARY_SKIP_REASONS = [
 const emptyBoundarySkipped = () => zeroCounts(BOUNDARY_SKIP_REASONS);
 
 /**
- * 断片の長さか。**空文字は断片ではない**(寄せる文字が無い。`split.ts` は空を送らないので
+ * 行の段(tier)。**空文字は断片ではない**(寄せる文字が無い。`split.ts` は空を送らないので
  * 復元データだけの経路だが、`chars: 0` の適用が診断に載ると読めない)。
+ *
+ * - `0` … 対象外(`BOUNDARY_EXTENDED_CHAR_LIMIT` より長い / 空 / 再接続の印)。(a) の anchor
+ * - `1` … 通常断片(`BOUNDARY_FRAGMENT_CHAR_LIMIT` 以下)。(a)(b) どちらでも寄せられる側
+ * - `2` … 拡張断片(4〜5 文字)。(a) では寄せられる側、(b) では本体(寄せ先)
  */
-const isFragmentLength = (line) => {
+function fragmentTier(line) {
+  if (line == null || isReconnect(line)) return 0;
   const n = textLength(line);
-  return n > 0 && n <= BOUNDARY_FRAGMENT_CHAR_LIMIT;
-};
+  if (n === 0) return 0;
+  if (n <= BOUNDARY_FRAGMENT_CHAR_LIMIT) return 1;
+  return n <= BOUNDARY_EXTENDED_CHAR_LIMIT ? 2 : 0;
+}
+
+/**
+ * 同じ final か。`seq` の無い行(#36 以前に保存されたセッション)は「同じ final」を確かめられない
+ * ので、何とも同じ final にならない。時間窓へは落とさない — ⓪は挟まれていない分、①より弱い
+ * 証拠で動くため、緩い判定に落とすと本物の相槌を寄せる側へ倒れる。
+ */
+const sameSeq = (a, b) => typeof a === "number" && a === b;
+/** 隣 `n` が同じ final の発話行か(再接続の印と別 `seq` は隣として数えない)。(a) の anchor と内容ゲートの共通の述語 */
+const sameFinalNeighbor = (n, seq) => n != null && !isReconnect(n) && sameSeq(seq, n.seq);
+
+const isPunctuated = (text) => text.length > 0 && BOUNDARY_PUNCTUATION.includes(text.at(-1));
+/** 末尾の句読点を**すべて**剥がす(`はい。` → `はい`、`ね？！` → `ね`) */
+function stripTrailingPunctuation(text) {
+  let s = text;
+  while (s.length > 0 && BOUNDARY_PUNCTUATION.includes(s.at(-1))) s = s.slice(0, -1);
+  return s;
+}
+/**
+ * 相槌・独立短文の語彙に当たるか。**句読点を剥がしてから引く**(#57)。#55 は `text` の完全一致
+ * だったので `はい。` は語彙では弾けず、句読点ゲートに依存していた。句読点を絶対条件から
+ * 外した今、語彙が先に効かないと `A: 進めます。 | B: はい。 | A: 次です。` の `はい。` が寄る。
+ */
+const isBackchannel = (text) => BACKCHANNEL_WORDS.includes(stripTrailingPunctuation(text));
+
+/**
+ * 文字種。境界をまたぐ 2 文字の組み合わせから「語の途中で切れた確度」を出すためのもので、
+ * 辞書は使わない。範囲は Unicode のブロックで引く(長音「ー」はカタカナのブロック内、
+ * 「々」は漢字扱い)。`BOUNDARY_PUNCTUATION` と空白は `punct`。
+ */
+function charClass(ch) {
+  if (!ch) return "none";
+  if (BOUNDARY_PUNCTUATION.includes(ch) || /\s/.test(ch)) return "punct";
+  const code = ch.codePointAt(0);
+  if (code >= 0x3040 && code <= 0x309f) return "hiragana";
+  if ((code >= 0x30a0 && code <= 0x30ff) || (code >= 0x31f0 && code <= 0x31ff)) return "katakana";
+  if ((code >= 0x4e00 && code <= 0x9fff) || (code >= 0x3400 && code <= 0x4dbf) || ch === "々") {
+    return "kanji";
+  }
+  if (/[0-9A-Za-z０-９Ａ-Ｚａ-ｚ]/.test(ch)) return "latin";
+  return "other";
+}
+
+const CONTINUITY_RANK = Object.freeze({ none: 0, weak: 1, medium: 2, strong: 3 });
+
+/**
+ * 文字列の端の 1 文字(コードポイント単位。空なら `""`)。`String#at` は UTF-16 コード単位なので、
+ * サロゲートペアの漢字(CJK 拡張 B 以降)が孤立サロゲートになって `other`(= 弱)に落ちる。
+ * `[...text]` で全文を展開しない — 隣は長い anchor で、要るのは端の 1 文字だけ。
+ */
+const firstChar = (s) => (s.length === 0 ? "" : String.fromCodePoint(s.codePointAt(0)));
+function lastChar(s) {
+  if (s.length === 0) return "";
+  const lo = s.charCodeAt(s.length - 1);
+  const isPair = lo >= 0xdc00 && lo <= 0xdfff && s.length >= 2 && (s.charCodeAt(s.length - 2) & 0xfc00) === 0xd800;
+  return s.slice(isPair ? -2 : -1);
+}
+
+/**
+ * `prevText` の末尾と `nextText` の先頭の文字種から、境目が「語の途中」である強さを返す(#57)。
+ *
+ * | 前の末尾 → 後の先頭 | 強さ |
+ * |---|---|
+ * | カタカナ → カタカナ / 漢字 → 漢字 / 英数 → 英数 | `strong`(`スキ｜ル`、`専｜門`) |
+ * | 漢字 → ひらがな / ひらがな → ひらがな | `medium`(送り仮名・助詞。`始｜めていた`、`な｜ので`) |
+ * | ひらがな → 漢字 など上記以外 | `weak`(助詞 → 名詞は典型的な語境界。`です｜了解`) |
+ * | どちらかが句読点・空白・空 | `none` |
+ *
+ * 通常断片(3 文字以下)にはこのゲートを掛けない(#55 の挙動を変えない)。掛けるのは拡張断片と
+ * 句読点で閉じた行だけ。表は日本語前提で、英数は 1 クラスにまとめているだけ。
+ */
+export function continuity(prevText, nextText) {
+  const a = charClass(lastChar(String(prevText ?? "")));
+  const b = charClass(firstChar(String(nextText ?? "")));
+  if (a === "none" || b === "none" || a === "punct" || b === "punct") return "none";
+  if (a === b && (a === "katakana" || a === "kanji" || a === "latin")) return "strong";
+  if ((a === "kanji" || a === "hiragana") && b === "hiragana") return "medium";
+  return "weak";
+}
+const continuityOk = (level) => CONTINUITY_RANK[level] >= CONTINUITY_RANK[BOUNDARY_CONTINUITY_MIN];
+
+/**
+ * 候補行 `k` の内容ゲート。通れば `null`、落ちれば理由キー。
+ *
+ * 判定順は 語彙 → 句読点 → 文字種。**語彙を最初に見る**のは、`はい。` のように句読点付きの
+ * 相槌を「句読点で閉じている」ではなく「相槌語彙」に数えるため(語彙リストを調整する材料は
+ * 「語彙が無ければ寄っていた」数でなければならない)。
+ *
+ * - 句読点で閉じた行: **直前の行との境目**が中以上で、直前の行が句読点で閉じていなければ通る。
+ *   「次の行との境目」は見ない — 句読点で閉じた行の後ろに続く語は無い
+ * - 拡張断片(4〜5 文字): 前後どちらかの境目が中以上なら通る(前後は同じ final の行に限る。
+ *   chain の中の行でも anchor でもよい)
+ * - 通常断片で句読点の無い行: 文字種は見ない(#55 と同じ)
+ */
+function contentGate(out, k, seq) {
+  const text = lineText(out[k]);
+  if (isBackchannel(text)) return "backchannel";
+  const neighborText = (n) => (sameFinalNeighbor(n, seq) ? lineText(n) : null);
+  const prevText = neighborText(out[k - 1]);
+  if (isPunctuated(text)) {
+    const tail =
+      prevText != null && !isPunctuated(prevText) && continuityOk(continuity(prevText, text));
+    return tail ? null : "punctuated";
+  }
+  if (fragmentTier(out[k]) === 2) {
+    const nextText = neighborText(out[k + 1]);
+    const ok =
+      (prevText != null && continuityOk(continuity(prevText, text))) ||
+      (nextText != null && continuityOk(continuity(text, nextText)));
+    if (!ok) return "weakContinuity";
+  }
+  return null;
+}
+
+/**
+ * 寄せた行の種別(#57)。**1 行 1 種類で、リスクの高い規則から優先して付ける** —
+ * 句読点を緩めた規則 → 4〜5 文字を対象にした規則 → 連鎖をまとめた規則 → #55 相当。
+ * 「どの新しい規則が寄せたか」を診断で見るための分類なので、危ない規則ほど上に置く。
+ */
+function appliedKind(line, groupSize) {
+  if (isPunctuated(lineText(line))) return "punctuated";
+  if (fragmentTier(line) === 2) return "extended";
+  return groupSize >= 2 ? "chain" : "basic";
+}
+/**
+ * 種別のキー。**順序も含めてここが定義箇所**(`BOUNDARY_SKIP_REASONS` と同じ流儀で、表示名は
+ * `diagnostics.js` の `BOUNDARY_KIND_LABELS`)。計画の `kinds` にこの順で 0 埋めの件数を出し、
+ * 表示名の表がこの列と一致することはテストで固定する。
+ */
+const BOUNDARY_APPLIED_KINDS = ["basic", "extended", "punctuated", "chain"];
+
+/** (a) の anchor: 同じ final で speaker が確定した、テキストのある行。無ければ `null` */
+function anchorSpeaker(n, seq) {
+  if (!sameFinalNeighbor(n, seq) || !hasSpeaker(n) || textLength(n) === 0) return null;
+  return n.speaker;
+}
+
+// ---- (a)(b) 共通: 寄せ先が決まった後の「候補 → 総量 → 内容ゲート → 適用」 ----
+//
+// 判定順(総量 → 内容)と「全部か無しか」の持ち主はここ 1 か所。(a) と (b) の違いは
+// **落ちた行のどれを数えるか**だけなので、それは呼び出し側に残す。
+
+/** `[s, e]` の中で寄せ先 `to` と speaker が異なる行(= 動かす候補)の添字 */
+function movers(out, s, e, to) {
+  const candidates = [];
+  for (let k = s; k <= e; k++) if (out[k].speaker !== to) candidates.push(k);
+  return candidates;
+}
+
+/**
+ * 候補行を総量 → 内容ゲートに掛ける。通れば `null`、落ちれば `[k, reason]` の列
+ * (総量超過は候補の全行が `chainTooLong`)。**1 行でも落ちたら全体を寄せない**(部分的に寄せると
+ * chain の途中で speaker が入れ替わり、観測より複雑な形を作る)。
+ */
+function gateFailures(out, candidates, seq) {
+  const chars = candidates.reduce((n, k) => n + textLength(out[k]), 0);
+  if (chars > BOUNDARY_CHAIN_MAX_CHARS) return candidates.map((k) => [k, "chainTooLong"]);
+  const failed = candidates.map((k) => [k, contentGate(out, k, seq)]).filter(([, r]) => r != null);
+  return failed.length > 0 ? failed : null;
+}
+
+/** 候補行をすべて `to` へ寄せる。`kind` は候補の本数で決まる(2 本以上なら `chain`) */
+function applyAll(out, candidates, to, apply) {
+  for (const k of candidates) apply(k, to, appliedKind(out[k], candidates.length));
+}
+
+/**
+ * (a) 長い anchor による chain の判定。**chain の外側の同じ final の行は tier 0 なので、
+ * 隣にあれば必ず anchor の長さ**(chain は tier > 0 の極大 run)。
+ *
+ * 戻り値は「この chain の判定を終えたか」。`true` なら (b) は走らない(寄せた / 既に割れていて
+ * 何もしない)。`false` なら (b) に落とす(anchor が無い / 両側が別 speaker / 総量超過 /
+ * 内容ゲートで落ちた)。
+ *
+ * **両側の anchor が別 speaker でも、chain が先頭から左の speaker・途中から右の speaker と
+ * 単調に並んでいれば「既に割れている」**(#55 の「同じ話者の本体に接している断片は対象外」の
+ * 一般化)。各行は自分の本体に接しているので何もしないし見送りにも数えない。
+ *
+ * 内容ゲートは **全部か無しか**。1 行でも落ちたら chain 全体を寄せない(部分的に寄せると chain の
+ * 途中で speaker が入れ替わり、観測より複雑な形を作る)。落ちた行のうち **拡張断片と句読点付きの
+ * 行だけ**ここで数える — 通常断片は (b) が改めて判定して数えるので、1 行を 2 度数えない。
+ * 拡張断片を数えるのは (a) の候補になったときだけ((b) では本体側)。数えないと
+ * 「4〜5 文字の行の大半が見送り」になって内訳が読めなくなる(#55 で長い行を数えない理由と同じ)。
+ */
+function resolveByAnchors(out, start, end, skip, apply) {
+  const seq = out[start].seq;
+  if (typeof seq !== "number") return false;
+  for (let k = start; k <= end; k++) if (!hasSpeaker(out[k])) return false;
+  const left = anchorSpeaker(out[start - 1], seq);
+  const right = anchorSpeaker(out[end + 1], seq);
+  if (left == null && right == null) return false;
+  if (left != null && right != null && left !== right) {
+    let k = start;
+    while (k <= end && out[k].speaker === left) k++;
+    while (k <= end && out[k].speaker === right) k++;
+    return k > end;
+  }
+  const to = left ?? right;
+  const candidates = movers(out, start, end, to);
+  if (candidates.length === 0) return true;
+  const failed = gateFailures(out, candidates, seq);
+  if (failed) {
+    // 数えるのは拡張断片と、内容ゲートで落ちた句読点付きの行だけ。通常断片は (b) が改めて判定して
+    // 数える(総量超過の通常断片も (b) の run の総量で数え直す)
+    for (const [k, reason] of failed) {
+      const counted = fragmentTier(out[k]) === 2 || (reason !== "chainTooLong" && isPunctuated(lineText(out[k])));
+      if (counted) skip(reason, k);
+    }
+    return false;
+  }
+  applyAll(out, candidates, to, apply);
+  return true;
+}
 
 /** `classifyNeighbor()` の戻り値: 同じ final の同じ話者の本体に接している(断片はその一部) */
 const ANCHOR = Object.freeze({ anchor: true });
 
 /**
- * 断片 `line` から見た隣 `n` を 1 つ分類する。**隣に対する判定はここ 1 か所**で、
- * `boundaryFragmentTarget()` は分類の組み合わせから結論を出すだけにする。
+ * (b) で run の端 `line` から見た隣 `n` を 1 つ分類する。#55 の規則そのもので、
+ * 「本体」は **4 文字以上**(tier 1 でない行)。
  *
  * - `null` … 境界ではない(端 / 同じ speaker の隣)。判定に参加しない
- * - `ANCHOR` … 同じ final の同じ speaker の長い行。断片はその本体の一部で、寄せる対象外
+ * - `ANCHOR` … 同じ final の同じ speaker の本体。断片はその一部で、寄せる対象外
  * - `{ reason }` … 境界だが寄せ先にならない(理由は `BOUNDARY_SKIP_REASONS` のキー)
- * - `{ to }` … 寄せ先の候補(同じ final の別 speaker の長い行)
+ * - `{ to }` … 寄せ先の候補(同じ final の別 speaker の本体)
  *
  * 判定順は **構造(seq・隣)を先に、内容(句読点・語彙)は呼び出し側で後に**。逆にすると
  * 「別 final の『はい』」が `backchannel` に数えられ、語彙リストを調整するための件数が
@@ -297,54 +579,97 @@ const ANCHOR = Object.freeze({ anchor: true });
 function classifyNeighbor(line, n) {
   if (n == null) return null;
   if (isReconnect(n)) return { reason: "boundary" };
-  // `seq` の無い行(#36 以前に保存されたセッション)は「同じ final」を確かめられないので、
-  // 何とも同じ final にならない。時間窓へは落とさない — ⓪は挟まれていない分、①より弱い
-  // 証拠で動くため、緩い判定に落とすと本物の相槌を寄せる側へ倒れる
-  const sameFinal = typeof line.seq === "number" && n.seq === line.seq;
-  if (n.speaker === line.speaker) return sameFinal && !isFragmentLength(n) ? ANCHOR : null;
+  const sameFinal = sameSeq(line.seq, n.seq);
+  if (n.speaker === line.speaker) return sameFinal && fragmentTier(n) !== 1 ? ANCHOR : null;
   if (!sameFinal) return { reason: "differentFinal" };
   if (!hasSpeaker(n)) return { reason: "unknown" };
-  if (isFragmentLength(n)) return { reason: "shortNeighbor" };
+  if (fragmentTier(n) === 1) return { reason: "unresolvedChain" };
   return { to: n.speaker };
 }
 
 /**
- * `line` が「同じ final の中で語の途中に入った境界の断片」なら寄せ先の speaker を返す。
+ * (b) #55 互換の判定を、通常断片の run `[s, e]` に当てる。
  *
- * 戻り値は 3 種類。
- * - `{ to, chars }` … 寄せる(`to` は隣の長い行の speaker、`chars` は断片の文字数)
- * - `{ reason }` … 断片ではあるが見送る(理由は `BOUNDARY_SKIP_REASONS` のキー)
- * - `null` … そもそも判定の対象外(長い行 / 空 / 再接続の印 / 境界に立っていない /
- *   同じ final の同じ話者の本体に接している)
+ * 1 行の run に対しては #55 の `boundaryFragmentTarget()` と同じ結果になる。run が 2 行以上の
+ * とき(`A:テ | A:キ | B:ストです`)は #55 が `キ` だけを寄せて `テ` を `shortNeighbor` にしていた
+ * 形で、run をまとめて寄せる(#57 のパターン 3)。
  *
- * **長い行は「見送り」に数えない。** 数えると全行の大半が見送りになり、閾値を決めるための
- * 内訳が読めなくなる。内訳に出るのは「断片の長さなのに寄せなかった行」だけ。
+ * 本体に接している側(`ANCHOR`)からは、その speaker の行を順に「本体の一部」として外す。
+ * `A長 | A:あ | A:い | B長` は両方 A の本体で、何もしない(#55 は 1 行の窓で `い` を B へ寄せていたが、
+ * raw が A と言っている連続を割る根拠は無い)。
  *
- * **同じ final の同じ speaker の長い行に既に接していれば対象外(`ANCHOR`)。** `A長 | A短 | B長`
- * (同じ seq)の `A短` は、反対側に別話者の長い行があっても A の本体の一部と見るのが自然で、
- * それを B へ引き剥がす向きに動いてはいけない。raw からこの形が出るのは `split.ts` の
- * 空セグメント除去や復元データに限られるが、ロジックの向きとして固定しておく。
- *
- * **両隣が同じ final の長い行で speaker が異なる**(`A長 | X短 | B長`)ならどちらへ寄せる根拠も
- * 無いので `ambiguous`。`A長 | X短 | A長` は両方とも A なので寄せる(①jitter と同じ結果になり
- * 矛盾しない)。
+ * 見送りの計上は **境界に立つ行**(隣と speaker が違う行)だけ。run の中で全行が同じ speaker で
+ * 両隣も境界でなければ、判定の対象外で何も数えない。run 全体の verdict(`noSeq` / `unknown` /
+ * `ambiguous` / 総量 / 内容ゲート)は境界に立つ全行に、側の理由(`differentFinal` / `boundary` /
+ * `unknown`)はその側に接する行だけに付け、残りの境界の行は `unresolvedChain` に数える。
  */
-function boundaryFragmentTarget(prev, line, next) {
-  if (isReconnect(line) || !isFragmentLength(line)) return null;
-  const sides = [prev, next].map((n) => classifyNeighbor(line, n)).filter((v) => v != null);
-  if (sides.length === 0 || sides.includes(ANCHOR)) return null;
-  if (typeof line.seq !== "number") return { reason: "noSeq" };
+function resolveRun(out, s, e, skip, apply) {
+  let left = classifyNeighbor(out[s], out[s - 1]);
+  let right = classifyNeighbor(out[e], out[e + 1]);
+  // 同じ話者の本体に接している側は run から刈り取り、**その本体を反対側の行の寄せ先にはしない**
+  // (`BODY(0) | あ(0) | い(1) | う(0) | BODY(0)` の `い` は寄らず `unresolvedChain`)。
+  // #55 も `shortNeighbor` で寄せていなかった形で、挟まれた 1 行は①jitter が拾う。
+  // 寄せ先にすると (b) が設計に無い「断片に挟まれた断片」まで動かすことになる
+  if (left === ANCHOR) {
+    const sp = out[s - 1].speaker;
+    while (s <= e && out[s].speaker === sp) s++;
+    left = { reason: "unresolvedChain" };
+  }
+  if (right === ANCHOR) {
+    const sp = out[e + 1].speaker;
+    while (e >= s && out[e].speaker === sp) e--;
+    right = { reason: "unresolvedChain" };
+  }
+  if (s > e) return;
+  const atBoundary = (k) =>
+    [out[k - 1], out[k + 1]].some(
+      (n) => n != null && (isReconnect(n) || n.speaker !== out[k].speaker),
+    );
+  const countAll = (reason) => {
+    for (let k = s; k <= e; k++) if (atBoundary(k)) skip(reason, k);
+  };
+  const sides = [left, right].filter((v) => v != null);
+  // 両隣が端か別 final の同じ話者。run の中に話者交代が無ければ `atBoundary()` が全行 false で何も数えない
+  if (sides.length === 0) return countAll("unresolvedChain");
+  if (typeof out[s].seq !== "number") return countAll("noSeq");
   // 断片自身の speaker が不明なら寄せない。①は不明行を prev で上書きするが、あちらは
   // 前後が同じ確定話者に挟まれている分だけ証拠が強い。こちらは「誰から」が無いまま
   // 隣へ寄せることになるので、`from` を持たない適用は作らない
-  if (!hasSpeaker(line)) return { reason: "unknown" };
+  for (let k = s; k <= e; k++) if (!hasSpeaker(out[k])) return countAll("unknown");
   const targets = sides.filter((v) => "to" in v).map((v) => v.to);
-  if (targets.length === 0) return { reason: sides[0].reason };
-  if (targets.length === 2 && targets[0] !== targets[1]) return { reason: "ambiguous" };
-  const text = String(line.text);
-  if (BOUNDARY_PUNCTUATION.includes(text.at(-1))) return { reason: "punctuated" };
-  if (BACKCHANNEL_WORDS.includes(text)) return { reason: "backchannel" };
-  return { to: targets[0], chars: text.length };
+  if (targets.length === 0) {
+    for (let k = s; k <= e; k++) {
+      if (k === s && left?.reason) skip(left.reason, k);
+      else if (k === e && right?.reason) skip(right.reason, k);
+      else if (atBoundary(k)) skip("unresolvedChain", k);
+    }
+    return;
+  }
+  if (targets.length === 2 && targets[0] !== targets[1]) return countAll("ambiguous");
+  const to = targets[0];
+  const candidates = movers(out, s, e, to);
+  if (candidates.length === 0) return;
+  const failed = gateFailures(out, candidates, out[s].seq);
+  if (failed) {
+    for (const [k, reason] of failed) skip(reason, k);
+    return;
+  }
+  applyAll(out, candidates, to, apply);
+}
+
+/** (b) chain の中の通常断片の run ごとに `resolveRun()` を当てる。拡張断片は run を切る本体 */
+function resolveByRuns(out, start, end, skip, apply) {
+  let s = start;
+  while (s <= end) {
+    if (fragmentTier(out[s]) !== 1) {
+      s++;
+      continue;
+    }
+    let e = s;
+    while (e + 1 <= end && fragmentTier(out[e + 1]) === 1) e++;
+    resolveRun(out, s, e, skip, apply);
+    s = e + 1;
+  }
 }
 
 /**
@@ -352,22 +677,24 @@ function boundaryFragmentTarget(prev, line, next) {
  * 引数の配列も要素も変更しない。**何も削除しない。** 直すのは `speaker` だけ。
  *
  * コピーは copy-on-write — 配列だけ複製し、寄せた行だけを新しいオブジェクトに差し替える。
- * ⓪が書き換えるのは「3 文字以下で境界に立つ断片」だけで全行のごく一部なのに、
+ * ⓪が書き換えるのは「境界に立つ短い行」だけで全行のごく一部なのに、
  * `renderTranscript()`(final のたび)と `renderDiagnostics()`(毎秒)から呼ばれるパイプラインに
  * 全行コピーをもう 1 段足す理由が無い(①が直後にどのみち全行コピーする)。
  *
- * 走査は左から 1 パスで、**補正済みの結果を次の判定に使う**(①と同じ規律)。
- * 2 パス目は持たない — `A:テ | A:キ | B:スト…` のように断片が連なる形は、`キ` が B に
- * 寄ったあと `テ` の隣が短い `キ` になるので寄らない。複数の断片の連鎖は証拠が弱く、
- * 寄せるほど誤統合の面積が増えるため、診断に `shortNeighbor` として残すに留める。
- * その `テ` を数えるため、寄せた直後に**直前の 1 行だけ**判定し直す(隣が変わったのは
- * その行だけで、変わった隣は断片の長さなので判定し直しても寄ることはない)。直前の行が
- * 既に数えられていれば(寄せた・見送った)判定し直さない — 二重計上しないのはこの 1 行だけ
- * なので、状態は「直前の 1 行が判定済みか」の 1 ビットで足りる。
+ * 走査は左から 1 パスで、**同じ `seq` の短い行(tier > 0)が続く限りを 1 つの chain として閉じてから
+ * 判定する**。寄せた結果は次の chain の判定に使う(①と同じ規律)が、chain は tier 0 の行で
+ * 切れるので、寄せても次の chain から見た anchor の speaker は変わらない。`seq` の無い行は
+ * 何とも同じ final にならず、1 行の chain になる。
+ *
+ * 見送りの計上は **1 行 1 理由**(`decided`)。(a) で数えた行を (b) で数え直さない。寄せた行が
+ * 後から数えられることは無い — (a) が寄せれば (b) は走らず、(b) の run どうしは重ならず、
+ * 同じ行の内容ゲートは (a) でも (b) でも同じ結果になる(見るのは同じ `out` の同じ隣)ため。
  *
  * @typedef {Record<string, number>} BoundarySkipped キーは `BOUNDARY_SKIP_REASONS`
+ * @typedef {Record<string, number>} BoundaryKinds キーは `BOUNDARY_APPLIED_KINDS`
  * @typedef {{
- *   applied: Array<{index:number, from:number, to:number, chars:number}>,
+ *   applied: Array<{index:number, from:number, to:number, chars:number, kind:string}>,
+ *   kinds: BoundaryKinds,
  *   skipped: BoundarySkipped,
  * }} BoundaryPlan
  * @returns {{ lines: Array<Record<string, any>>, plan: BoundaryPlan }}
@@ -375,25 +702,33 @@ function boundaryFragmentTarget(prev, line, next) {
 export function smoothSpeakerBoundaries(lines) {
   const out = lines.slice();
   const applied = [];
+  const kinds = zeroCounts(BOUNDARY_APPLIED_KINDS);
   const skipped = emptyBoundarySkipped();
-  const record = (i) => {
-    const verdict = boundaryFragmentTarget(out[i - 1], out[i], out[i + 1]);
-    if (!verdict) return null;
-    if ("to" in verdict) {
-      applied.push({ index: i, from: out[i].speaker, to: verdict.to, chars: verdict.chars });
-      out[i] = { ...out[i], speaker: verdict.to };
-    } else {
-      skipped[verdict.reason] += 1;
-    }
-    return verdict;
+  const decided = new Set();
+  const skip = (reason, k) => {
+    if (decided.has(k)) return;
+    decided.add(k);
+    skipped[reason] += 1;
   };
-  let prevDecided = false;
-  for (let i = 0; i < out.length; i++) {
-    const verdict = record(i);
-    if (verdict && "to" in verdict && i > 0 && !prevDecided) record(i - 1);
-    prevDecided = verdict != null;
+  const apply = (k, to, kind) => {
+    applied.push({ index: k, from: out[k].speaker, to, chars: textLength(out[k]), kind });
+    kinds[kind] += 1;
+    out[k] = { ...out[k], speaker: to };
+  };
+  let i = 0;
+  while (i < out.length) {
+    if (fragmentTier(out[i]) === 0) {
+      i++;
+      continue;
+    }
+    const start = i;
+    const seq = out[i].seq;
+    i++;
+    while (i < out.length && fragmentTier(out[i]) > 0 && sameSeq(seq, out[i].seq)) i++;
+    const end = i - 1;
+    if (!resolveByAnchors(out, start, end, skip, apply)) resolveByRuns(out, start, end, skip, apply);
   }
-  return { lines: out, plan: { applied, skipped } };
+  return { lines: out, plan: { applied, kinds, skipped } };
 }
 
 // ---- 第2段: 想定話者数つきの minor speaker island 補正(#48) ----
