@@ -20,11 +20,12 @@ import {
   textIntegrityRows,
   textIntegrityStageRows,
   textIntegrityVerdict,
+  BOUNDARY_SKIP_LABELS,
 } from "../public/diagnostics.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
 // 表示補正の計画は utterances.js が唯一の定義箇所（#48）。**診断もそこを通る**ので、
 // 「表示に効かせた補正」と「診断に出す件数」が別実装になりようがない
-import { planDisplayCorrection, planMinorIslandMerges } from "../public/utterances.js";
+import { planDisplayCorrection, planMinorIslandMerges, smoothSpeakerBoundaries } from "../public/utterances.js";
 
 /**
  * 収音診断（#26）。固定するのは2つ。
@@ -241,6 +242,8 @@ const MD_ARGS = {
   speakerStats: collectSpeakerStats([]),
   expectedSpeakers: "auto",
   sttInfo: null,
+  // #55 の境界平滑化。既定では**計画を渡していない**状態（節ごと出ない）を表す
+  boundaryPlan: null,
   // #48 の表示補正。既定では**計画を渡していない**状態（節ごと出ない）を表す
   islandPlan: null,
   // #50 の中立化。同じく既定では計画を渡していない状態
@@ -543,6 +546,8 @@ function islandArgs(lines: ReturnType<typeof line>[], expectedSpeakers = "2") {
     ...SPEAKER_MD_ARGS,
     speakerStats: collectSpeakerStats(lines),
     expectedSpeakers,
+    // ⓪の計画（#55）も同じ1回の計算から。`app.js` の配線と同じ形
+    boundaryPlan: correction.boundaryPlan,
     islandPlan: correction.plan,
     unresolvedPlan: correction.unresolvedPlan,
     displayDetected: correction.displayDetected,
@@ -903,4 +908,79 @@ test("画面パネルも text_integrity が無ければ行を出さない", () =
     textIntegrityRows({ integrity: null, received: CLIENT_CHARS, displayed: CLIENT_CHARS }),
     [],
   );
+});
+
+// ---- 表示補正（speaker boundary、#55） ----
+//
+// ⓪は想定話者数のゲートを持たないので「無効」の行は無い。**②の節の有無で⓪の節を判定しない** —
+// ②が無効（想定話者数が自動）でも⓪の節は出る。計画を渡さなければ節ごと出さない（②と同じ規律）。
+
+/**
+ * 同じ final（`line()` は全行 seq:1）の中に、主要 speaker 0 の長い行に挟まれた 2 文字の断片
+ * （speaker 1）が 1 つある合成セッション。断片を自分と同じ話者の長い行の隣に置くと
+ * 「その話者の本体の一部」として対象外になり寄らない（`utterances.test.ts` で固定）。
+ */
+const BOUNDARY_LINES = [
+  line(0, 120, 240, 1_010_000),
+  line(1, 1, 2, 1_010_000), // 断片: 両隣の 0 へ寄る
+  line(0, 76, 152, 1_020_000),
+  line(1, 20, 40, 1_030_000),
+];
+
+test("境界補正の件数・文字数・見送り内訳が Markdown に出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(BOUNDARY_LINES));
+  assert.match(md, /### 表示補正（speaker boundary）/);
+  assert.match(md, /- 表示補正（speaker boundary）: 1 seg \/ 2 文字/);
+  assert.match(
+    md,
+    /- 境界補正の見送り: 曖昧 0 \/ 隣も断片 0 \/ 句読点で閉じている 0 \/ 相槌語彙 0 \/ 隣が別 final 0 \/ 再接続境界 0 \/ 話者不明 0 \/ seq なし 0/,
+  );
+  // パイプラインの順に、②の節より手前
+  assert.ok(md.indexOf("### 表示補正（speaker boundary）") < md.indexOf("### 表示補正（minor island）"));
+});
+
+test("②が無効（想定話者数が自動）でも⓪の節は出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(BOUNDARY_LINES, "auto"));
+  assert.match(md, /- 表示補正: 無効（想定話者数が自動）/);
+  assert.match(md, /- 表示補正（speaker boundary）: 1 seg \/ 2 文字/);
+});
+
+test("計画を渡さなければ境界補正の節ごと出さない", () => {
+  const md = buildDiagnosticsMarkdown({ ...SPEAKER_MD_ARGS });
+  assert.doesNotMatch(md, /表示補正（speaker boundary）/);
+});
+
+test("境界補正の節に会話本文が混入しない", () => {
+  const marker = "このもじれつはほんぶんのしるし";
+  const fragment = "xy";
+  const lines = BOUNDARY_LINES.map((l) => ({ ...l, text: l.text.length <= 3 ? fragment : marker }));
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.equal(md.includes(marker), false);
+  assert.equal(md.includes(fragment), false, "寄せた断片の本文が出ている");
+  assert.match(md, /### 表示補正（speaker boundary）/, "節そのものは出ている");
+});
+
+/**
+ * 理由を足して表示名を付け忘れると、その件数が診断から黙って消える。
+ * キーの定義箇所は `utterances.js`（計画の `skipped` の挿入順）で、表示名の表がそれと
+ * **順序まで**一致することで固定する。
+ */
+test("境界補正の見送り理由は全キーに表示名があり、順序も計画と一致する", () => {
+  assert.deepEqual(
+    BOUNDARY_SKIP_LABELS.map(([key]) => key),
+    Object.keys(smoothSpeakerBoundaries([]).plan.skipped),
+  );
+  for (const [, label] of BOUNDARY_SKIP_LABELS) assert.ok(label.length > 0);
+});
+
+test("画面パネルにも境界補正の行が出る（Markdown と同じ行データ）", () => {
+  const rows = speakerDiagRows(islandArgs(BOUNDARY_LINES)) as Array<[string, string]>;
+  assert.deepEqual(
+    rows.find(([k]) => k === "表示補正（speaker boundary）"),
+    ["表示補正（speaker boundary）", "1 seg / 2 文字"],
+  );
+  const labels = rows.map(([k]) => k);
+  assert.ok(labels.includes("境界補正の見送り"));
+  // パイプラインの順に、②の行より手前
+  assert.ok(labels.indexOf("表示補正（speaker boundary）") < labels.indexOf("表示補正"));
 });

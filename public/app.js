@@ -34,6 +34,9 @@ import {
 // エクスポートで補正結果が食い違う。
 // **groupUtterances() の2箇所には必ず同じ引数を渡すこと** — 片方だけ想定話者数を
 // 渡すと画面と Markdown で話者ラベルが割れ、しかも例外は出ない。
+// **段落内の連結はグループの `runs` を描く**(#55)。同じ final 由来の行は区切りなし、
+// 別の final は半角スペース。連結子の規則は `mergeSameSpeaker()` が決めるので、
+// 画面と Markdown で割れない(`texts` を直接連結しないこと)
 import { groupUtterances, planDisplayCorrection } from "./utterances.js";
 // 話者統計の集計・想定話者数の選択肢は speaker-stats.js が唯一の定義箇所(#46)。
 // **集計は raw の finalLines に対して行う**(groupUtterances() の結果ではない) —
@@ -956,7 +959,7 @@ function renderTranscript() {
       finalText.append(el("div", "reconnect-marker", "― 再接続(以降の話者ラベルは振り直し)―"));
       continue;
     }
-    const { speaker, texts } = group;
+    const { speaker } = group;
     const div = el("div", "utterance");
     // **中立化した行は話者色を付けない**(#50)。統合先を決められなかった minor speaker を
     // 「話者C」として見せないための表示なので、通常の話者チップと同じ見た目にすると
@@ -968,7 +971,9 @@ function renderTranscript() {
     } else if (speaker != null) {
       div.append(el("span", `speaker-chip sp-${speaker % 6}`, speakerLabel(speaker)));
     }
-    for (const text of texts) div.append(renderLine(text));
+    // run 単位で描く(#55)。同じ final 由来の断片は 1 つの run になるので、run をまたぐ語にも
+    // ハイライトが当たる。`renderLine()` が run の末尾に付ける半角スペースが run 間の連結子
+    for (const run of group.runs) div.append(renderLine(run));
     finalText.append(div);
   }
 }
@@ -1328,7 +1333,7 @@ function buildTranscriptMarkdown() {
       out.push("---", "", "*再接続しました。以降の話者ラベルは振り直しです。*", "");
       continue;
     }
-    const { speaker, t, texts } = group;
+    const { speaker, t } = group;
     // 画面と同じ判断を同じ順で行う(#50)。**`speaker == null` の `発言` は据え置き** —
     // raw で speaker が付かなかった行と、中立化した行は別の事実
     const label = group.unresolved
@@ -1336,7 +1341,7 @@ function buildTranscriptMarkdown() {
       : speaker != null
         ? speakerLabel(speaker)
         : "発言";
-    out.push(`**${label}** \`${fmtElapsed(t - started.getTime())}\``, "", texts.map(escMd).join(" "), "");
+    out.push(`**${label}** \`${fmtElapsed(t - started.getTime())}\``, "", group.runs.map(escMd).join(" "), "");
   }
   return out.join("\n");
 }
@@ -1393,7 +1398,7 @@ function renderDiagnostics() {
   // (詳細は utterances.js の planDisplayCorrection() のコメント)。
   // ここと buildDiagnosticsMd() は同じ形にすること
   const speakerStats = collectSpeakerStats(finalLines);
-  const { plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
+  const { boundaryPlan, plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
     expectedSpeakers: getExpectedSpeakers(),
   });
   const stages = textIntegrityStages();
@@ -1415,6 +1420,7 @@ function renderDiagnostics() {
       speakerStats,
       expectedSpeakers: getExpectedSpeakers(),
       sttInfo,
+      boundaryPlan,
       islandPlan,
       unresolvedPlan,
       displayDetected,
@@ -1449,7 +1455,7 @@ function buildDiagnosticsMd() {
   // (詳細は utterances.js の planDisplayCorrection() のコメント)。
   // ここと renderDiagnostics() は同じ形にすること
   const speakerStats = collectSpeakerStats(finalLines);
-  const { plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
+  const { boundaryPlan, plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
     expectedSpeakers: getExpectedSpeakers(),
   });
   const stages = textIntegrityStages();
@@ -1471,6 +1477,7 @@ function buildDiagnosticsMd() {
     speakerStats,
     expectedSpeakers: getExpectedSpeakers(),
     sttInfo,
+    boundaryPlan,
     islandPlan,
     unresolvedPlan,
     displayDetected,

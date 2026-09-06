@@ -4,18 +4,22 @@ import test from "node:test";
 // public/ はビルドレスな素の JS。tsconfig.test.json の allowJs で解決している
 // （`tests/card-status.test.ts` が public/card-status.js を読むのと同じ）。
 import {
+  BOUNDARY_FRAGMENT_CHAR_LIMIT,
   JITTER_CHAR_LIMIT,
   JITTER_WINDOW_MS,
   MINOR_ISLAND_MAX_RATIO,
   MINOR_ISLAND_MAX_WORDS,
   MIN_TOTAL_WORDS_FOR_ISLANDS,
+  BACKCHANNEL_WORDS,
   groupUtterances,
   mergeSameSpeaker,
   planDisplayCorrection,
   planMinorIslandMerges,
   planUnresolvedMinors,
   smoothMinorSpeakerIslands,
+  smoothSpeakerBoundaries,
   smoothSpeakerJitter,
+  BOUNDARY_PUNCTUATION,
 } from "../public/utterances.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
 // 文字数の数え方は diagnostics.js が唯一の定義箇所（#52）。ここで数え直すと、
@@ -43,6 +47,8 @@ interface Line {
   /** そのセグメントの word 数（`ServerMessage.transcript.wordCount`）。#48 の判定に使う */
   w?: number;
   type?: string;
+  /** ③（#50）が立てる印。復元経路の fixture でだけ使う */
+  unresolved?: boolean;
 }
 
 /** 発話行。既定で `t` は連番、`seq` は明示したときだけ載せる。 */
@@ -240,12 +246,14 @@ test("空配列は空のグループ列", () => {
  * 境界の向こう側を「前後が同じ話者」の根拠に使ってはいけない。
  */
 test("再接続を越えて jitter 補正しない", () => {
-  const lines = [line("まえ", 0, { seq: 7 }), reconnect(), line(SHORT, 1, { seq: 1 }), line("あと", 0, { seq: 1 })];
+  // 「あと」は⓪（#55）の断片の長さに当たり、同じ final の SHORT（話者1）へ寄ってしまう。
+  // ここで固定したいのは①が再接続を越えないことなので、⓪に掛からない長さにしておく
+  const lines = [line("まえ", 0, { seq: 7 }), reconnect(), line(SHORT, 1, { seq: 1 }), line("あとのはなし", 0, { seq: 1 })];
   assert.deepEqual(summary(groupUtterances(lines)), [
     { speaker: 0, text: "まえ" },
     { type: "reconnect" },
     { speaker: 1, text: SHORT },
-    { speaker: 0, text: "あと" },
+    { speaker: 0, text: "あとのはなし" },
   ]);
 });
 
@@ -1328,4 +1336,318 @@ test("再接続を挟んでも③と④の文字数が一致する", () => {
   ];
   assert.deepEqual(displayedChars(lines), receivedChars(lines));
   assert.equal(receivedChars(lines).visible, 4);
+});
+
+// ---- ⓪ 同じ final の中で語の途中に入った speaker 境界の平滑化（#55） ----
+//
+// 固定したいのは3つ。
+// 1. **同じ final の短い断片だけを隣へ寄せ、別 final は絶対に跨がない** — 別 final で届いた
+//    本物の相槌は `seq` が違うので構造的に吸収されない（#36 と同じ規律）
+// 2. **同じ final でも、句読点で閉じた断片・相槌語彙・両隣が異なる長い行は寄せない**
+// 3. **同じ final 由来の行は区切りなしで連結される** — speaker を揃えるだけでは
+//    「テキ ストを確認します」のように語の途中にスペースが残る（#55 の受け入れ条件）
+//
+// fixture はここでも匿名化した合成データ。文字列は長さと文字種にしか意味が無い。
+
+/** 断片の長さ（上限ちょうど）。閾値を直接使い、値を変えてもテストの意図がずれないようにする */
+const FRAG = "あ".repeat(BOUNDARY_FRAGMENT_CHAR_LIMIT);
+/** 断片ではない長さ（上限 + 1）。`LONG` と別に持つのは、①の閾値と独立に動かせるようにするため */
+const BODY = "い".repeat(BOUNDARY_FRAGMENT_CHAR_LIMIT + 1);
+
+/** グループを「話者 + 連結 run」に畳む。run の割れ方（連結子の出し分け）まで見る */
+function runsOf(groups: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return groups.map((g) =>
+    g.type === "reconnect" ? { type: "reconnect" } : { speaker: g.speaker, runs: g.runs },
+  );
+}
+
+/** ⓪の計画。本番と同じく `planDisplayCorrection()` の1回の計算から取る */
+function boundaryPlanOf(lines: Line[]) {
+  return planDisplayCorrection(lines, {}).boundaryPlan;
+}
+
+/** 「1 件も見送っていない」内訳。空入力の計画から取るので、理由を足してもここは古くならない */
+const NO_SKIPS = smoothSpeakerBoundaries([]).plan.skipped;
+function assertNothingSkipped(plan: { skipped: Record<string, number> }) {
+  assert.deepEqual(plan.skipped, NO_SKIPS);
+}
+
+test("同じ final の短い断片は隣の長い行の話者へ寄り、区切りなしで連結される", () => {
+  const lines = [line(FRAG, 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 1, runs: [FRAG + BODY] }]);
+  const plan = boundaryPlanOf(lines);
+  assert.deepEqual(plan.applied, [{ index: 0, from: 0, to: 1, chars: FRAG.length }]);
+});
+
+test("断片が final の末尾にあれば前の行へ寄る", () => {
+  const lines = [line(BODY, 1, { seq: 5 }), line(FRAG, 0, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 1, runs: [BODY + FRAG] }]);
+});
+
+test("別 final で届いた短い発話は寄せない（differentFinal）", () => {
+  const lines = [line(BODY, 0, { seq: 1 }), line(FRAG, 1, { seq: 2 }), line(BODY, 0, { seq: 3 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [
+    { speaker: 0, runs: [BODY] },
+    { speaker: 1, runs: [FRAG] },
+    { speaker: 0, runs: [BODY] },
+  ]);
+  assert.equal(boundaryPlanOf(lines).skipped.differentFinal, 1);
+});
+
+/**
+ * **構造の証拠を内容のゲートより先に見る。** 別 final の「はい」を `backchannel` に数えると、
+ * 語彙リストを調整するための件数が、構造上どのみち寄らないケースで水増しされる。
+ */
+test("別 final の相槌語彙は backchannel ではなく differentFinal に数える", () => {
+  const lines = [line(BODY, 0, { seq: 1 }), line("はい", 1, { seq: 2 }), line(BODY, 0, { seq: 3 })];
+  const { skipped } = boundaryPlanOf(lines);
+  assert.equal(skipped.differentFinal, 1);
+  assert.equal(skipped.backchannel, 0);
+});
+
+test("句読点で閉じた断片は同じ final でも寄せない（punctuated）", () => {
+  const lines = [line("あ。", 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [
+    { speaker: 0, runs: ["あ。"] },
+    { speaker: 1, runs: [BODY] },
+  ]);
+  assert.equal(boundaryPlanOf(lines).skipped.punctuated, 1);
+});
+
+test("相槌語彙は同じ final でも寄せない（backchannel）", () => {
+  for (const word of BACKCHANNEL_WORDS) {
+    const lines = [line(word, 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+    assert.equal(groupUtterances(lines).length, 2, `${word} が寄せられた`);
+    assert.equal(boundaryPlanOf(lines).skipped.backchannel, 1, `${word} が backchannel に数えられていない`);
+  }
+});
+
+/** 閾値より長い語をリストに載せても長さのゲートで先に落ちるので、効いているように読めるだけになる */
+test("相槌語彙は断片の長さの語だけ（それより長い語は効かない）", () => {
+  for (const word of BACKCHANNEL_WORDS) {
+    assert.ok(word.length <= BOUNDARY_FRAGMENT_CHAR_LIMIT, `${word} は閾値より長い`);
+  }
+});
+
+test("両隣が異なる話者の長い行なら寄せない（ambiguous）", () => {
+  const lines = [line(BODY, 0, { seq: 5 }), line(FRAG, 2, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 3);
+  assert.equal(boundaryPlanOf(lines).skipped.ambiguous, 1);
+});
+
+test("両隣が同じ話者の長い行なら寄せる（①jitter と同じ結果）", () => {
+  const lines = [line(BODY, 0, { seq: 5 }), line(FRAG, 2, { seq: 5 }), line(BODY, 0, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 0, runs: [BODY + FRAG + BODY] }]);
+  // ⓪が先に効く（①ではなく⓪の計画に載る）
+  assert.equal(boundaryPlanOf(lines).applied.length, 1);
+});
+
+test("再接続の印を越えて寄せない（boundary）", () => {
+  const lines = [line(FRAG, 0, { seq: 5 }), reconnect(), line(BODY, 1, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [
+    { speaker: 0, runs: [FRAG] },
+    { type: "reconnect" },
+    { speaker: 1, runs: [BODY] },
+  ]);
+  assert.equal(boundaryPlanOf(lines).skipped.boundary, 1);
+});
+
+test("隣の話者が不明なら寄せない（unknown）", () => {
+  const lines = [line(FRAG, 0, { seq: 5 }), line(BODY, null, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 2);
+  assert.equal(boundaryPlanOf(lines).skipped.unknown, 1);
+});
+
+test("seq の無い旧セッションでは何もしない（noSeq。時間窓へ落とさない）", () => {
+  const lines = [
+    { text: FRAG, speaker: 0, t: 0 },
+    { text: BODY, speaker: 1, t: 0 },
+  ] as Line[];
+  assert.equal(groupUtterances(lines).length, 2);
+  assert.equal(boundaryPlanOf(lines).skipped.noSeq, 1);
+});
+
+/**
+ * 断片が連なる形は 1 パスで隣の 1 つだけが寄る。残った断片は寄らないが、
+ * **診断には `shortNeighbor` として残す**（寄せた直後に直前の 1 行だけ判定し直す）。
+ * `ambiguous`（両隣が異なる長い行）とは別に数える — 前者は 2 パス目、後者は追加ゲートの
+ * 検討材料で、混ぜると内訳が読めない。
+ */
+test("断片が2つ続けば隣の1つだけが寄り、残りは shortNeighbor に数える", () => {
+  const lines = [line("あ", 0, { seq: 5 }), line("い", 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [
+    { speaker: 0, runs: ["あ"] },
+    { speaker: 1, runs: ["い" + BODY] },
+  ]);
+  const plan = boundaryPlanOf(lines);
+  assert.equal(plan.applied.length, 1);
+  assert.equal(plan.skipped.shortNeighbor, 1);
+  assert.equal(plan.skipped.ambiguous, 0);
+});
+
+/**
+ * **同じ final の同じ話者の長い行に既に接している断片は、その話者の本体の一部。**
+ * 反対側に別話者の長い行があっても B へ引き剥がさない（対象外なので見送りにも数えない）。
+ */
+test("同じ final の同じ話者の長い行に接していれば、反対側の別話者へ寄せない", () => {
+  const lines = [line(BODY, 0, { seq: 5 }), line(FRAG, 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [
+    { speaker: 0, runs: [BODY + FRAG] },
+    { speaker: 1, runs: [BODY] },
+  ]);
+  const plan = boundaryPlanOf(lines);
+  assert.equal(plan.applied.length, 0);
+  assertNothingSkipped(plan);
+  // 断片が 2 つ続く形でも、先頭の断片は同じ話者の本体に接しているので shortNeighbor に数えない
+  const chain = [line(BODY, 0, { seq: 5 }), line("あ", 0, { seq: 5 }), line("い", 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  const chainPlan = boundaryPlanOf(chain);
+  assert.equal(chainPlan.applied.length, 1);
+  assert.equal(chainPlan.applied[0].index, 2);
+  assertNothingSkipped(chainPlan);
+});
+
+test("断片自身の話者が不明なら寄せない（unknown。from の無い適用を作らない）", () => {
+  const lines = [line(FRAG, null, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 2);
+  const plan = boundaryPlanOf(lines);
+  assert.equal(plan.applied.length, 0);
+  assert.equal(plan.skipped.unknown, 1);
+});
+
+test("空文字の行は断片ではない（寄せず、見送りにも数えない）", () => {
+  const lines = [line("", 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  const plan = boundaryPlanOf(lines);
+  assert.equal(plan.applied.length, 0);
+  assertNothingSkipped(plan);
+});
+
+test("BOUNDARY_PUNCTUATION のどの文字で閉じていても寄せない", () => {
+  for (const p of BOUNDARY_PUNCTUATION) {
+    const lines = [line(`あ${p}`, 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+    assert.equal(groupUtterances(lines).length, 2, `${p} で閉じた断片が寄せられた`);
+    assert.equal(boundaryPlanOf(lines).skipped.punctuated, 1, `${p} が punctuated に数えられていない`);
+  }
+});
+
+test("両隣とも同じ話者の短い行は境界に無いので判定の対象外（見送りにも数えない）", () => {
+  const lines = [line(BODY, 0, { seq: 5 }), line(FRAG, 0, { seq: 5 }), line(BODY, 0, { seq: 5 })];
+  const plan = boundaryPlanOf(lines);
+  assert.equal(plan.applied.length, 0);
+  assertNothingSkipped(plan);
+});
+
+test("別 final の同一話者は従来どおり別 run（スペース連結のまま）", () => {
+  const lines = [line(BODY, 0, { seq: 1 }), line(BODY, 0, { seq: 2 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 0, runs: [BODY, BODY] }]);
+});
+
+test("seq の無い行どうしは undefined === undefined で繋がない", () => {
+  const lines = [
+    { text: BODY, speaker: 0, t: 0 },
+    { text: BODY, speaker: 0, t: 0 },
+  ] as Line[];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 0, runs: [BODY, BODY] }]);
+});
+
+test("text が欠けた復元行があっても run に undefined が混ざらない", () => {
+  // 復元データは検証を通っていないので `text` が欠けた形が来うる
+  const groups = mergeSameSpeaker([
+    { text: "a", speaker: 0, t: 0, seq: 1 },
+    { text: undefined, speaker: 0, t: 0, seq: 1 },
+    { text: "c", speaker: 0, t: 0, seq: 1 },
+  ] as unknown as Line[]) as Array<Record<string, unknown>>;
+  assert.deepEqual(groups[0].runs, ["ac"]);
+  assert.equal((groups[0].texts as unknown[]).length, 3, "texts は行数のまま");
+});
+
+test("グループは texts（行ごと）と runs（同じ final 由来だけ区切りなし）を持つ（中立化グループも同じ）", () => {
+  const groups = mergeSameSpeaker([
+    { text: "a", speaker: 0, t: 0, seq: 1 },
+    { text: "b", speaker: 0, t: 0, seq: 1 },
+    { text: "c", speaker: 2, t: 0, seq: 2, unresolved: true },
+    { text: "d", speaker: 2, t: 0, seq: 3, unresolved: true },
+  ] as Line[]) as Array<Record<string, unknown>>;
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups[0].texts, ["a", "b"]);
+  assert.deepEqual(groups[0].runs, ["ab"]);
+  assert.deepEqual(groups[1].texts, ["c", "d"]);
+  assert.deepEqual(groups[1].runs, ["c", "d"]);
+  assert.equal(groups[1].unresolved, true);
+});
+
+/**
+ * ⓪→①→②の順序。⓪が先に寄せた断片は②の島として現れない（同じ行を2つの段で二重に
+ * 数えない）。想定2人・検出3で、minor の断片が主要 speaker と同じ final にある形。
+ */
+test("⓪が先に寄せた断片は②の対象にならない（⓪→①→②の順序）", () => {
+  const lines: Line[] = [
+    { text: LONG, speaker: 0, t: 0, seq: 1, w: 300 },
+    { text: LONG, speaker: 1, t: 1, seq: 2, w: 100 },
+    { text: FRAG, speaker: 2, t: 1, seq: 2, w: 2 },
+    { text: LONG, speaker: 0, t: 2, seq: 3, w: 100 },
+  ];
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  const { boundaryPlan, displayDetected } = correction;
+  const plan = correction.plan as { disabledBy: string | null; merges: unknown[] };
+  assert.equal(boundaryPlan.applied.length, 1, "⓪が寄せていない");
+  assert.equal(plan.disabledBy, null, "②のゲートは通っている（検出3 > 想定2、総 word 数も十分）");
+  assert.equal(plan.merges.length, 0, "⓪が寄せた行を②が島として数えている");
+  assert.equal(displayDetected, 2);
+  assert.deepEqual(runsOf(groupUtterances(lines, { expectedSpeakers: EXPECTED_2 })), [
+    { speaker: 0, runs: [LONG] },
+    { speaker: 1, runs: [LONG + FRAG] },
+    { speaker: 0, runs: [LONG] },
+  ]);
+});
+
+test("smoothSpeakerBoundaries は入力の配列も要素も書き換えない", () => {
+  const lines = [line(FRAG, 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  const snapshot = JSON.stringify(lines);
+  const { lines: out } = smoothSpeakerBoundaries(lines);
+  assert.equal(JSON.stringify(lines), snapshot);
+  assert.notEqual(out, lines);
+  assert.equal(out[0].speaker, 1);
+  assert.equal(lines[0].speaker, 0);
+});
+
+test("⓪の skipped は 0 件でも全キーを持つ（順序も固定。診断の表示名の表と突き合わせる）", () => {
+  const { plan } = smoothSpeakerBoundaries([]);
+  assert.deepEqual(Object.keys(plan.skipped), [
+    "ambiguous",
+    "shortNeighbor",
+    "punctuated",
+    "backchannel",
+    "differentFinal",
+    "boundary",
+    "unknown",
+    "noSeq",
+  ]);
+  assert.deepEqual(Object.values(plan.skipped), Object.keys(plan.skipped).map(() => 0));
+  assert.deepEqual(plan.applied, []);
+});
+
+test("⓪を通してもテキストと行数は1つも変わらず、③と④の文字数が一致する", () => {
+  const fixtures: Line[][] = [
+    [line(FRAG, 0, { seq: 5 }), line(BODY, 1, { seq: 5 })],
+    [line(BODY, 0, { seq: 5 }), line(FRAG, 2, { seq: 5 }), line(BODY, 1, { seq: 5 })],
+    [line("あ", 0, { seq: 5 }), line("い", 0, { seq: 5 }), line(BODY, 1, { seq: 5 })],
+    [line(FRAG, 0, { seq: 5 }), reconnect(), line(BODY, 1, { seq: 5 })],
+    [line("あ。", 0, { seq: 5 }), line("はい", 1, { seq: 5 }), line(BODY, 1, { seq: 5 })],
+  ];
+  for (const lines of fixtures) {
+    assert.deepEqual(displayedChars(lines), receivedChars(lines));
+    const rows = groupUtterances(lines)
+      .filter((g: Record<string, unknown>) => g.type !== "reconnect")
+      .reduce((n: number, g: Record<string, unknown>) => n + (g.texts as string[]).length, 0);
+    assert.equal(rows, lines.filter((l) => l.type !== "reconnect").length);
+  }
+});
+
+test("既存の jitter fixture は⓪を足しても結果が変わらない（#36 の退行検出）", () => {
+  // `SHORT`(= JITTER_CHAR_LIMIT 文字)は⓪の閾値より長いので、⓪は #36 の fixture に一切掛からない
+  assert.ok(SHORT.length > BOUNDARY_FRAGMENT_CHAR_LIMIT, "⓪の閾値が①の閾値以上になっている");
+  for (const c of cases) {
+    const plan = boundaryPlanOf(linesOf(c));
+    assert.equal(plan.applied.length, 0, `${c.id}: ⓪が #36 の fixture に掛かった`);
+  }
 });

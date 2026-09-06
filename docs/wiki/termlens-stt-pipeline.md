@@ -14,6 +14,8 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
   - src/stt/
   - public/speaker-stats.js
+  - public/app.js
+  - tests/utterances.test.ts
 related: [[termlens-architecture]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-deployment]], [[termlens-testing]]
 confidence: high
 updated: 2026-09-05
@@ -250,9 +252,11 @@ diarizer の metadata だけ。**会話本文・音声・絶対時刻・`request
 
 #### 想定話者数を超えた少数 speaker の島を寄せる（Issue #48）
 
-**表示側の補正は 3 段になった**（#50 で③が加わり、グループ化まで含めて 4 段）。どの段も
+**表示側の補正は 4 段**（#50 で③、#55 で⓪が加わり、グループ化まで含めて 5 段）。どの段も
 raw の `finalLines` は書き換えず、表示・エクスポート用コピーだけを直す。テキストも行数も
 変えない。
+
+> 2026-09-05 まで: 3 段（①②③。グループ化まで含めて 4 段）。#55 で⓪が先頭に加わった。
 
 ```
 finalLines（raw / localStorage に保存されるのもこれ）
@@ -261,9 +265,9 @@ finalLines（raw / localStorage に保存されるのもこれ）
   │                                          │
   │                          主要 speaker の選定に使う
   │                                          ▼
-  └─ ① smoothSpeakerJitter() ─▶ ② planMinorIslandMerges() ─▶ ③ planUnresolvedMinors() ─▶ ④ mergeSameSpeaker()
-     #36 局所 jitter              + applyMerges                + applyNeutralize             既存
-                                  #48 minor island             #50 中立化
+  └─ ⓪ smoothSpeakerBoundaries() ─▶ ① smoothSpeakerJitter() ─▶ ② planMinorIslandMerges() ─▶ ③ planUnresolvedMinors() ─▶ ④ mergeSameSpeaker()
+     #55 同一 final の断片           #36 局所 jitter              + applyMerges                + applyNeutralize             + runs（連結子）
+                                                                  #48 minor island             #50 中立化                    #55
 ```
 
 順序は `correctSpeakers()` の中に閉じてあり、呼び出し側の規律にはしていない。
@@ -467,16 +471,114 @@ Markdown・診断が同じ文言を引く）。
 実データを見た人がどちらの数字を見ているのか分からなくなる。②と同じく「効いていない」
 （ゲートで無効）と「効いた結果 0 件」も区別する。
 
-#### 残っている弱点: 段落内の連結は半角スペース
+#### 同じ final の中で語の途中に入った speaker 境界を平滑化する（Issue #55）
 
-同じ段落に入った行は、画面（`renderLine()`）でも Markdown（`texts.join(" ")`）でも
-**半角スペースで連ねられる**。両者は一致しているので「表示とエクスポートで同じ結果」は満たすが、
-#36 は「1 つの final の 1 文が割れたもの」を意図的に同じ段落へ入れる機能なので、
-**日本語の文の途中にスペースが入るケースが増える**。下の「用語抽出バッファに空白が入る」と
-同じ現象が、今回から表示・エクスポート側にも出るようになった。
+**表示側の補正は 4 段になった**（⓪が先頭に加わり、グループ化まで含めて 5 段）。順序は
+`⓪ smoothSpeakerBoundaries() → ① jitter → ② minor island → ③ 中立化 → ④ mergeSameSpeaker()` で、
+引き続き `correctSpeakers()` の中に閉じてある。
 
-直すなら、グループに `seq` の境界を持たせて連結子を出し分ける（同じ final 由来なら区切りなし）。
-情報は手元にあるが、`mergeSameSpeaker()` がグループを作る時点で `seq` を捨てている。
+きっかけは #52 の結論。「発話の冒頭が数文字欠けて見える」は文字の欠落ではなく、**word 単位の
+話者分割が語や短い句の途中に境界を入れていた**（`A: テキ | B: ストを確認します`）。この形は
+2 行で完結して後ろに元の話者が戻ってこないため、「前後が同じ話者に挟まれた島」だけを直す①には
+構造的に当たらない。
+
+##### 判定は「同じ final」という証拠だけで動く
+
+クライアントの行が持つのは `text` / `speaker` / `t`（受信時刻）/ `seq`（`finalSeq`）/ `w` だけで、
+**word 単位のタイムスタンプは無い**（#19 の判断で捨てている）。「前後のタイムスタンプが極めて
+近い」は `seq` の一致で置き換える — 同じ final 由来なら受信時刻は実質 0ms 差、別 final なら
+数百 ms 以上なので、`t` を見ても `seq` と同じ判定になる。**別 final は絶対に跨がない**ので、
+endpointing の無音を挟んで別 final として届いた本物の相槌は①と同じ理由で吸収されない。
+
+寄せるのは以下をすべて満たす断片だけ（`public/utterances.js` の `boundaryFragmentTarget()`）。
+
+1. 断片が `BOUNDARY_FRAGMENT_CHAR_LIMIT`（**3 文字**）以下。①の `JITTER_CHAR_LIMIT`(4) より
+   1 小さいのは、挟まれていない分だけ証拠が弱いため
+2. 隣（前後どちらか）が **同じ `seq`** で、speaker が確定していて、断片より長い。断片自身の
+   speaker も確定している（不明なら `unknown`。`from` の無い適用は作らない）
+3. 両隣が異なる speaker の長い行（`A長 | X短 | B長`）ではない → `ambiguous` として見送る。
+   `A長 | X短 | A長` は両方 A なので寄せる（①と同じ結果になり矛盾しない）。隣も断片の長さなら
+   どちらが本体か決められない → `shortNeighbor`（`ambiguous` とは分けて数える）
+3'. **同じ final の同じ speaker の長い行に既に接していれば対象外。** `A長 | A短 | B長` の `A短` は
+   A の本体の一部で、反対側の B へ引き剥がす向きには動かない（raw からこの形が出るのは
+   `split.ts` の空セグメント除去や復元データに限られるが、ロジックの向きとして固定）
+4. 断片の末尾が句読点（`。、？！?!`）で閉じていない → `punctuated`
+5. 断片が相槌語彙（`public/utterances.js` の `BACKCHANNEL_WORDS`）に無い → `backchannel`
+6. 再接続の印を挟まない → `boundary`。`seq` の無い旧セッションの行は `noSeq` で何もしない
+   （①と違って時間窓へ落とさない — 証拠が弱い段で緩い判定に落とすと相槌を寄せる側へ倒れる）
+
+**理由の判定順は「構造（seq・隣）→ 内容（句読点・語彙）」。** 逆にすると別 final の「はい」が
+`backchannel` に数えられ、語彙リストを調整するための件数が構造上どのみち寄らないケースで
+水増しされる。内容ゲートの件数は「それが無ければ寄っていた」数だけになっている。
+
+走査は左から 1 パスで、寄せた結果を次の判定に使う（①と同じ）。**2 パス目は持たない** —
+`A:テ | A:キ | B:スト…` のように断片が連なる形は `キ` だけが B へ寄り、`テ` は隣が短い `キ` に
+なるので寄らない。証拠が弱い連鎖を寄せるほど誤統合の面積が増えるため、診断に `shortNeighbor` として
+残すに留める（寄せた直後に直前の 1 行だけ判定し直して数える）。
+
+**長い行は「見送り」に数えない。** 数えると全行の大半が見送りになり、閾値を決めるための内訳が
+読めなくなる。内訳に出るのは「断片の長さなのに寄せなかった行」だけ。
+
+##### speaker を揃えるだけでは表示が自然にならない（連結子の出し分け）
+
+同じ段落に入った行は画面（`renderLine()`）でも Markdown（`join(" ")`）でも半角スペースで
+連ねられていたので、⓪が speaker を揃えても `テキ ストを確認します` と語の途中にスペースが残る。
+`mergeSameSpeaker()` がグループを作るときに **`runs`（同じ `seq` が続く行は区切りなし、
+別 `seq` は別 run にまとめた文字列の列）** を `texts` と並べて持たせる。画面は run ごとに
+`renderLine()`、Markdown は run を `join(" ")` する。**連結子の規則はグループを作る場所で決め、
+消費側は `runs` を描くだけ**にしてあり、両方が `runs` を描く（`texts` を直接連結しない）ことを
+`tests/app-wiring.test.ts` が固定している（片方が `texts` を直接連結すると割れる）。
+
+- `texts` の形は変えていない。ハイライトも診断の④（#52）も従来どおり `texts` を数える
+- 隣どうしの `seq` が**両方とも数値で一致**するときだけ連結する。`seq` の無い旧セッションは
+  `undefined === undefined` で繋がず、従来どおりスペース連結。復元データで `text` が欠けた行は
+  空文字として連結する（`"a" + undefined` を本文に出さない）
+- 副次効果として、同じ final 由来の断片がまたがる語（「テキスト」）にもハイライトが当たる
+
+##### 診断への出方
+
+「話者分離の診断」に `### 表示補正（speaker boundary）` が**②の手前**に出る。⓪は想定話者数の
+ゲートを持たないので「無効」の行は無く、**②が無効（想定話者数が自動）でも⓪の節は出る**
+（②の有無で⓪を判定しない）。計画を渡さなければ節ごと出ない（②と同じ規律）。
+
+```
+- 表示補正（speaker boundary）: 3 seg / 7 文字
+- 境界補正の見送り: 曖昧 2 / 隣も断片 1 / 句読点で閉じている 1 / 相槌語彙 4 / 隣が別 final 12 / 再接続境界 0 / 話者不明 0 / seq なし 0
+```
+
+単位は常に文字数（行に `w` があっても断片の一部を word 数では表せない）。会話本文も speaker
+番号の明細も出さない。**見送りの内訳が閾値と語彙を決める唯一の材料** — `曖昧` が多ければ
+両隣が異なる長い行に挟まれた形が多く追加ゲート（文字種の連続性、案2）の検討材料、`隣も断片` が
+多ければ断片の連鎖が多く 2 パス目の検討材料、`相槌語彙` が多ければ語彙リストが効いている、と読む。
+理由キーの定義箇所は `public/utterances.js` の `BOUNDARY_SKIP_REASONS`（②の `emptySkipped()` と
+同じ流儀）で、表示名は `public/diagnostics.js` の `BOUNDARY_SKIP_LABELS`（②の `ISLAND_SKIP_LABELS`
+と同じ `[key, label]` の列）。両者が順序まで一致することを `tests/diagnostics.test.ts` が
+`smoothSpeakerBoundaries([]).plan.skipped` のキー列と突き合わせて固定する。②③⓪の内訳の整形は
+`skipBreakdown()` 1 か所。
+
+##### 閾値・語彙（すべて暫定値。実機の診断を見て調整する）
+
+| 定数 | 値 | 場所 |
+|---|---|---|
+| `BOUNDARY_FRAGMENT_CHAR_LIMIT` | 3 | `public/utterances.js` |
+| `BOUNDARY_PUNCTUATION` | `。、？！?!` | `public/utterances.js` |
+| `BACKCHANNEL_WORDS` | はい / ええ / うん / そう / へえ / あー / えー / ん / はー / ほう / ふむ | `public/utterances.js`（3 文字以下の語だけ。長い語は長さのゲートで先に落ちる。⓪の調整つまみは 3 つともこのファイルの同じ節にある） |
+
+**残るリスク**: 重なって話して endpointing の無音が入らず、相手の相槌が同じ final に混ざった
+ケースは、語彙・句読点で弾けなければ隣の話者へ寄る。**テキストは消えず帰属だけが変わる**。
+3 重のゲートで頻度を抑えるがゼロにはできない。語彙リストは日本語固定。
+
+#### 段落内の連結は半角スペース（#55 で解消）
+
+> 2026-09-05 まで: 同じ段落に入った行は、画面（`renderLine()`）でも Markdown（`texts.join(" ")`）
+> でも**半角スペースで連ねられる**。両者は一致しているので「表示とエクスポートで同じ結果」は
+> 満たすが、#36 は「1 つの final の 1 文が割れたもの」を意図的に同じ段落へ入れる機能なので、
+> **日本語の文の途中にスペースが入るケースが増える**。直すなら、グループに `seq` の境界を持たせて
+> 連結子を出し分ける（同じ final 由来なら区切りなし）。情報は手元にあるが、`mergeSameSpeaker()` が
+> グループを作る時点で `seq` を捨てている。（2026-09-05 更新: #55 で上記のとおり
+> `mergeSameSpeaker()` が `runs` を持たせて解消。別 final どうしは従来どおりスペース連結）
+
+下の「用語抽出バッファに空白が入る」は**表示側とは別の経路**で、こちらは #55 でも変えていない。
 
 ### interim は分割しない
 
