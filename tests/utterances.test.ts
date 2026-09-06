@@ -20,6 +20,9 @@ import {
   smoothSpeakerBoundaries,
   smoothSpeakerJitter,
   BOUNDARY_PUNCTUATION,
+  BOUNDARY_EXTENDED_CHAR_LIMIT,
+  BOUNDARY_CHAIN_MAX_CHARS,
+  continuity,
 } from "../public/utterances.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
 // 文字数の数え方は diagnostics.js が唯一の定義箇所（#52）。ここで数え直すと、
@@ -247,13 +250,15 @@ test("空配列は空のグループ列", () => {
  */
 test("再接続を越えて jitter 補正しない", () => {
   // 「あと」は⓪（#55）の断片の長さに当たり、同じ final の SHORT（話者1）へ寄ってしまう。
-  // ここで固定したいのは①が再接続を越えないことなので、⓪に掛からない長さにしておく
-  const lines = [line("まえ", 0, { seq: 7 }), reconnect(), line(SHORT, 1, { seq: 1 }), line("あとのはなし", 0, { seq: 1 })];
+  // ここで固定したいのは①が再接続を越えないことなので、⓪に掛からない長さにしておく。
+  // さらに #57 で SHORT（4 文字）は「6 文字以上の anchor と文字種が連続していれば寄る」
+  // 拡張断片になったので、境目をひらがな → 漢字（連続性「弱」）にして⓪の対象から外す
+  const lines = [line("まえ", 0, { seq: 7 }), reconnect(), line(SHORT, 1, { seq: 1 }), line("後のはなしを", 0, { seq: 1 })];
   assert.deepEqual(summary(groupUtterances(lines)), [
     { speaker: 0, text: "まえ" },
     { type: "reconnect" },
     { speaker: 1, text: SHORT },
-    { speaker: 0, text: "あとのはなし" },
+    { speaker: 0, text: "後のはなしを" },
   ]);
 });
 
@@ -1351,8 +1356,14 @@ test("再接続を挟んでも③と④の文字数が一致する", () => {
 
 /** 断片の長さ（上限ちょうど）。閾値を直接使い、値を変えてもテストの意図がずれないようにする */
 const FRAG = "あ".repeat(BOUNDARY_FRAGMENT_CHAR_LIMIT);
-/** 断片ではない長さ（上限 + 1）。`LONG` と別に持つのは、①の閾値と独立に動かせるようにするため */
+/**
+ * 断片ではない長さ（上限 + 1 = 4 文字）。`LONG` と別に持つのは、①の閾値と独立に動かせるようにするため。
+ * #57 以降、この長さは (b) の本体であると同時に (a) の拡張断片でもある — `BODY` だけの fixture は
+ * 6 文字以上の anchor を持たないので (a) が動かず、#55 と同じ (b) の経路を通る
+ */
 const BODY = "い".repeat(BOUNDARY_FRAGMENT_CHAR_LIMIT + 1);
+/** (a) の anchor になる長さ（拡張上限 + 1 = 6 文字）。ひらがななので、ひらがな始まりの行とは連続性「中」 */
+const ANCHOR6 = "い".repeat(BOUNDARY_EXTENDED_CHAR_LIMIT + 1);
 
 /** グループを「話者 + 連結 run」に畳む。run の割れ方（連結子の出し分け）まで見る */
 function runsOf(groups: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
@@ -1376,7 +1387,7 @@ test("同じ final の短い断片は隣の長い行の話者へ寄り、区切�
   const lines = [line(FRAG, 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
   assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 1, runs: [FRAG + BODY] }]);
   const plan = boundaryPlanOf(lines);
-  assert.deepEqual(plan.applied, [{ index: 0, from: 0, to: 1, chars: FRAG.length }]);
+  assert.deepEqual(plan.applied, [{ index: 0, from: 0, to: 1, chars: FRAG.length, kind: "basic" }]);
 });
 
 test("断片が final の末尾にあれば前の行へ寄る", () => {
@@ -1415,18 +1426,28 @@ test("句読点で閉じた断片は同じ final でも寄せない（punctuated
 });
 
 test("相槌語彙は同じ final でも寄せない（backchannel）", () => {
+  // 隣は `ANCHOR6`。4〜5 文字の語彙は (a) の候補になったときだけ数えるので、(b) しか動かない
+  // `BODY` を隣に置くと「寄らない」は同じでも `backchannel` には数えられない
   for (const word of BACKCHANNEL_WORDS) {
-    const lines = [line(word, 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+    const lines = [line(word, 0, { seq: 5 }), line(ANCHOR6, 1, { seq: 5 })];
     assert.equal(groupUtterances(lines).length, 2, `${word} が寄せられた`);
     assert.equal(boundaryPlanOf(lines).skipped.backchannel, 1, `${word} が backchannel に数えられていない`);
   }
 });
 
 /** 閾値より長い語をリストに載せても長さのゲートで先に落ちるので、効いているように読めるだけになる */
-test("相槌語彙は断片の長さの語だけ（それより長い語は効かない）", () => {
+test("相槌語彙は拡張断片の長さまでの語だけ（それより長い語は効かない）", () => {
   for (const word of BACKCHANNEL_WORDS) {
-    assert.ok(word.length <= BOUNDARY_FRAGMENT_CHAR_LIMIT, `${word} は閾値より長い`);
+    assert.ok(word.length <= BOUNDARY_EXTENDED_CHAR_LIMIT, `${word} は閾値より長い`);
   }
+});
+
+test("句読点付きの相槌語彙は、句読点を剥がして backchannel に数える（#57）", () => {
+  const lines = [line("はい。", 0, { seq: 5 }), line(ANCHOR6, 1, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 2);
+  const { skipped } = boundaryPlanOf(lines);
+  assert.equal(skipped.backchannel, 1);
+  assert.equal(skipped.punctuated, 0);
 });
 
 test("両隣が異なる話者の長い行なら寄せない（ambiguous）", () => {
@@ -1468,21 +1489,18 @@ test("seq の無い旧セッションでは何もしない（noSeq。時間窓�
 });
 
 /**
- * 断片が連なる形は 1 パスで隣の 1 つだけが寄る。残った断片は寄らないが、
- * **診断には `shortNeighbor` として残す**（寄せた直後に直前の 1 行だけ判定し直す）。
- * `ambiguous`（両隣が異なる長い行）とは別に数える — 前者は 2 パス目、後者は追加ゲートの
- * 検討材料で、混ぜると内訳が読めない。
+ * 断片が連なる形（#57 のパターン 3）。#55 は 1 行の窓で隣の 1 つだけを寄せ、残りを `shortNeighbor` に
+ * 数えていたが、#57 では **run をまとめて寄せる**。4 文字の `BODY` が本体（(b) の anchor）になる形。
  */
-test("断片が2つ続けば隣の1つだけが寄り、残りは shortNeighbor に数える", () => {
+test("断片が2つ続けば run としてまとめて隣の本体へ寄る（kind: chain）", () => {
   const lines = [line("あ", 0, { seq: 5 }), line("い", 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
-  assert.deepEqual(runsOf(groupUtterances(lines)), [
-    { speaker: 0, runs: ["あ"] },
-    { speaker: 1, runs: ["い" + BODY] },
-  ]);
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 1, runs: ["あい" + BODY] }]);
   const plan = boundaryPlanOf(lines);
-  assert.equal(plan.applied.length, 1);
-  assert.equal(plan.skipped.shortNeighbor, 1);
-  assert.equal(plan.skipped.ambiguous, 0);
+  assert.deepEqual(plan.applied, [
+    { index: 0, from: 0, to: 1, chars: 1, kind: "chain" },
+    { index: 1, from: 0, to: 1, chars: 1, kind: "chain" },
+  ]);
+  assertNothingSkipped(plan);
 });
 
 /**
@@ -1498,11 +1516,16 @@ test("同じ final の同じ話者の長い行に接していれば、反対側�
   const plan = boundaryPlanOf(lines);
   assert.equal(plan.applied.length, 0);
   assertNothingSkipped(plan);
-  // 断片が 2 つ続く形でも、先頭の断片は同じ話者の本体に接しているので shortNeighbor に数えない
+  // 断片が 2 つ続く形でも、両方とも同じ話者の本体に接している（raw が A と言っている連続を
+  // 割る根拠は無い）。#55 は 1 行の窓で `い` だけを B へ寄せていたが、#57 の run 判定では
+  // 本体に接している側から順に「本体の一部」として外すので何もしない
   const chain = [line(BODY, 0, { seq: 5 }), line("あ", 0, { seq: 5 }), line("い", 0, { seq: 5 }), line(BODY, 1, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(chain)), [
+    { speaker: 0, runs: [BODY + "あい"] },
+    { speaker: 1, runs: [BODY] },
+  ]);
   const chainPlan = boundaryPlanOf(chain);
-  assert.equal(chainPlan.applied.length, 1);
-  assert.equal(chainPlan.applied[0].index, 2);
+  assert.equal(chainPlan.applied.length, 0);
   assertNothingSkipped(chainPlan);
 });
 
@@ -1614,7 +1637,9 @@ test("⓪の skipped は 0 件でも全キーを持つ（順序も固定。診�
   const { plan } = smoothSpeakerBoundaries([]);
   assert.deepEqual(Object.keys(plan.skipped), [
     "ambiguous",
-    "shortNeighbor",
+    "unresolvedChain",
+    "chainTooLong",
+    "weakContinuity",
     "punctuated",
     "backchannel",
     "differentFinal",
@@ -1644,10 +1669,244 @@ test("⓪を通してもテキストと行数は1つも変わらず、③と④�
 });
 
 test("既存の jitter fixture は⓪を足しても結果が変わらない（#36 の退行検出）", () => {
-  // `SHORT`(= JITTER_CHAR_LIMIT 文字)は⓪の閾値より長いので、⓪は #36 の fixture に一切掛からない
-  assert.ok(SHORT.length > BOUNDARY_FRAGMENT_CHAR_LIMIT, "⓪の閾値が①の閾値以上になっている");
+  // `SHORT`(= JITTER_CHAR_LIMIT 文字)は⓪の通常断片より長いので (b) に掛からず、
+  // `LONG`(= JITTER_CHAR_LIMIT + 1 文字)は拡張上限以下なので (a) の anchor にならない。
+  // つまり #36 の fixture には⓪の 2 段のどちらも掛からない（#57 で前提が 2 つになった）
+  assert.ok(SHORT.length > BOUNDARY_FRAGMENT_CHAR_LIMIT, "⓪の通常断片の閾値が①の閾値以上になっている");
+  assert.ok(LONG.length <= BOUNDARY_EXTENDED_CHAR_LIMIT, "①の LONG が⓪の anchor の長さになっている");
   for (const c of cases) {
     const plan = boundaryPlanOf(linesOf(c));
     assert.equal(plan.applied.length, 0, `${c.id}: ⓪が #36 の fixture に掛かった`);
+  }
+});
+
+// ---- ⓪ の拡張（#57）: 句読点付きの断片・4〜5 文字の断片・断片の chain ----
+//
+// 判定は 2 段。(a) `ANCHOR6`（拡張上限 + 1 文字）を anchor とする chain 判定、(b) 4 文字以上を本体・
+// 3 文字以下を断片とする #55 互換の run 判定。固定したいのは 4 つ。
+// 1. **(a) の 3 パターンが寄る** — 句読点付き / 4〜5 文字 / chain。それぞれ `kind` が付く
+// 2. **証拠が無ければ寄らない** — 語彙・文字種の連続性・直前の句読点・総量・寄せ先の一意性
+// 3. **(a) が決まらなければ (b) に落ち、#55 の形（短い断片 + 4〜5 文字の本体）は従来どおり寄る**
+// 4. **見送りは 1 行 1 理由**で、落ちた行だけを数える
+//
+// fixture はここでも匿名化した合成データ。文字列は長さと文字種にしか意味が無い。
+
+/** 拡張断片の上限ちょうど（ひらがな）。`ANCHOR6` と隣り合うと連続性「中」 */
+const EXT = "あ".repeat(BOUNDARY_EXTENDED_CHAR_LIMIT);
+/** 6 文字 = anchor の長さで、句読点で閉じている行 */
+const CLOSED6 = "い".repeat(BOUNDARY_EXTENDED_CHAR_LIMIT) + "。";
+
+// #57 の代表的な形。個別のテストと末尾の文字数完全性・不変性のテストで同じ配列を使う
+// （書き写すと、fixture を調整したときに片方だけ変わる）
+const PUNCT_TAIL = () => [line("専門スキ", 0, { seq: 5 }), line("ルです。", 1, { seq: 5 }), line(ANCHOR6, 0, { seq: 5 })];
+const EXT_TAIL = () => [line("始", 0, { seq: 5 }), line("めていた", 1, { seq: 5 }), line(ANCHOR6, 0, { seq: 5 })];
+const ALT_CHAIN = () => [
+  line(ANCHOR6, 0, { seq: 5 }),
+  line("テ", 1, { seq: 5 }),
+  line("キ", 0, { seq: 5 }),
+  line("ス", 1, { seq: 5 }),
+  line("ト", 0, { seq: 5 }),
+];
+const NO_ANCHOR_CHAIN = () => [line("これを", 0, { seq: 5 }), line("自動", 1, { seq: 5 }), line("化し", 0, { seq: 5 }), line("ます", 1, { seq: 5 })];
+const CLOSED_PREV = () => [line(CLOSED6, 0, { seq: 5 }), line("です。", 1, { seq: 5 })];
+const CROSSED_CHAIN = () => [line(ANCHOR6, 0, { seq: 5 }), line("い", 1, { seq: 5 }), line("あ", 0, { seq: 5 }), line(ANCHOR6, 1, { seq: 5 })];
+
+test("句読点で閉じた断片でも、直前の語と文字種が連続していれば前の語の続きとして寄る（kind: punctuated）", () => {
+  const lines = PUNCT_TAIL();
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 0, runs: ["専門スキルです。" + ANCHOR6] }]);
+  const plan = boundaryPlanOf(lines);
+  // 4 文字で拡張断片でもあるが、句読点を緩めた規則のほうがリスクが高いので `punctuated` を優先する
+  assert.deepEqual(plan.applied, [{ index: 1, from: 1, to: 0, chars: 4, kind: "punctuated" }]);
+  assertNothingSkipped(plan);
+});
+
+test("4〜5 文字の断片は、長い anchor と文字種の連続性（漢字 → ひらがな）があれば寄る（kind: extended）", () => {
+  const lines = EXT_TAIL();
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 0, runs: ["始めていた" + ANCHOR6] }]);
+  const plan = boundaryPlanOf(lines);
+  assert.deepEqual(plan.applied, [{ index: 1, from: 1, to: 0, chars: 4, kind: "extended" }]);
+  assertNothingSkipped(plan);
+});
+
+test("交互に割れた断片の chain は anchor の speaker へまとめて寄る（kind: chain）", () => {
+  const lines = ALT_CHAIN();
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 0, runs: [ANCHOR6 + "テキスト"] }]);
+  const plan = boundaryPlanOf(lines);
+  // 既に anchor と同じ speaker の行（キ・ト）は動かさず、`applied` にも載せない
+  assert.deepEqual(plan.applied, [
+    { index: 1, from: 1, to: 0, chars: 1, kind: "chain" },
+    { index: 3, from: 1, to: 0, chars: 1, kind: "chain" },
+  ]);
+  assertNothingSkipped(plan);
+});
+
+test("短い断片 + 4〜5 文字の本体（#55 の形）は anchor が無くても (b) で従来どおり寄る", () => {
+  const lines = [line("今日は", 0, { seq: 5 }), line("晴れですね", 1, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [{ speaker: 1, runs: ["今日は晴れですね"] }]);
+  assert.deepEqual(boundaryPlanOf(lines).applied, [{ index: 0, from: 0, to: 1, chars: 3, kind: "basic" }]);
+});
+
+test("句読点で閉じた相槌が 4〜5 文字の本体に挟まれていても、語彙で弾く（backchannel。punctuated ではない）", () => {
+  const lines = [line("進めます。", 0, { seq: 5 }), line("はい。", 1, { seq: 5 }), line("次です。", 0, { seq: 5 })];
+  // ⓪単体の出力で見る。①（#36 の jitter）は語彙を見ずに「同じ final で同じ話者に挟まれた 4 文字以下」を
+  // 寄せるので、`groupUtterances()` の段落数はここで固定したいものではない
+  assert.deepEqual(smoothSpeakerBoundaries(lines).lines.map((l) => l.speaker), [0, 1, 0]);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  assert.equal(skipped.backchannel, 1);
+  assert.equal(skipped.punctuated, 0);
+});
+
+test("両方とも anchor の長さなら判定の対象外（寄せず、見送りにも数えない）", () => {
+  const lines = [line("そうですね。", 0, { seq: 5 }), line("次に行きます。", 1, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 2);
+  const plan = boundaryPlanOf(lines);
+  assert.equal(plan.applied.length, 0);
+  assertNothingSkipped(plan);
+});
+
+test("両側の anchor が別 speaker なら寄せない（ambiguous）", () => {
+  const lines = [line(ANCHOR6, 0, { seq: 5 }), line(FRAG, 1, { seq: 5 }), line(ANCHOR6, 2, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 3);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  assert.equal(skipped.ambiguous, 1);
+});
+
+test("anchor の無い断片だけの final は寄せ先を決められない（unresolvedChain。境界に立つ全行を数える）", () => {
+  const lines = NO_ANCHOR_CHAIN();
+  // ⓪単体の出力で見る（①は挟まれた `自動` を寄せる）
+  assert.deepEqual(smoothSpeakerBoundaries(lines).lines.map((l) => l.speaker), [0, 1, 0, 1]);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  assert.equal(skipped.unresolvedChain, 4);
+});
+
+test("句読点で閉じていて直前との連続性が弱ければ寄せない（punctuated。ひらがな → 漢字）", () => {
+  const lines = [line(ANCHOR6, 0, { seq: 5 }), line("了解。", 1, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 2);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  // (a) で数えた行を (b) で数え直さない（1 行 1 理由）
+  assert.equal(skipped.punctuated, 1);
+  assert.equal(skipped.unresolvedChain, 0);
+});
+
+test("直前の行が句読点で閉じていれば、句読点付きの断片は前の語の続きではない（punctuated）", () => {
+  const lines = CLOSED_PREV();
+  assert.equal(groupUtterances(lines).length, 2);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  assert.equal(skipped.punctuated, 1);
+});
+
+test("4〜5 文字の断片は文字種の連続性が弱ければ寄せない（weakContinuity。ひらがな → 漢字）", () => {
+  const lines = [line(ANCHOR6, 0, { seq: 5 }), line("漢字です", 1, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 2);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  assert.equal(skipped.weakContinuity, 1);
+});
+
+test("寄せる行の総文字数が上限を超える chain は寄せない（chainTooLong）", () => {
+  const piece = "あ".repeat(BOUNDARY_FRAGMENT_CHAR_LIMIT);
+  const n = Math.floor(BOUNDARY_CHAIN_MAX_CHARS / piece.length) + 1; // 上限をちょうど超える本数
+  const lines = [line(ANCHOR6, 0, { seq: 5 }), ...Array.from({ length: n }, () => line(piece, 1, { seq: 5 }))];
+  assert.equal(groupUtterances(lines).length, 2);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  assert.equal(skipped.chainTooLong, n);
+});
+
+test("chain の 1 行が語彙に当たれば chain 全体を寄せない。数えるのは落ちた行だけ", () => {
+  const lines = [line(ANCHOR6, 0, { seq: 5 }), line("あ", 1, { seq: 5 }), line("はい", 1, { seq: 5 }), line("い", 1, { seq: 5 })];
+  assert.equal(groupUtterances(lines).length, 2);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  assert.deepEqual(skipped, { ...NO_SKIPS, backchannel: 1 }, "落ちていない行まで数えている");
+});
+
+test("両側の anchor が別 speaker でも、chain が既に割れていれば対象外（見送りにも数えない）", () => {
+  const lines = [line(ANCHOR6, 0, { seq: 5 }), line("あ", 0, { seq: 5 }), line("い", 1, { seq: 5 }), line(ANCHOR6, 1, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(lines)), [
+    { speaker: 0, runs: [ANCHOR6 + "あ"] },
+    { speaker: 1, runs: ["い" + ANCHOR6] },
+  ]);
+  const plan = boundaryPlanOf(lines);
+  assert.equal(plan.applied.length, 0);
+  assertNothingSkipped(plan);
+});
+
+test("両側の anchor が別 speaker で chain が交差していれば ambiguous（境界に立つ全行を数える）", () => {
+  const lines = CROSSED_CHAIN();
+  // ⓪単体の出力で見る（①は挟まれた `い` を寄せる）
+  assert.deepEqual(smoothSpeakerBoundaries(lines).lines.map((l) => l.speaker), [0, 1, 0, 1]);
+  const { applied, skipped } = boundaryPlanOf(lines);
+  assert.equal(applied.length, 0);
+  assert.equal(skipped.ambiguous, 2);
+});
+
+/**
+ * (a) と (b) が食い違う形。(a) は「6 文字以上の本体が同じ final にある」という #55 より強い証拠を
+ * 要求しているので、成立すれば (a) を優先する。(a) が内容ゲートで落ちれば (b) の #55 互換に落ちる。
+ */
+test("(a) が成立すれば (b) より優先し、(a) が内容ゲートで落ちれば (b) に落ちる", () => {
+  // (a) 成立: `EXT`（ひらがな）は `ANCHOR6`（ひらがな）と連続性「中」なので anchor の speaker へ。
+  // (b) なら `今日は` が `EXT` の speaker 1 へ寄っていた形
+  const win = [line(ANCHOR6, 0, { seq: 5 }), line(EXT, 1, { seq: 5 }), line("今日は", 0, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(win)), [{ speaker: 0, runs: [ANCHOR6 + EXT + "今日は"] }]);
+  const winPlan = boundaryPlanOf(win);
+  assert.deepEqual(winPlan.applied, [{ index: 1, from: 1, to: 0, chars: EXT.length, kind: "extended" }]);
+  assertNothingSkipped(winPlan);
+  // (a) 落ちる: `晴れですね` は前後どちらとも連続性「弱」。(b) が #55 と同じく `今日は` を 1 へ寄せる
+  const fall = [line(ANCHOR6, 0, { seq: 5 }), line("晴れですね", 1, { seq: 5 }), line("今日は", 0, { seq: 5 })];
+  assert.deepEqual(runsOf(groupUtterances(fall)), [
+    { speaker: 0, runs: [ANCHOR6] },
+    { speaker: 1, runs: ["晴れですね今日は"] },
+  ]);
+  const fallPlan = boundaryPlanOf(fall);
+  assert.deepEqual(fallPlan.applied, [{ index: 2, from: 0, to: 1, chars: 3, kind: "basic" }]);
+  assert.equal(fallPlan.skipped.weakContinuity, 1);
+});
+
+test("文字種の連続性の表（#57）", () => {
+  assert.equal(continuity("スキ", "ルです"), "strong", "カタカナ → カタカナ");
+  assert.equal(continuity("テー", "ブル"), "strong", "長音もカタカナ");
+  assert.equal(continuity("専", "門"), "strong", "漢字 → 漢字");
+  assert.equal(continuity("佐々", "木"), "strong", "々 は漢字");
+  assert.equal(continuity("AP", "I"), "strong", "英数 → 英数");
+  assert.equal(continuity("ＡＰ", "Ｉ"), "strong", "全角の英数");
+  assert.equal(continuity("始", "めていた"), "medium", "漢字 → ひらがな");
+  assert.equal(continuity("な", "ので"), "medium", "ひらがな → ひらがな");
+  assert.equal(continuity("です", "了解"), "weak", "ひらがな → 漢字");
+  assert.equal(continuity("スキ", "です"), "weak", "カタカナ → ひらがな");
+  assert.equal(continuity("です。", "次"), "none", "前が句読点で閉じている");
+  assert.equal(continuity("です", "。"), "none", "後が句読点");
+  assert.equal(continuity("あ ", "い"), "none", "空白");
+  assert.equal(continuity("", "あ"), "none", "空");
+  assert.equal(continuity("あ", ""), "none", "空");
+});
+
+test("⓪の kinds は 0 件でも全キーを持つ（順序も固定。診断の表示名の表と突き合わせる）", () => {
+  const { plan } = smoothSpeakerBoundaries([]);
+  assert.deepEqual(Object.keys(plan.kinds), ["basic", "extended", "punctuated", "chain"]);
+  assert.deepEqual(Object.values(plan.kinds), [0, 0, 0, 0]);
+  // 件数は `applied` から派生する値と一致する
+  const { kinds, applied } = boundaryPlanOf(ALT_CHAIN());
+  assert.deepEqual(kinds, { basic: 0, extended: 0, punctuated: 0, chain: applied.length });
+});
+
+test("#57 の fixture でもテキストと行数は 1 つも変わらず、③と④の文字数が一致する", () => {
+  const fixtures: Line[][] = [PUNCT_TAIL(), EXT_TAIL(), ALT_CHAIN(), NO_ANCHOR_CHAIN(), CLOSED_PREV(), CROSSED_CHAIN()];
+  for (const lines of fixtures) {
+    assert.deepEqual(displayedChars(lines), receivedChars(lines));
+    const rows = groupUtterances(lines).reduce(
+      (n: number, g: Record<string, unknown>) => n + (g.texts as string[]).length,
+      0,
+    );
+    assert.equal(rows, lines.length);
+    const snapshot = JSON.stringify(lines);
+    smoothSpeakerBoundaries(lines);
+    assert.equal(JSON.stringify(lines), snapshot, "入力を書き換えている");
   }
 });

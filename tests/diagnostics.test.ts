@@ -21,6 +21,7 @@ import {
   textIntegrityStageRows,
   textIntegrityVerdict,
   BOUNDARY_SKIP_LABELS,
+  BOUNDARY_KIND_LABELS,
 } from "../public/diagnostics.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
 // 表示補正の計画は utterances.js が唯一の定義箇所（#48）。**診断もそこを通る**ので、
@@ -930,10 +931,10 @@ const BOUNDARY_LINES = [
 test("境界補正の件数・文字数・見送り内訳が Markdown に出る", () => {
   const md = buildDiagnosticsMarkdown(islandArgs(BOUNDARY_LINES));
   assert.match(md, /### 表示補正（speaker boundary）/);
-  assert.match(md, /- 表示補正（speaker boundary）: 1 seg \/ 2 文字/);
+  assert.match(md, /- 表示補正（speaker boundary）: 1 seg \/ 2 文字（通常 1 \/ 4〜5文字 0 \/ 句読点付き 0 \/ chain 0）/);
   assert.match(
     md,
-    /- 境界補正の見送り: 曖昧 0 \/ 隣も断片 0 \/ 句読点で閉じている 0 \/ 相槌語彙 0 \/ 隣が別 final 0 \/ 再接続境界 0 \/ 話者不明 0 \/ seq なし 0/,
+    /- 境界補正の見送り: 曖昧 0 \/ chain 未解決 0 \/ chain が長い 0 \/ 連続性が弱い 0 \/ 句読点で閉じている 0 \/ 相槌語彙 0 \/ 隣が別 final 0 \/ 再接続境界 0 \/ 話者不明 0 \/ seq なし 0/,
   );
   // パイプラインの順に、②の節より手前
   assert.ok(md.indexOf("### 表示補正（speaker boundary）") < md.indexOf("### 表示補正（minor island）"));
@@ -977,10 +978,93 @@ test("画面パネルにも境界補正の行が出る（Markdown と同じ行�
   const rows = speakerDiagRows(islandArgs(BOUNDARY_LINES)) as Array<[string, string]>;
   assert.deepEqual(
     rows.find(([k]) => k === "表示補正（speaker boundary）"),
-    ["表示補正（speaker boundary）", "1 seg / 2 文字"],
+    ["表示補正（speaker boundary）", "1 seg / 2 文字（通常 1 / 4〜5文字 0 / 句読点付き 0 / chain 0）"],
   );
   const labels = rows.map(([k]) => k);
   assert.ok(labels.includes("境界補正の見送り"));
   // パイプラインの順に、②の行より手前
   assert.ok(labels.indexOf("表示補正（speaker boundary）") < labels.indexOf("表示補正"));
+});
+
+// ---- 表示補正（speaker boundary）の種別と新しい見送り理由（#57） ----
+//
+// `applied[].kind`（通常 / 4〜5文字 / 句読点付き / chain）の内訳が 1 行目の括弧に出ること、
+// #57 で足した理由（chain 未解決 / chain が長い / 連続性が弱い）が内訳に出ること、
+// どちらにも会話本文が混ざらないことを固定する。テキストは長さと文字種にしか意味が無い。
+
+/**
+ * 4 種類の `kind` が 1 つずつ以上出る合成セッション。`line()` は全行 seq:1 で、`"x"` は英数なので
+ * 英数どうしの境目は連続性「強」。
+ */
+const BOUNDARY_KIND_LINES = [
+  line(0, 120, 240, 1_010_000),
+  line(1, 1, 2, 1_010_000), // 通常: 両隣の 0 へ
+  line(0, 76, 152, 1_020_000),
+  // 句読点付き: 直前の x と連続。4 文字(tier 2)でもあるが、kind の優先順位(punctuated > extended)で
+  // 「句読点付き」に数える(優先順位そのものは utterances.test.ts で固定)
+  { ...line(1, 2, 4, 1_020_000), text: "xxx。" },
+  line(0, 50, 100, 1_030_000),
+  line(1, 2, 4, 1_030_000), // 4〜5文字: 前後の x と連続
+  line(0, 50, 100, 1_040_000),
+  line(1, 1, 1, 1_040_000), // chain: 交互に割れた 1 文字が両隣の 0 へ
+  line(0, 1, 1, 1_040_000),
+  line(1, 1, 1, 1_040_000),
+  line(0, 50, 100, 1_050_000),
+];
+
+/**
+ * 新しい見送り理由が 1 つずつ以上出る合成セッション。先頭の断片だけの final（seq:2）は
+ * anchor が無く `chain 未解決`、ひらがなの 4 文字は英数の anchor と連続性「弱」、
+ * 3 文字 × 3 行は総量の上限（8）を超える。
+ */
+const BOUNDARY_SKIP_LINES = [
+  { ...line(1, 1, 1, 1_000_000), seq: 2 },
+  { ...line(0, 1, 1, 1_000_000), seq: 2 },
+  { ...line(1, 1, 1, 1_000_000), seq: 2 },
+  { ...line(0, 1, 1, 1_000_000), seq: 2 },
+  line(0, 50, 100, 1_010_000),
+  { ...line(1, 2, 4, 1_010_000), text: "あいうえ" },
+  line(0, 50, 100, 1_020_000),
+  line(1, 3, 3, 1_020_000),
+  line(1, 3, 3, 1_020_000),
+  line(1, 3, 3, 1_020_000),
+];
+
+test("境界補正の種別の内訳が Markdown の 1 行目に出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(BOUNDARY_KIND_LINES));
+  assert.match(md, /- 表示補正（speaker boundary）: 5 seg \/ 12 文字（通常 1 \/ 4〜5文字 1 \/ 句読点付き 1 \/ chain 2）/);
+  assert.match(
+    md,
+    /- 境界補正の見送り: 曖昧 0 \/ chain 未解決 0 \/ chain が長い 0 \/ 連続性が弱い 0 \/ 句読点で閉じている 0 \/ 相槌語彙 0 \/ 隣が別 final 0 \/ 再接続境界 0 \/ 話者不明 0 \/ seq なし 0/,
+  );
+});
+
+test("#57 で足した見送り理由が内訳に出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(BOUNDARY_SKIP_LINES));
+  assert.match(md, /- 表示補正（speaker boundary）: 0 seg \/ 0 文字（通常 0 \/ 4〜5文字 0 \/ 句読点付き 0 \/ chain 0）/);
+  assert.match(
+    md,
+    /- 境界補正の見送り: 曖昧 0 \/ chain 未解決 4 \/ chain が長い 3 \/ 連続性が弱い 1 \/ 句読点で閉じている 0 \/ 相槌語彙 0 \/ 隣が別 final 0 \/ 再接続境界 0 \/ 話者不明 0 \/ seq なし 0/,
+  );
+  // 見送った行の本文も出ない
+  assert.equal(md.includes("あいうえ"), false);
+});
+
+/** 見送り理由と同じ流儀: キーの定義箇所は `utterances.js`（計画の `kinds` のキー列）で、表示名の表が順序まで一致する */
+test("種別の表示名は全キーに表示名があり、順序も計画と一致する", () => {
+  assert.deepEqual(
+    BOUNDARY_KIND_LABELS.map(([key]) => key),
+    Object.keys(smoothSpeakerBoundaries([]).plan.kinds),
+  );
+  for (const [, label] of BOUNDARY_KIND_LABELS) assert.ok(label.length > 0);
+});
+
+test("種別の内訳にも会話本文が混入しない（画面パネルと Markdown）", () => {
+  const marker = "このもじれつはほんぶんのしるし";
+  const lines = BOUNDARY_KIND_LINES.map((l) => (l.text.length > 5 ? { ...l, text: marker } : l));
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.equal(md.includes(marker), false);
+  assert.equal(md.includes("xxx。"), false, "寄せた断片の本文が出ている");
+  const rows = speakerDiagRows(islandArgs(lines)) as Array<[string, string]>;
+  for (const [, value] of rows) assert.equal(String(value).includes(marker), false);
 });

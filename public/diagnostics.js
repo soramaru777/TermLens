@@ -392,14 +392,15 @@ function minorIslandRows(islandPlan, ratioBasis) {
  * `tests/diagnostics.test.ts` が `smoothSpeakerBoundaries([]).plan.skipped` のキー列と突き合わせて
  * 固定する(理由を足して表示名を付け忘れると、その件数が診断から黙って消えるため)。
  *
- * `曖昧` が多ければ両隣が長い形(`A長 | X短 | B長`)が多く追加ゲート(文字種の連続性)の検討材料、
- * `隣も断片` が多ければ断片の連鎖が多く 2 パス目の検討材料、`相槌語彙` が多ければ語彙リストが
- * 効いている、のように**実データから閾値と語彙を決めるための材料**なので、内訳を必ず出す。
- * 長い行は断片候補にならないだけで内訳には入らない(`boundaryFragmentTarget()` のコメント参照)。
+ * **実データから閾値と語彙を決めるための材料**なので、内訳を必ず出す(理由ごとの読み方は Wiki の
+ * `termlens-stt-pipeline` ⓪の節に 1 か所だけ書く)。長い行は断片候補にならないだけで内訳には入らない。
+ * **既存のキーは改名しない**(#57) — 過去セッションの診断 Markdown と件数を比べられなくなる。
  */
 export const BOUNDARY_SKIP_LABELS = Object.freeze([
   ["ambiguous", "曖昧"],
-  ["shortNeighbor", "隣も断片"],
+  ["unresolvedChain", "chain 未解決"],
+  ["chainTooLong", "chain が長い"],
+  ["weakContinuity", "連続性が弱い"],
   ["punctuated", "句読点で閉じている"],
   ["backchannel", "相槌語彙"],
   ["differentFinal", "隣が別 final"],
@@ -409,17 +410,33 @@ export const BOUNDARY_SKIP_LABELS = Object.freeze([
 ]);
 
 /**
+ * 寄せた行の種別の表示名(#57)。**順序も含めて `[key, label]` の列**で、キーの定義箇所は
+ * `utterances.js` の `BOUNDARY_APPLIED_KINDS`(計画の `kinds` のキー列)。`BOUNDARY_SKIP_LABELS` と
+ * 同じく `tests/diagnostics.test.ts` が `smoothSpeakerBoundaries([]).plan.kinds` のキー列と突き合わせる。
+ * **どの規則が寄せたか**を見るための内訳で、`通常` は #55 相当。
+ */
+export const BOUNDARY_KIND_LABELS = Object.freeze([
+  ["basic", "通常"],
+  ["extended", "4〜5文字"],
+  ["punctuated", "句読点付き"],
+  ["chain", "chain"],
+]);
+
+/**
  * 境界平滑化の見出し行。**画面パネルと Markdown が同じ配列から描く**(既存の規則)。
- * 出るのは件数・文字数・理由名だけで、会話本文も speaker 番号の明細も出さない
+ * 出るのは件数・文字数・種別名・理由名だけで、会話本文も speaker 番号の明細も出さない
  * (speaker ごとの明細は②と違って閾値決めの材料にならない)。
  * 計画は `planDisplayCorrection()` の同じ計算からしか来ず永続化もされないので、
- * `applied` / `skipped` の欠損は想定しない(②の `?? {}` は保存データ由来の経緯があるが、⓪は新規)。
+ * `applied` / `kinds` / `skipped` の欠損は想定しない(②の `?? {}` は保存データ由来の経緯があるが、⓪は新規)。
+ * 見出しと `N seg / M 文字` の前置きは #55 のまま(種別の内訳は括弧で後ろに足す)。
+ * 種別も見送りも、計画が持つ 0 埋めの件数を同じ `skipBreakdown()` で描く。
  */
 function boundaryRows(boundaryPlan) {
   if (!boundaryPlan) return [];
   const chars = boundaryPlan.applied.reduce((n, a) => n + a.chars, 0);
+  const kinds = skipBreakdown(BOUNDARY_KIND_LABELS, (key) => boundaryPlan.kinds[key]);
   return [
-    ["表示補正（speaker boundary）", `${boundaryPlan.applied.length} seg / ${chars} 文字`],
+    ["表示補正（speaker boundary）", `${boundaryPlan.applied.length} seg / ${chars} 文字（${kinds}）`],
     ["境界補正の見送り", skipBreakdown(BOUNDARY_SKIP_LABELS, (key) => boundaryPlan.skipped[key])],
   ];
 }
