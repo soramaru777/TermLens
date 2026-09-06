@@ -9,6 +9,8 @@ import {
   JITTER_WINDOW_MS,
   MINOR_ISLAND_MAX_RATIO,
   MINOR_ISLAND_MAX_WORDS,
+  MINOR_ISLAND_RELATIVE_MAX_RATIO,
+  MINOR_ISLAND_RELATIVE_CAP_RATIO,
   MIN_TOTAL_WORDS_FOR_ISLANDS,
   BACKCHANNEL_WORDS,
   groupUtterances,
@@ -24,7 +26,7 @@ import {
   BOUNDARY_CHAIN_MAX_CHARS,
   continuity,
 } from "../public/utterances.js";
-import { collectSpeakerStats } from "../public/speaker-stats.js";
+import { collectSpeakerStats, MINOR_SPEAKER_RATIO } from "../public/speaker-stats.js";
 // 文字数の数え方は diagnostics.js が唯一の定義箇所（#52）。ここで数え直すと、
 // 診断が読む数と、この不変条件が守る数が別物になる
 import { countTextChars } from "../public/diagnostics.js";
@@ -481,6 +483,15 @@ test("minor の割合が閾値を超えていれば島とみなさない", () =>
   const plan = planOf(lines);
   assert.deepEqual(plan.minors, [], "閾値を超える speaker は minor ではない");
   assert.deepEqual(plan.merges, []);
+  // **相対判定(#59)でも minor にならない値であること。** この fixture は絶対閾値の境界を見るのが
+  // 主題なので、相対判定の範囲に入っていると「絶対で落ちた」のか「相対で拾われた」のか読めなくなる
+  const [j] = plan.minorJudgements;
+  assert.equal(j.speaker, 2);
+  assert.ok(
+    j.relativeRatio != null && j.relativeRatio > MINOR_ISLAND_RELATIVE_MAX_RATIO,
+    `fixture が相対判定の範囲に入っている（相対比 ${j.relativeRatio}）`,
+  );
+  assert.equal(j.kind, "none");
 });
 
 test("想定話者数が自動なら1件も補正しない（disabledBy: auto）", () => {
@@ -906,6 +917,333 @@ test("A → X → ? → X → A は不一致ではなく「隣が話者不明」
   assert.deepEqual(plan.minors, [2]);
   assert.deepEqual(plan.merges, []);
   assert.deepEqual(plan.skipped, { mismatch: 0, tooLong: 0, edge: 0, boundary: 0, unknown: 2 });
+});
+
+// ---- minor 候補の判定を「絶対 OR 相対（絶対上限つき）」にする（#59） ----
+//
+// 固定したいのは4つ。
+// 1. **絶対判定は据え置き** — `ratio < MINOR_ISLAND_MAX_RATIO` は従来どおり minor。#48 の fixture は
+//    1本も結果が変わらない
+// 2. **相対判定** — 「統合先になれる主要 speaker の最小割合」に対する比が
+//    `MINOR_ISLAND_RELATIVE_MAX_RATIO` 以下、かつ絶対割合が `MINOR_ISLAND_RELATIVE_CAP_RATIO` 未満なら minor。
+//    実機 2 サンプル目（`56.6% / 40.0% / 3.4%`、想定 2 人）を拾うための経路
+// 3. **1 speaker 1 種別** — 両方に当たれば `absolute` に 1 回だけ数える。内訳は閾値を決める材料なので二重に数えない
+// 4. **minor 判定後は現行の②③をそのまま流れる** — island 条件・中立化のルールは変えない
+//
+// fixture は合成データ。word 数の比だけが判定に効く。
+
+/** 実機 2 サンプル目と同じ比（566 / 400 / 34）。minor 側は run 長の上限に掛からないよう 2 つの島に割る */
+const RELATIVE_SPEC: IslandSpec = [
+  [0, 300],
+  [1, 400],
+  [0, 100],
+  [2, 17],
+  [0, 100],
+  [2, 17],
+  [0, 66],
+];
+
+/** 判定明細から speaker → 種別の対応だけを取る */
+function kindsOf(plan: ReturnType<typeof planOf>): Record<number, string> {
+  return Object.fromEntries(plan.minorJudgements.map((j) => [j.speaker, j.kind]));
+}
+
+test("固定 3% を超える extra speaker でも、主要 speaker との差が十分大きければ相対判定で minor になる", () => {
+  const lines = islandLines(RELATIVE_SPEC);
+  const stats = collectSpeakerStats(lines);
+  const extra = stats.speakers.find((x) => x.speaker === 2)!;
+  assert.ok(extra.ratio >= MINOR_ISLAND_MAX_RATIO, "fixture が絶対閾値の内側にある（相対判定を観測できない）");
+
+  const plan = planOf(lines);
+  assert.deepEqual(plan.majors, [0, 1]);
+  assert.deepEqual(plan.minors, [2]);
+  assert.deepEqual(plan.others, []);
+  assert.deepEqual(plan.minorKinds, { absolute: 0, relative: 1, none: 0 });
+  const [j] = plan.minorJudgements;
+  assert.equal(j.kind, "relative");
+  assert.equal(plan.smallestMajorRatio, stats.speakers.find((x) => x.speaker === 1)!.ratio);
+  assert.ok(j.relativeRatio != null && j.relativeRatio <= MINOR_ISLAND_RELATIVE_MAX_RATIO);
+  // 島は現行②の条件でそのまま寄る（`0 → 2 → 0` が 2 つ）
+  assert.deepEqual(plan.merges, [{ from: 2, to: 0, segments: 2, words: 34, indexes: [3, 5] }]);
+  assert.deepEqual(speakersOf(groupUtterances(lines, { expectedSpeakers: EXPECTED_2 })), [0, 1, 0]);
+});
+
+test("絶対閾値未満の speaker は従来どおり absolute として minor になる", () => {
+  // 700 / 280 / 20 = 2%
+  const lines = islandLines([
+    [0, 400],
+    [1, 280],
+    [0, 290],
+    [2, 20],
+    [0, 10],
+  ]);
+  const plan = planOf(lines);
+  assert.deepEqual(plan.minors, [2]);
+  assert.deepEqual(plan.minorKinds, { absolute: 1, relative: 0, none: 0 });
+  assert.deepEqual(plan.merges, [{ from: 2, to: 0, segments: 1, words: 20, indexes: [3] }]);
+});
+
+test("相対比も絶対上限も超える speaker（60% / 30% / 10%）は minor にしない", () => {
+  const lines = islandLines([
+    [0, 300],
+    [1, 300],
+    [0, 300],
+    [2, 100],
+  ]);
+  const plan = planOf(lines);
+  assert.deepEqual(plan.minors, []);
+  assert.deepEqual(plan.others, [2]);
+  assert.deepEqual(plan.minorKinds, { absolute: 0, relative: 0, none: 1 });
+  assert.deepEqual(plan.merges, []);
+  const [j] = plan.minorJudgements;
+  assert.ok(j.relativeRatio! > MINOR_ISLAND_RELATIVE_MAX_RATIO);
+  assert.ok(j.ratio >= MINOR_ISLAND_RELATIVE_CAP_RATIO);
+});
+
+test("主要 speaker に近い extra speaker（50% / 30% / 20%）は minor にしない", () => {
+  const lines = islandLines([
+    [0, 250],
+    [1, 300],
+    [0, 250],
+    [2, 200],
+  ]);
+  const plan = planOf(lines);
+  assert.deepEqual(plan.majors, [0, 1], "順位は word 数の降順（0 が 500、1 が 300）");
+  assert.deepEqual(plan.minors, []);
+  assert.deepEqual(plan.others, [2]);
+  assert.equal(kindsOf(plan)[2], "none");
+});
+
+/**
+ * **絶対上限が単独で効くこと。** 想定 2 人の実分布では「最小の主要 speaker」が 50% を超えることは
+ * 無いので、現行値（相対 0.10 / 上限 5%）では上限が効く分布は作れない — 上限は相対閾値を
+ * 広げたときの歯止めであり、その歯止めそのものを固定するために統計を直接与える
+ * （`planMinorIslandMerges()` は `stats` の整合性を検証しない）。
+ */
+test("相対比が閾値以下でも絶対割合が上限以上なら minor にしない（上限が単独で効く）", () => {
+  const cap = MINOR_ISLAND_RELATIVE_CAP_RATIO;
+  const rel = MINOR_ISLAND_RELATIVE_MAX_RATIO;
+  // 上限ちょうどの extra と、相対比が閾値の内側（0.083）に収まる主要 speaker。
+  // **相対の境界は別のテストで見る**ので、ここは境界から離して「上限だけで落ちる」ことを固定する
+  const stats = {
+    detected: 3,
+    ratioBasis: "words",
+    totalWords: MIN_TOTAL_WORDS_FOR_ISLANDS,
+    speakers: [
+      { speaker: 0, words: 1000, ratio: 0.9 },
+      { speaker: 1, words: 800, ratio: (cap / rel) * 1.2 },
+      { speaker: 2, words: 50, ratio: cap },
+    ],
+  };
+  const lines = islandLines([
+    [0, 100],
+    [1, 100],
+    [2, 5],
+    [1, 100],
+  ]);
+  const plan = planMinorIslandMerges(lines, { expectedSpeakers: EXPECTED_2, stats: stats as never });
+  assert.equal(plan.disabledBy, null);
+  const [j] = plan.minorJudgements;
+  assert.equal(j.speaker, 2);
+  assert.ok(j.relativeRatio! < rel, "fixture の相対比が閾値の内側にない");
+  assert.equal(j.kind, "none", "上限以上を相対判定で minor にしている");
+  assert.deepEqual(plan.minors, []);
+});
+
+test("絶対割合が上限未満でも相対比が閾値を超えれば minor にしない（相対が単独で効く）", () => {
+  // 800 / 150 / 40 → extra は 4.0%（上限未満、絶対閾値以上）、最小の主要 15.2% に対して 0.27
+  const lines = islandLines([
+    [0, 400],
+    [1, 150],
+    [0, 400],
+    [2, 40],
+  ]);
+  const plan = planOf(lines);
+  const [j] = plan.minorJudgements;
+  assert.ok(j.ratio >= MINOR_ISLAND_MAX_RATIO && j.ratio < MINOR_ISLAND_RELATIVE_CAP_RATIO, "fixture が上限の内側にない");
+  assert.ok(j.relativeRatio! > MINOR_ISLAND_RELATIVE_MAX_RATIO);
+  assert.equal(j.kind, "none");
+  assert.deepEqual(plan.minors, []);
+});
+
+test("相対比がちょうど閾値なら minor になる（以下）", () => {
+  // 500 / 500 / 50 → 50 / 500 = 0.1 ちょうど。extra は 4.76% で上限未満・絶対閾値以上
+  const lines = islandLines([
+    [0, 500],
+    [1, 500],
+    [2, 50],
+  ]);
+  const plan = planOf(lines);
+  const [j] = plan.minorJudgements;
+  assert.equal(j.relativeRatio, MINOR_ISLAND_RELATIVE_MAX_RATIO, "fixture が閾値ちょうどになっていない");
+  assert.ok(j.ratio >= MINOR_ISLAND_MAX_RATIO && j.ratio < MINOR_ISLAND_RELATIVE_CAP_RATIO);
+  assert.equal(j.kind, "relative");
+});
+
+test("主要 speaker 側も小さい分布（90% / 4% / 3.4%）では相対判定で minor にしない", () => {
+  const lines = islandLines([
+    [0, 450],
+    [1, 40],
+    [0, 450],
+    [2, 34],
+  ]);
+  const plan = planOf(lines);
+  assert.deepEqual(plan.majors, [0, 1], "4% は絶対閾値以上なので主要");
+  const [j] = plan.minorJudgements;
+  assert.ok(j.relativeRatio! > MINOR_ISLAND_RELATIVE_MAX_RATIO, "3.4 / 4 は 0.85");
+  assert.equal(j.kind, "none");
+  assert.deepEqual(plan.others, [2]);
+});
+
+/**
+ * **主要 speaker が 1 人も残らなければ相対判定の基準が無い。** 実分布では最上位が 3% 未満になることは
+ * 無いので統計を直接与える（`stats` の整合性は検証されない）。基準が無い以上、絶対判定だけで決める。
+ */
+test("主要 speaker が空なら相対判定を行わない（基準は null）", () => {
+  const stats = {
+    detected: 3,
+    ratioBasis: "words",
+    totalWords: MIN_TOTAL_WORDS_FOR_ISLANDS,
+    speakers: [
+      { speaker: 0, words: 2, ratio: 0.02 },
+      { speaker: 1, words: 2, ratio: 0.02 },
+      { speaker: 2, words: 4, ratio: 0.025 },
+    ],
+  };
+  const lines = islandLines([
+    [0, 100],
+    [1, 100],
+    [2, 5],
+  ]);
+  const plan = planMinorIslandMerges(lines, { expectedSpeakers: EXPECTED_2, stats: stats as never });
+  assert.equal(plan.disabledBy, null);
+  assert.deepEqual(plan.majors, []);
+  assert.equal(plan.smallestMajorRatio, null);
+  for (const j of plan.minorJudgements) {
+    assert.equal(j.relativeRatio, null);
+    assert.ok(j.kind === "absolute" || j.kind === "none");
+  }
+  assert.deepEqual(kindsOf(plan), { 0: "absolute", 1: "absolute", 2: "absolute" });
+  assert.deepEqual(plan.merges, [], "統合先が無いので何も寄らない");
+});
+
+test("想定話者数が自動なら判定明細も空（disabledBy: auto）", () => {
+  const plan = planOf(islandLines(RELATIVE_SPEC), "auto");
+  assert.equal(plan.disabledBy, "auto");
+  assert.deepEqual(plan.minorJudgements, []);
+  assert.deepEqual(plan.minorKinds, { absolute: 0, relative: 0, none: 0 });
+  assert.equal(plan.smallestMajorRatio, null);
+});
+
+test("検出が想定以下なら判定明細も空（disabledBy: detectedNotOver）", () => {
+  const plan = planOf(
+    islandLines([
+      [0, 300],
+      [1, 200],
+    ]),
+  );
+  assert.equal(plan.disabledBy, "detectedNotOver");
+  assert.deepEqual(plan.minorJudgements, []);
+  assert.deepEqual(plan.minorKinds, { absolute: 0, relative: 0, none: 0 });
+});
+
+test("絶対と相対の両方に当たる speaker は absolute に 1 回だけ数える", () => {
+  // 600 / 380 / 20 → 2%（絶対閾値未満）かつ 20 / 380 = 0.053（相対閾値以下）
+  const lines = islandLines([
+    [0, 600],
+    [1, 380],
+    [2, 20],
+  ]);
+  const plan = planOf(lines);
+  const [j] = plan.minorJudgements;
+  assert.ok(j.ratio < MINOR_ISLAND_MAX_RATIO && j.relativeRatio! <= MINOR_ISLAND_RELATIVE_MAX_RATIO);
+  assert.equal(j.kind, "absolute");
+  assert.deepEqual(plan.minorKinds, { absolute: 1, relative: 0, none: 0 });
+});
+
+test("主要 speaker が同数でも判定は決定的で、行の並びを変えても同じ明細になる", () => {
+  // 480 / 480 / 40 → extra 4%、相対比 0.083
+  const spec: IslandSpec = [
+    [1, 240],
+    [0, 480],
+    [2, 20],
+    [1, 240],
+    [2, 20],
+  ];
+  const plan = planOf(islandLines(spec));
+  assert.deepEqual(plan.majors, [0, 1], "同数なら speaker 番号の小さい方が上位");
+  assert.equal(kindsOf(plan)[2], "relative");
+  const reordered = planOf(islandLines([...spec].reverse()));
+  assert.deepEqual(reordered.majors, plan.majors);
+  assert.deepEqual(reordered.minorJudgements, plan.minorJudgements);
+  assert.deepEqual(reordered.smallestMajorRatio, plan.smallestMajorRatio);
+});
+
+test("0 word の speaker と話者不明の行があっても例外にならず、0 word は absolute", () => {
+  const lines = islandLines([
+    [0, 300],
+    [1, 200],
+    [null, 3],
+    [3, 0],
+    [0, 10],
+  ]);
+  const plan = planOf(lines);
+  assert.equal(plan.disabledBy, null);
+  assert.equal(kindsOf(plan)[3], "absolute");
+  assert.ok(plan.minorJudgements.every((j) => Number.isFinite(j.ratio)));
+});
+
+test("判定は入力の行と統計を変更しない", () => {
+  const lines = islandLines(RELATIVE_SPEC);
+  const stats = collectSpeakerStats(lines);
+  const linesBefore = structuredClone(lines);
+  const statsBefore = structuredClone(stats);
+  planMinorIslandMerges(lines, { expectedSpeakers: EXPECTED_2, stats });
+  assert.deepEqual(lines, linesBefore);
+  assert.deepEqual(stats, statsBefore);
+});
+
+test("同じ入力なら同じ計画になる（純関数）", () => {
+  const lines = islandLines(RELATIVE_SPEC);
+  assert.deepEqual(planOf(lines), planOf(lines));
+});
+
+/**
+ * 相対判定の絶対上限は診断の警告線（`MINOR_SPEAKER_RATIO`）と同じ値に置いてある —
+ * 「診断が疑わない割合の speaker を機械が相対判定で寄せることはない」という関係。
+ * 定数は役割が違うので別に持つが、片方だけ動かすのは意図的な判断であるべきなのでここで固定する。
+ */
+test("相対判定の絶対上限は診断の警告線と同じ値", () => {
+  assert.equal(MINOR_ISLAND_RELATIVE_CAP_RATIO, MINOR_SPEAKER_RATIO);
+  assert.ok(MINOR_ISLAND_MAX_RATIO < MINOR_ISLAND_RELATIVE_CAP_RATIO, "絶対閾値より上限が小さいと相対判定が成立しない");
+});
+
+test("種別のキー列は順序も含めて固定（無効な計画でも全キーを持つ）", () => {
+  // ⓪の `kinds` と同じく直書きで固定する。定数と突き合わせると種別を足しても順序を変えても通ってしまう
+  assert.deepEqual(Object.keys(planMinorIslandMerges([]).minorKinds), ["absolute", "relative", "none"]);
+});
+
+test("相対判定で minor になった speaker も、前後の主要 speaker が違えば③で中立化される", () => {
+  // 550 / 416 / 34 → extra 3.4% は相対判定。`0 → 2 → 1` が 2 か所
+  const lines = islandLines([
+    [1, 300],
+    [0, 300],
+    [2, 17],
+    [1, 100],
+    [0, 250],
+    [2, 17],
+    [1, 16],
+  ]);
+  const plan = planOf(lines);
+  assert.equal(kindsOf(plan)[2], "relative");
+  assert.deepEqual(plan.merges, []);
+  assert.equal(plan.skipped.mismatch, 2);
+  const neutral = planUnresolvedMinors(plan);
+  assert.equal(neutral.disabledBy, null);
+  assert.deepEqual(neutral.neutralized, [{ speaker: 2, segments: 2, words: 34, indexes: [2, 5] }]);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.deepEqual(speakersOf(groups), [1, 0, 2, 1, 0, 2, 1]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, true, false, false, true, false]);
 });
 
 // ---- 統合先を決められなかった minor speaker の中立化（#50） ----

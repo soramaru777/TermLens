@@ -22,6 +22,7 @@ import {
   textIntegrityVerdict,
   BOUNDARY_SKIP_LABELS,
   BOUNDARY_KIND_LABELS,
+  MINOR_KIND_LABELS,
 } from "../public/diagnostics.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
 // 表示補正の計画は utterances.js が唯一の定義箇所（#48）。**診断もそこを通る**ので、
@@ -628,6 +629,113 @@ test("画面パネルにも表示補正の行が出る", () => {
     rows.find(([k]) => k === "表示補正 2 → 0"),
     ["表示補正 2 → 0", "1 seg / 3 word"],
   );
+});
+
+// ---- minor 判定の内訳（#59） ----
+//
+// #48 の「minor speaker」の行は顔ぶれしか出さないので、固定 3% を超える extra speaker が
+// **どの経路で minor になったか（絶対 / 相対 / 対象外）** は読めなかった。相対閾値を実機データから
+// 決めるための唯一の材料なので、内訳・基準・speaker ごとの判定を出す。会話本文は入らない。
+
+/** 想定 2 人・検出 3。extra は 3.2%（絶対閾値以上）で、最小の主要 35.8% に対して 0.09 → 相対判定で minor */
+const RELATIVE_LINES = [
+  line(0, 300, 600, 1_010_000),
+  line(1, 200, 400, 1_020_000),
+  line(0, 20, 40, 1_030_000),
+  line(2, 18, 36, 1_040_000),
+  line(0, 20, 40, 1_050_000),
+];
+
+/** 見送り理由と同じ流儀: キーの定義箇所は `utterances.js`（計画の `minorKinds` のキー列）で、表示名の表が順序まで一致する */
+test("minor 判定の種別の表示名は全キーに表示名があり、順序も計画と一致する", () => {
+  assert.deepEqual(
+    MINOR_KIND_LABELS.map(([key]) => key),
+    Object.keys(planMinorIslandMerges([]).minorKinds),
+  );
+  for (const [, label] of MINOR_KIND_LABELS) assert.ok(label.length > 0);
+});
+
+test("相対判定で minor になった speaker の内訳・基準・判定行が Markdown に出る", () => {
+  const args = islandArgs(RELATIVE_LINES);
+  const islandPlan = args.islandPlan as ReturnType<typeof planMinorIslandMerges>;
+  assert.deepEqual(islandPlan.minorKinds, { absolute: 0, relative: 1, none: 0 }, "fixture が相対判定になっていない");
+  const md = buildDiagnosticsMarkdown(args);
+  assert.match(md, /- minor speaker: 2/);
+  assert.match(md, /- minor 判定: 絶対 0 \/ 相対 1 \/ 対象外 0/);
+  assert.match(md, /- minor 判定の閾値: 絶対 3\.0% \/ 相対 10\.0% \/ 上限 5\.0%/);
+  assert.match(md, /- 相対判定の基準: 最小の主要 speaker 35\.8%/);
+  assert.match(md, /- minor 判定 speaker 2: 相対（割合 3\.2% \/ 相対比 9\.0% \/ 絶対 超過 \/ 相対 適合 \/ 上限 適合）/);
+  // 島は現行②の条件で寄る
+  assert.match(md, /- 表示補正: 1 seg \/ 18 word/);
+});
+
+test("絶対判定と対象外の speaker も判定行に出る", () => {
+  // 検出 4: speaker 2 は 1.3%（絶対）、speaker 3 は 10% 超（対象外）
+  const lines = [
+    line(0, 300, 600, 1_010_000),
+    line(1, 200, 400, 1_020_000),
+    line(0, 20, 40, 1_030_000),
+    line(2, 8, 16, 1_040_000),
+    line(0, 20, 40, 1_050_000),
+    line(3, 70, 140, 1_060_000),
+  ];
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.match(md, /- minor 判定: 絶対 1 \/ 相対 0 \/ 対象外 1/);
+  assert.match(md, /- minor 判定 speaker 2: 絶対（割合 1\.3% \/ 相対比 4\.0% \/ 絶対 適合 \/ 相対 適合 \/ 上限 適合）/);
+  assert.match(md, /- minor 判定 speaker 3: 対象外（割合 11\.3% \/ 相対比 35\.0% \/ 絶対 超過 \/ 相対 超過 \/ 上限 超過）/);
+  assert.match(md, /- 対象外 speaker: 3/);
+});
+
+/**
+ * 主要 speaker が 1 人も残らない統計（実分布では起きないので統計を直接与える）では、
+ * 相対判定の基準そのものが無いことを 1 行で示す。`-` の相対比も同じ理由。
+ */
+test("主要 speaker が空なら「主要 speaker なし」と出し、相対比は - になる", () => {
+  const lines = [line(0, 100, 200, 1_010_000), line(1, 100, 200, 1_020_000), line(2, 5, 10, 1_030_000)];
+  const stats = {
+    ...collectSpeakerStats(lines),
+    speakers: [
+      { speaker: 0, words: 2, chars: 4, segments: 1, ratio: 0.02, firstT: null, lastT: null },
+      { speaker: 1, words: 2, chars: 4, segments: 1, ratio: 0.02, firstT: null, lastT: null },
+      { speaker: 2, words: 4, chars: 8, segments: 1, ratio: 0.025, firstT: null, lastT: null },
+    ],
+  };
+  const islandPlan = planMinorIslandMerges(lines, { expectedSpeakers: "2", stats });
+  assert.equal(islandPlan.disabledBy, null);
+  assert.deepEqual(islandPlan.majors, []);
+  const md = buildDiagnosticsMarkdown({
+    ...SPEAKER_MD_ARGS,
+    speakerStats: stats,
+    expectedSpeakers: "2",
+    islandPlan,
+    unresolvedPlan: { neutralized: [], skippedRuns: [], disabledBy: null },
+    displayDetected: 3,
+  });
+  assert.match(md, /- minor 判定の閾値: 絶対 3\.0% \/ 相対 10\.0% \/ 上限 5\.0%/);
+  assert.match(md, /- 相対判定の基準: 主要 speaker なし$/m);
+  assert.match(md, /- minor 判定 speaker 2: 絶対（割合 2\.5% \/ 相対比 - \/ 絶対 適合 \/ 相対 - \/ 上限 適合）/);
+});
+
+test("ゲートで無効なら minor 判定の行を出さない", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(RELATIVE_LINES, "auto"));
+  assert.match(md, /- 表示補正: 無効（想定話者数が自動）/);
+  assert.doesNotMatch(md, /- minor 判定/);
+  assert.doesNotMatch(md, /- 相対判定の基準/);
+});
+
+test("minor 判定の行にも会話本文が混入しない（画面パネルと Markdown）", () => {
+  const marker = "このもじれつはほんぶんのしるし";
+  const lines = RELATIVE_LINES.map((l) => ({ ...l, text: marker }));
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.equal(md.includes(marker), false);
+  assert.match(md, /- minor 判定 speaker 2: 相対/, "判定行そのものは出ている");
+  const rows = speakerDiagRows(islandArgs(lines)) as Array<[string, string]>;
+  const labels = rows.map(([k]) => k);
+  assert.ok(labels.includes("minor 判定"));
+  assert.ok(labels.includes("minor 判定の閾値"));
+  assert.ok(labels.includes("相対判定の基準"));
+  assert.ok(labels.includes("minor 判定 speaker 2"));
+  for (const [, value] of rows) assert.equal(String(value).includes(marker), false);
 });
 
 // ---- 中立化（#50） ----

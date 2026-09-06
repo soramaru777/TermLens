@@ -18,7 +18,7 @@ sources:
   - tests/utterances.test.ts
 related: [[termlens-architecture]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-deployment]], [[termlens-testing]]
 confidence: high
-updated: 2026-09-06
+updated: 2026-09-07
 ---
 
 # TermLens STT パイプライン
@@ -291,9 +291,29 @@ finalLines（raw / localStorage に保存されるのもこれ）
 
 ##### 判定
 
-主要 speaker は統計の値の降順 → speaker 番号の昇順で上位 N 名。**tie-break を明示するのは
-純関数の決定性のため**で、同数が上位 N の境界にまたがると順位が不定になる。minor は
-「主要でない」かつ `ratio < MINOR_ISLAND_MAX_RATIO`。
+主要 speaker は統計の値の降順 → speaker 番号の昇順で上位 N 名のうち `ratio >= MINOR_ISLAND_MAX_RATIO`
+のもの。**tie-break を明示するのは純関数の決定性のため**で、同数が上位 N の境界にまたがると順位が
+不定になる。
+
+minor は「主要でない」かつ、次の **2 経路のどちらか**に当たる speaker（#59）。両方に当たれば
+`absolute` に 1 回だけ数える（1 speaker 1 種別。古くて強い規則を優先する）。
+
+| 種別 | 条件 | 意図 |
+|---|---|---|
+| `absolute` | `ratio < MINOR_ISLAND_MAX_RATIO`（3%） | #48 からの絶対判定。据え置き |
+| `relative` | `ratio / 最小の主要 speaker の ratio <= MINOR_ISLAND_RELATIVE_MAX_RATIO`（0.10）かつ `ratio < MINOR_ISLAND_RELATIVE_CAP_RATIO`（5%） | 固定 3% を僅かに超える偽 speaker を、**主要 speaker との差が十分大きい**ことで拾う |
+| `none` | どちらでもない | `others`（対象外）。run を作らない |
+
+> 2026-09-06 まで: minor は「主要でない」かつ `ratio < MINOR_ISLAND_MAX_RATIO` の 1 経路だった
+> （2026-09-07 更新）。実機 2 サンプル目（想定 2 人で `56.6% / 40.0% / 3.4%`）の 3.4% が固定 3% を
+> 0.4pt 超えて `others` に落ち、②にも③にも掛からず 3 人目として残ったのがきっかけ。
+
+相対判定の基準は**統合先になれる主要 speaker の最小 ratio**（上位 N 位でも絶対閾値未満で主要から
+落ちた speaker は基準にしない）。主要 speaker が空なら基準が無いので相対判定は行わない。
+**主要 speaker 側も小さい崩れた分布（`90% / 4% / 3.4%`）では 3.4 / 4 = 0.85 で minor にならない** —
+そういう分布では minor と主要を区別できないので意図どおり。想定 2 人の実分布では最小の主要 speaker が
+50% を超えることは無いため、現行値（0.10 / 5%）では絶対上限が単独で効く分布は作れない。上限は
+相対閾値を広げたときの歯止め。
 
 発話行を 1 パスで走査し、**同一 minor speaker が連続する run** を切り出す。run は別の
 speaker（主要でも別の minor でも）・話者不明・再接続の印で切れる。run 全体を寄せるのは
@@ -329,11 +349,13 @@ A → [jitter B] → minorX → A
 固定しており（#46）、①通過後のコピーから取るとその不変条件が壊れる。実害の面でも、
 ①が動かすのは 4 文字以下の行だけなので word 数の順位は動かない。
 
-##### 閾値（`public/utterances.js`。すべて 1 サンプル由来の暫定値）
+##### 閾値（`public/utterances.js`。#48 の 3 つは 1 サンプル、#59 の 2 つは 2 サンプル目由来の暫定値）
 
 | 定数 | 暫定値 | 役割 |
 |---|---|---|
-| `MINOR_ISLAND_MAX_RATIO` | 0.03 | **機械が黙って統合してよい**線 |
+| `MINOR_ISLAND_MAX_RATIO` | 0.03 | **機械が黙って統合してよい**線（絶対判定） |
+| `MINOR_ISLAND_RELATIVE_MAX_RATIO` | 0.10 | 最小の主要 speaker に対する比がこれ以下なら相対判定で minor（#59）。実機値 0.085 が通る側 |
+| `MINOR_ISLAND_RELATIVE_CAP_RATIO` | 0.05 | 相対判定で minor にしてよい絶対割合の上限（未満）。`MINOR_SPEAKER_RATIO` と同じ値（#59） |
 | `MINOR_ISLAND_MAX_WORDS` | 20 | 1 つの島として吸収してよい最大 word 数 |
 | `MIN_TOTAL_WORDS_FOR_ISLANDS` | 200 | これ未満では主要 speaker の順位を信用しない |
 
@@ -348,12 +370,22 @@ A → [jitter B] → minorX → A
 ラベルを書き換える線なので、当然もっと厳しくなる。役割が違うので**名前とファイルの両方で
 離してある** — 片方を実機データで動かしたときに、もう片方を触ったつもりにならないため。
 
+相対判定の絶対上限 `MINOR_ISLAND_RELATIVE_CAP_RATIO` は `MINOR_SPEAKER_RATIO` と**同じ値だが別定数**
+（#59）。値を揃えてあるのは「**診断が疑わない割合の speaker を、機械が相対判定で寄せることはない**」
+という関係を保つため。値の一致はテストで固定してあり、片方だけ動かすのは意図的な判断になる。
+
 ##### 診断への出方
 
 「話者分離の診断」に、raw の**検出話者数**と別ラベルで**表示上の通常話者数**（補正後の行から
 `collectSpeakerStats()` で数える。#50 で中立化したぶんは除く）が並び、`### 表示補正（minor island）` として補正の
 `from → to` 表・主要/minor/対象外の顔ぶれ・**見送りの理由別件数**が出る。#46 の「診断は raw から」は
 崩していない（raw が主で、補正後は従の併記）。
+
+#59 で **minor 判定の内訳**（`絶対 / 相対 / 対象外` の件数）、**minor 判定の閾値**（絶対 / 相対 / 上限）、
+**相対判定の基準**（最小の主要 speaker の割合）、extra speaker ごとの **判定行**（割合・相対比・各閾値への適合/超過）が加わった。
+実機で「相対」が増えるかどうかが `MINOR_ISLAND_RELATIVE_MAX_RATIO` を動かすべきかの唯一の材料。
+閾値の値は計画（`thresholds`）に載せて診断へ渡す — `diagnostics.js` は AudioWorklet から static import
+されるため `utterances.js` を import できない（⓪の見送り理由のキーと同じ流儀）。
 
 **診断は必ず `planDisplayCorrection()` を通す。`planMinorIslandMerges()` を raw の
 `finalLines` に直接当ててはいけない。** 表示に効くのは①jitter を通した後の行に対する計画なので、
