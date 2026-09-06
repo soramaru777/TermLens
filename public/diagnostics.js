@@ -347,6 +347,41 @@ const ISLAND_SKIP_LABELS = [
 ];
 
 /**
+ * minor 判定の種別の表示名(#59)。**順序も含めて `[key, label]` の列**(`ISLAND_SKIP_LABELS` と同じ形)。
+ * キーの定義箇所は `utterances.js` の `MINOR_KINDS` で、この表がそれと一致することは
+ * `tests/diagnostics.test.ts` が `planMinorIslandMerges([]).minorKinds` のキー列と突き合わせて固定する
+ * (種別を足して表示名を付け忘れると、その件数が診断から黙って消えるため)。
+ *
+ * 「絶対」= 絶対閾値未満 / 「相対」= 主要 speaker との相対差で minor / 「対象外」= どちらでもない。
+ * 内訳を出すのは、実機で「相対」が増えるかどうかで相対閾値を動かすべきかを人が判断するため。
+ */
+export const MINOR_KIND_LABELS = Object.freeze([
+  ["absolute", "絶対"],
+  ["relative", "相対"],
+  ["none", "対象外"],
+]);
+
+/**
+ * extra speaker 1 人ぶんの minor 判定の行(#59)。出るのは speaker 番号・割合・種別・相対比と
+ * 各閾値への適合だけで、会話本文は入らない。**適合/超過は計画の `checks` を描くだけ**で、
+ * ここでは比較しない(比較演算子は `utterances.js` の `judgeMinor()` にだけある)。
+ * 相対比と相対の適合は、基準になる主要 speaker が無ければどちらも `-`。
+ */
+function minorJudgementRow(j) {
+  const kind = MINOR_KIND_LABELS.find(([key]) => key === j.kind)?.[1] ?? j.kind;
+  const hasRel = j.relativeRatio != null;
+  const fit = (ok) => (ok ? "適合" : "超過");
+  const parts = [
+    `割合 ${pct1(j.ratio)}`,
+    `相対比 ${hasRel ? pct1(j.relativeRatio) : "-"}`,
+    `絶対 ${fit(j.checks.absolute)}`,
+    `相対 ${hasRel ? fit(j.checks.relative) : "-"}`,
+    `上限 ${fit(j.checks.cap)}`,
+  ];
+  return [`minor 判定 speaker ${j.speaker}`, `${kind}（${parts.join(" / ")}）`];
+}
+
+/**
  * 表示補正の見出し行。**画面パネルと Markdown が同じ配列から描く**(既存の規則)。
  * 出るのは speaker 番号・件数・word 数だけで、会話本文は1文字も入らない。
  */
@@ -364,6 +399,8 @@ function minorIslandRows(islandPlan, ratioBasis) {
   const segments = islandPlan.merges.reduce((n, m) => n + m.segments, 0);
   const words = islandPlan.merges.reduce((n, m) => n + m.words, 0);
   const skipped = islandPlan.skipped ?? {};
+  // #59 のキーは `disabledPlan()` も含めて必ずある(⓪の `kinds` と同じく欠損は想定しない)
+  const { minorKinds, minorJudgements, smallestMajorRatio, thresholds } = islandPlan;
   return [
     ["表示補正", `${segments} seg / ${words} ${view.unit}`],
     // **主要 / minor の顔ぶれも出す。** 0件だったときに「候補が1人もいなかった」のか
@@ -373,6 +410,22 @@ function minorIslandRows(islandPlan, ratioBasis) {
     ["minor speaker", islandPlan.minors.length ? islandPlan.minors.join(", ") : "(なし)"],
     // 主要でも minor でもない speaker。どちらのリストにも出ないと診断上は存在が消える
     ...(islandPlan.others?.length ? [["対象外 speaker", islandPlan.others.join(", ")]] : []),
+    // **どの経路で minor になったかの内訳(#59)。** 「相対」が実機で増えるかどうかが、
+    // 相対閾値(`MINOR_ISLAND_RELATIVE_MAX_RATIO`)を動かすべきかの唯一の材料になる
+    ["minor 判定", skipBreakdown(MINOR_KIND_LABELS, (key) => minorKinds[key])],
+    // 設定値(閾値)と観測値(基準になった主要 speaker の割合)は別の行にする。
+    // 閾値は計画の `thresholds` から(`diagnostics.js` は `utterances.js` を import できないので
+    // 値は計画に載せて渡される)。閾値を後から動かしたとき、過去の Markdown がどの値で
+    // 判定したかを読めるようにするための行
+    [
+      "minor 判定の閾値",
+      `絶対 ${pct1(thresholds.absolute)} / 相対 ${pct1(thresholds.relative)} / 上限 ${pct1(thresholds.cap)}`,
+    ],
+    [
+      "相対判定の基準",
+      smallestMajorRatio == null ? "主要 speaker なし" : `最小の主要 speaker ${pct1(smallestMajorRatio)}`,
+    ],
+    ...minorJudgements.map(minorJudgementRow),
     [
       "表示補正の見送り",
       skipBreakdown(ISLAND_SKIP_LABELS, (key) => skipped[key] ?? 0),

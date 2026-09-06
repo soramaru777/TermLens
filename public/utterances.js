@@ -88,6 +88,35 @@ export const JITTER_WINDOW_MS = 500;
  */
 export const MINOR_ISLAND_MAX_RATIO = 0.03;
 
+/**
+ * 相対判定の閾値(#59)。**主要 speaker の最小割合に対する extra speaker の割合**がこれ以下なら
+ * minor 候補にする。固定の絶対閾値だけだと `56.6% / 40.0% / 3.4%` のように 3% を僅かに超える
+ * 偽 speaker を取りこぼす一方で、絶対閾値を広げると本物の短時間話者まで巻き込む。
+ * 「主要 speaker との差が十分大きい」ことを別の経路で見るための値で、絶対判定は据え置く。
+ * 実機 2 サンプル目(3.4 / 40.0 = 0.085)が通る側に置いた暫定値。
+ */
+export const MINOR_ISLAND_RELATIVE_MAX_RATIO = 0.1;
+
+/**
+ * 相対判定で minor にしてよい絶対割合の上限(#59)。**未満**のときだけ相対判定が成立する。
+ * 相対比だけだと `70% / 10%` のような本物の短時間話者まで minor になるので、絶対の歯止めを置く。
+ *
+ * **`speaker-stats.js` の `MINOR_SPEAKER_RATIO`(5%) と同じ値だが別定数。** あちらは診断の
+ * 「偽 speaker の可能性」の警告線で、こちらは機械が相対判定で寄せてよい上限。値を揃えてあるのは
+ * 「診断が疑わない割合の speaker を機械が相対判定で寄せることはない」という関係を保つためで、
+ * 定数を共有しないのは #48 と同じ理由(片方を実機データで動かしたときにもう片方を触ったつもりに
+ * ならないため)。値の一致はテストで固定してあり、片方だけ動かすと意図的な判断を求められる。
+ */
+export const MINOR_ISLAND_RELATIVE_CAP_RATIO = 0.05;
+
+/**
+ * minor 判定の種別(#59)。**順序も含めてここが定義箇所**で、`diagnostics.js` の
+ * `MINOR_KIND_LABELS` がこの順で表示名を持つ(一致はテストで固定)。外へは計画の `minorKinds` の
+ * キー列として出る(⓪の `BOUNDARY_APPLIED_KINDS` と同じで、export はしない)。
+ * `absolute` = 絶対閾値未満 / `relative` = 相対判定で minor / `none` = どちらでもない(対象外)。
+ */
+const MINOR_KINDS = Object.freeze(["absolute", "relative", "none"]);
+
 /** 1つの island として吸収してよい最大 word 数。長い誤割り当て区間は吸収しない(#48 の将来スコープ) */
 export const MINOR_ISLAND_MAX_WORDS = 20;
 
@@ -742,6 +771,17 @@ export function smoothSpeakerBoundaries(lines) {
 /** 補正を見送った理由の内訳。**0 でも必ず全キーを出す**(件数を比べられるようにするため) */
 const emptySkipped = () => zeroCounts(["mismatch", "tooLong", "edge", "boundary", "unknown"]);
 
+/**
+ * minor 判定に使った閾値。**計画に値として載せる**のは、`diagnostics.js` が AudioWorklet から
+ * static import されるために `utterances.js` を import できず、診断が「絶対 3.0% → 超過」を
+ * 描くのに値そのものが要るため(#59)。
+ */
+const MINOR_THRESHOLDS = Object.freeze({
+  absolute: MINOR_ISLAND_MAX_RATIO,
+  relative: MINOR_ISLAND_RELATIVE_MAX_RATIO,
+  cap: MINOR_ISLAND_RELATIVE_CAP_RATIO,
+});
+
 /** ゲートで弾かれたときの空の計画。`disabledBy` に理由を入れる */
 function disabledPlan(reason) {
   return {
@@ -753,8 +793,51 @@ function disabledPlan(reason) {
     majors: [],
     minors: [],
     others: [],
+    // #59 の判定明細も空で必ずキーを持たせる(診断が `undefined` の分岐を持たないため)
+    minorJudgements: [],
+    minorKinds: zeroCounts(MINOR_KINDS),
+    smallestMajorRatio: null,
+    thresholds: MINOR_THRESHOLDS,
     disabledBy: reason,
   };
+}
+
+/**
+ * 絶対閾値未満か(#48 / #59)。主要 speaker の選定(これを満たす speaker は統合先にしない)と
+ * minor の `absolute` 判定は**同じ境界**なので、述語を 1 つにして両方から使う。
+ */
+const belowAbsolute = (ratio) => ratio < MINOR_ISLAND_MAX_RATIO;
+
+/**
+ * extra speaker(主要でない speaker)1 人ぶんの minor 判定(#59)。**絶対が先。**
+ * 両方に当たる speaker は `absolute` に 1 回だけ数える(古くて強い規則を優先し、1 speaker 1 種別)。
+ *
+ * 相対判定は「統合先になれる主要 speaker の最小割合」を基準にする。上位 N 位でも絶対閾値未満で
+ * majors から落ちた speaker は基準にしない(統合先になれない speaker を基準に「十分小さい」と
+ * 言っても意味が無い)。majors が空なら `smallestMajorRatio` は `null` で、相対判定は行わない。
+ *
+ * **3 つの比較の結果(`checks`)も明細に載せる。** 診断はそれを描くだけで、比較を持たない —
+ * `diagnostics.js` は `utterances.js` を import できないので、比較演算子を 2 か所に書くと
+ * 厳密/包含の向き(絶対と上限は `<`、相対は `<=`)が片方だけ変わり「種別は相対なのに上限 超過」
+ * という自己矛盾行が黙って出る。`kind` は `checks` から導く。
+ *
+ * @returns {{
+ *   speaker:number, ratio:number, relativeRatio:number|null,
+ *   checks:{absolute:boolean, relative:boolean|null, cap:boolean},
+ *   kind:"absolute"|"relative"|"none",
+ * }}
+ */
+function judgeMinor(x, smallestMajorRatio) {
+  const ratio = x.ratio;
+  const relativeRatio = smallestMajorRatio > 0 ? ratio / smallestMajorRatio : null;
+  const checks = {
+    absolute: belowAbsolute(ratio),
+    // 基準が無ければ判定そのものが無い(`false` にすると「相対 超過」と読めてしまう)
+    relative: relativeRatio == null ? null : relativeRatio <= MINOR_ISLAND_RELATIVE_MAX_RATIO,
+    cap: ratio < MINOR_ISLAND_RELATIVE_CAP_RATIO,
+  };
+  const kind = checks.absolute ? "absolute" : checks.relative && checks.cap ? "relative" : "none";
+  return { speaker: x.speaker, ratio, relativeRatio, checks, kind };
 }
 
 /**
@@ -772,6 +855,11 @@ function disabledPlan(reason) {
  *   skipped: {mismatch:number, tooLong:number, edge:number, boundary:number, unknown:number},
  *   skippedRuns: Array<{reason:string, speaker:number, words:number, indexes:number[]}>,
  *   majors: number[], minors: number[], others: number[],
+ *   minorJudgements: Array<{speaker:number, ratio:number, relativeRatio:number|null,
+ *     checks:{absolute:boolean, relative:boolean|null, cap:boolean}, kind:"absolute"|"relative"|"none"}>,
+ *   minorKinds: {absolute:number, relative:number, none:number},
+ *   smallestMajorRatio: number|null,
+ *   thresholds: {absolute:number, relative:number, cap:number},
  *   disabledBy: "auto"|"atLeast"|"noStats"|"detectedNotOver"|"charsBasis"|"tooFewWords"|null,
  * }}
  */
@@ -811,24 +899,28 @@ export function planMinorIslandMerges(lines, { expectedSpeakers, stats } = {}) {
   // 1人が支配的で残りが全員小さい(diarization が崩れたとき現実に起きる)分布では、
   // 「このコードが minor と判定するはずの speaker」が順位だけで主要になれてしまう。
   // そこへ島を寄せるのは、誤りを別の誤りに置き換えるだけ。落ちた run は自然に mismatch になる
-  const majors = ranked
-    .slice(0, n)
-    .filter((x) => x.ratio >= MINOR_ISLAND_MAX_RATIO)
-    .map((x) => x.speaker);
+  const majorEntries = ranked.slice(0, n).filter((x) => !belowAbsolute(x.ratio));
+  const majors = majorEntries.map((x) => x.speaker);
   const majorSet = new Set(majors);
-  // minor は「主要でない」だけでは足りない。割合の閾値も満たすこと
-  // (想定を超えて検出された speaker が、実は無視できない量を話していることがある)
-  const minors = s.speakers
-    .filter((x) => !majorSet.has(x.speaker) && x.ratio < MINOR_ISLAND_MAX_RATIO)
-    .map((x) => x.speaker);
+  // 相対判定の基準は「統合先になれる主要 speaker の最小割合」(#59)。majors が空なら null
+  const smallestMajorRatio =
+    majorEntries.length > 0 ? Math.min(...majorEntries.map((x) => x.ratio)) : null;
+  // minor は「主要でない」だけでは足りない。割合の条件も満たすこと
+  // (想定を超えて検出された speaker が、実は無視できない量を話していることがある)。
+  // 条件は **絶対閾値未満 OR 相対判定(絶対上限つき)** の 2 経路(#59)。判定明細を
+  // `stats.speakers` の順で残し、診断が「どの経路で minor になったか」を出せるようにする
+  const minorJudgements = s.speakers
+    .filter((x) => !majorSet.has(x.speaker))
+    .map((x) => judgeMinor(x, smallestMajorRatio));
+  const minorKinds = zeroCounts(MINOR_KINDS);
+  for (const j of minorJudgements) minorKinds[j.kind]++;
+  const minors = minorJudgements.filter((j) => j.kind !== "none").map((j) => j.speaker);
   const minorSet = new Set(minors);
   // **主要でも minor でもない speaker も出す。** 「候補が1人もいなかった」と
   // 「候補はいたが条件で落ちた」を区別するために majors/minors を診断へ出しているが、
   // 割合が閾値以上なのに上位 N に入らなかった speaker はどちらにも現れず、run も作らないので
   // `skipped` にも出ない。診断だけを見ると存在ごと消える
-  const others = s.speakers
-    .filter((x) => !majorSet.has(x.speaker) && !minorSet.has(x.speaker))
-    .map((x) => x.speaker);
+  const others = minorJudgements.filter((j) => j.kind === "none").map((j) => j.speaker);
 
   // ---- 行を走査用のトークンへ落とす ----
   // 発話行(確定 speaker つき) / 話者不明 / 再接続の印の3種。**元の添字を持たせる**ので、
@@ -960,7 +1052,19 @@ export function planMinorIslandMerges(lines, { expectedSpeakers, stats } = {}) {
   const merges = [...merged.values()].sort((a, b) => a.from - b.from || a.to - b.to);
   // `skippedRuns` は run の走査順(＝行の添字の昇順)のまま。走査が1パスなので決定的で、
   // ③がここから作る `neutralized` の順序も入力だけで決まる
-  return { merges, skipped, skippedRuns, majors, minors, others, disabledBy: null };
+  return {
+    merges,
+    skipped,
+    skippedRuns,
+    majors,
+    minors,
+    others,
+    minorJudgements,
+    minorKinds,
+    smallestMajorRatio,
+    thresholds: MINOR_THRESHOLDS,
+    disabledBy: null,
+  };
 }
 
 /**
