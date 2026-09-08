@@ -195,7 +195,9 @@ const ISLAND_WIRING = [
   // 境界補正の件数が表示に効いたものとずれる（②③と同じ理由）
   // **③b の計画（#61）も同じ1回の計算から。** 別途 `planLongMinorRuns()` を呼び直すと
   // 再帰属・中立化の件数が表示に効いたものとずれる
-  "const { boundaryPlan, plan: islandPlan, unresolvedPlan, longMinorPlan, displayDetected } = planDisplayCorrection(finalLines, {",
+  // **③a の計画（#63）も同じ1回の計算から。** 別途 `planUnknownReattribution()` を呼び直すと
+  // 話者不明の再帰属の件数が表示に効いたものとずれる
+  "const { boundaryPlan, plan: islandPlan, unresolvedPlan, unknownPlan, longMinorPlan, displayDetected } = planDisplayCorrection(finalLines, {",
 ];
 
 test("診断の2箇所は表示補正の計画を同じ形で作る", () => {
@@ -219,25 +221,26 @@ test("診断の2箇所は表示補正の計画を同じ形で作る", () => {
 });
 
 /**
- * **③b の計画（#61）も、画面パネルと Markdown が同じ1回の計算から受け取り、そのまま渡す。**
- * 片方だけ渡し忘れると、画面には長い minor run の行が出るのに Markdown には出ない（例外は出ない）。
- * 受け取り方（分割代入）は上の `ISLAND_WIRING` が固定している。
+ * **③（#50）・③a（#63）・③b（#61）の計画は、画面パネルと Markdown が同じ1回の計算から受け取り、
+ * パイプラインの順（③ → ③a → ③b）でそのまま渡す。** 片方だけ渡し忘れると、画面には行が出るのに
+ * Markdown には出ない（例外は出ない）。受け取り方（分割代入）は上の `ISLAND_WIRING` が固定している。
+ * 段を足すときは `PASSED_PLANS` に 1 つ足す（隣り合う 2 キーの正規表現を段ごとに持つと、
+ * 段を足すたびに前の段のテストを書き換えることになる）。
  */
-test("診断の2箇所は長い minor run の計画を同じ形で受け渡す", () => {
+const PASSED_PLANS = [
+  ["unresolvedPlan", "planUnresolvedMinors"],
+  ["unknownPlan", "planUnknownReattribution"],
+  ["longMinorPlan", "planLongMinorRuns"],
+] as const;
+test("診断の2箇所は③・③a・③b の計画を同じ順で受け渡す", () => {
+  const inOrder = new RegExp(`\\n${PASSED_PLANS.map(([key]) => `\\s+${key},\\n`).join("")}`);
   for (const name of ["renderDiagnostics", "buildDiagnosticsMd"]) {
-    const body = fnBody(name);
-    assert.match(
-      body,
-      /\n\s+unresolvedPlan,\n\s+longMinorPlan,\n/,
-      `${name} が longMinorPlan を診断に渡していない`,
-    );
+    assert.match(fnBody(name), inOrder, `${name} が ③ → ③a → ③b の計画を診断に渡していない`);
   }
   // 計画は純関数側（utterances.js）の `planDisplayCorrection()` からしか来ない
-  assert.doesNotMatch(
-    CODE,
-    /planLongMinorRuns\(/,
-    "app.js が③b の計画を直接立てている（planDisplayCorrection を通すこと）",
-  );
+  for (const [, planner] of PASSED_PLANS) {
+    assert.doesNotMatch(CODE, new RegExp(`${planner}\\(`), `app.js が ${planner} を直接立てている（planDisplayCorrection を通すこと）`);
+  }
 });
 
 test("想定話者数の選択肢は EXPECTED_SPEAKER_OPTIONS から組み立てる", () => {

@@ -2,6 +2,7 @@
 // 話者ラベルの揺れ(speaker jitter)の補正(#36)、
 // 想定話者数を超えて検出された少数 speaker の島の補正(#48)、
 // 統合先を決められなかった minor speaker の中立化(#50)、
+// 話者不明にした minor 発話の同一 final による再帰属(#63)、
 // minor speaker の長い run の再帰属と中立化(#61)、
 // そして連続する同一話者の結合と、段落内の連結子の出し分け(#55)。
 //
@@ -1113,14 +1114,22 @@ export function smoothMinorSpeakerIslands(lines, opts = {}) {
 
 /**
  * 計画の `indexes` は `lines` の添字。**計画を立てた配列と同じものへ当てること。**
- * **計画が空なら入力をそのまま返す。** `groupUtterances()` は final ごとに呼ばれ、適用は②③③b で
- * 4 回あるので、何も変えない段まで全行コピーを繰り返さない(どの段も入力を変更しないので共有して安全)
+ * **計画が空なら入力をそのまま返す。** `groupUtterances()` は final ごとに呼ばれ、適用は②③③a③b で
+ * 5 回あるので、何も変えない段まで全行コピーを繰り返さない(どの段も入力を変更しないので共有して安全)
+ *
+ * **speaker を書いた行からは `unresolved` の印を落とす。** 「帰属先が決まった行に印は残らない」を
+ * 適用側の不変条件にしておくと、③a(#63)が③の立てた印を上書きするのに専用の適用関数が要らない。
+ * ②③b が当たる行にはそもそも印が無いので(②は③より前、③b の候補は③が印を立てない `tooLong`)、
+ * これで挙動が変わるのは③a だけ
  */
 function applyMerges(lines, plan) {
   if (plan.merges.length === 0) return lines;
   const out = lines.map((line) => ({ ...line }));
   for (const m of plan.merges) {
-    for (const i of m.indexes) out[i].speaker = m.to;
+    for (const i of m.indexes) {
+      out[i].speaker = m.to;
+      delete out[i].unresolved;
+    }
   }
   return out;
 }
@@ -1146,6 +1155,11 @@ function applyMerges(lines, plan) {
 /** 中立化の対象にする見送り理由。**`mismatch` だけ**(#50 の確定事項) */
 const NEUTRALIZE_REASON = "mismatch";
 
+/** ゲートで弾かれたときの空の計画。**空でも必ず全キーを持たせる**(②③a③b と同じ理由。③a が `neutralizedRuns` を走査する) */
+function disabledUnresolvedPlan(reason) {
+  return { neutralized: [], neutralizedRuns: [], skippedRuns: [], disabledBy: reason };
+}
+
 /**
  * 中立化の計画。**何も変更しない純関数。** ②の計画を入力に取る。
  *
@@ -1154,9 +1168,16 @@ const NEUTRALIZE_REASON = "mismatch";
  * 隠す根拠は無い)。ゲートを2組持つと「②は効いているのに③だけ無効」という
  * 説明のつかない状態が作れてしまう。
  *
+ * `neutralizedRuns` は同じ行を **run 単位・走査順**(＝行の添字の昇順)で持つ(#63)。③a
+ * (`planUnknownReattribution()`)は run 1 本ごとに前後の行の `seq` を見るので、speaker 単位に
+ * 集約した `neutralized` では run の境目が消えていて使えない。②が `skippedRuns` を足したのと
+ * 同じ理由で、③の側で run を切り直させない(「同一 minor の連続を別 speaker・話者不明・再接続で
+ * 切る」規則を 3 か所目に書かない)。`neutralized` と `skippedRuns` は据え置き。
+ *
  * @param plan `planMinorIslandMerges()` の戻り
  * @returns {{
  *   neutralized: Array<{speaker:number, segments:number, words:number, indexes:number[]}>,
+ *   neutralizedRuns: Array<{speaker:number, words:number, indexes:number[]}>,
  *   skippedRuns: Array<{reason:string, speaker:number, words:number, indexes:number[]}>,
  *   disabledBy: string|null,
  * }}
@@ -1165,13 +1186,15 @@ export function planUnresolvedMinors(plan) {
   // **計画は必須。** 渡されていないのを「有効・0件」と区別できないと、診断が
   // 「中立化 0 seg」と言い切ってしまう(`minorIslandRows()` が `!islandPlan` を
   // 節ごと出さない扱いにしているのと同じ理由)
-  if (!plan) return { neutralized: [], skippedRuns: [], disabledBy: "noPlan" };
+  if (!plan) return disabledUnresolvedPlan("noPlan");
   const disabledBy = plan.disabledBy ?? null;
-  if (disabledBy) return { neutralized: [], skippedRuns: [], disabledBy };
+  if (disabledBy) return disabledUnresolvedPlan(disabledBy);
 
   const runs = Array.isArray(plan.skippedRuns) ? plan.skippedRuns : [];
   // speaker ごとにまとめる。診断が `speaker 2 → 話者不明: 1 seg / 2 word` を出せる形
   const grouped = new Map();
+  // 同じ行を run 単位でも持つ(③a の入力)。`grouped` と同じループで積むので、両者がずれようがない
+  const neutralizedRuns = [];
   // 対象外にした run は**そのまま返す**。理由別の件数を診断が出せないと、
   // `edge` / `unknown` を将来この段の対象に加えるべきかを判断する材料が無くなる
   const skippedRuns = [];
@@ -1204,10 +1227,13 @@ export function planUnresolvedMinors(plan) {
     entry.words += run.words;
     entry.indexes.push(...run.indexes);
     grouped.set(run.speaker, entry);
+    // `indexes` は複製する(②の `skip()` と同じ。計画は純粋な値として扱い、内部の配列を共有しない)
+    neutralizedRuns.push({ speaker: run.speaker, words: run.words, indexes: [...run.indexes] });
   }
-  // 並びを決めておく。決めないと同じデータから作った診断 Markdown が実行ごとに違う順序で出る
+  // 並びを決めておく。決めないと同じデータから作った診断 Markdown が実行ごとに違う順序で出る。
+  // `neutralizedRuns` は走査順のまま(②の `skippedRuns` と同じで、入力だけで決まる)
   const neutralized = [...grouped.values()].sort((a, b) => a.speaker - b.speaker);
-  return { neutralized, skippedRuns, disabledBy: null };
+  return { neutralized, neutralizedRuns, skippedRuns, disabledBy: null };
 }
 
 /**
@@ -1238,6 +1264,171 @@ function applyNeutralize(lines, plan) {
  */
 function stripRestoredMarks(lines) {
   return lines.map(({ unresolved, ...rest }) => rest);
+}
+
+// ---- 第3a段: 話者不明にした minor 発話を同一 final で major へ戻す(#63) ----
+//
+// ③は `B → X → A`(前後の主要 speaker が違う)の X を「どちらへ寄せる根拠も無い」として
+// 話者不明にする。しかし実機(想定 2 人、raw 4 speaker、中立化 8 seg)の一部は
+// `A(seq=10) → X(seq=10) → B(seq=11)` の形で、X は A と**同じ Deepgram final** に入っている —
+// A の発話の途中で speaker が誤分離された可能性が高く、⓪(#55/#57)が同じ根拠で寄せている
+// 断片の、長さだけが⓪の上限(3〜5 文字)を超えたもの。この段はその「同一 final」という根拠を、
+// **minor と判定済みで③が印を立てた run に限って** `MINOR_ISLAND_MAX_WORDS`(20)まで広げる。
+//
+// 候補は③の `neutralizedRuns` だけで、独自に minor 判定はしない(②のゲート・#59 の minor 判定・
+// ③の `mismatch` と長さ上限を通った run だけがここへ来る)。③b の候補(`tooLong`)とは互いに素なので、
+// ③b の前に置いても③b の結果は変わらない。**③b の E1(safe merge)は②の `merges` だけを数え、
+// ここでの再帰属は数えない**(根拠の連鎖を作らない。テストで固定)。
+//
+// 根拠は同一 final(③b の E2)だけで、新しい閾値定数は足さない。句読点・文字種・時間差の veto は
+// 入れていない(調査の案2)。⓪の `BOUNDARY_PUNCTUATION` は読点を含むので「この機能は、」→「自動で
+// 動きます」のような自然な連続まで止めてしまい、句点だけに絞るにも「境目が句読点で閉じていた候補が
+// 実機で何件か」という判断材料が今は無い。診断の維持理由の内訳が溜まってから、
+// `UNKNOWN_KEEP_REASONS` にキーを足す形で検討する。
+//
+// 誤帰属(B のターンの先頭が A の final の中で始まっていた場合)は中立化より害が大きい
+// (相手の発言が major の名前で本文に残る)。歯止めは minor 判定済み ∧ 20 word 以下 ∧ 反対側が
+// 別 final ∧ 診断で `from → to` を追えること。実機で 1 件でも出たら本文と突き合わせる(#61 の E1 と同じ運用)。
+//
+// 補正するのは `speaker` と `unresolved` の印だけで、テキストも行数も変えない(#36 と同じ規律)。
+
+/**
+ * 維持の理由キー。**順序も含めてここが定義箇所**で、`diagnostics.js` の `UNKNOWN_KEEP_LABELS` が
+ * この順で表示名を持つ(一致はテストで固定。③b の `LONG_MINOR_KEEP_REASONS` と同じ流儀)。
+ * 判定の優先順位もこの順で、1 run に理由は 1 つ。
+ *
+ * 調査時は 4 つ(`noSeq` / `mixedFinal` / `sameFinalBoth` / `differentFinal`)だったが、
+ * 「同一 final の隣が major でない」(`Y(minor, seq 10) → X(seq 10) → A(seq 11)` の X)を
+ * `differentFinal` に混ぜると、内訳から「反対側が別 final なのに寄らなかった」件数が読めなくなる
+ * ので `anchorNotMajor` を分けて 5 つにした。`X → Y` の遷移は観測された話者交代なので跨がない。
+ */
+const UNKNOWN_KEEP_REASONS = Object.freeze([
+  "noSeq", // final 情報なし(旧セッション)
+  "mixedFinal", // run 内で final が割れる
+  "sameFinalBoth", // 両側が同一 final
+  "differentFinal", // どちらとも別 final
+  "anchorNotMajor", // 同一 final の隣が major でない
+]);
+
+/** ゲートで弾かれたときの空の計画。**空でも必ず全キーを持たせる**(②③③b と同じ理由) */
+function disabledUnknownPlan(reason) {
+  return {
+    candidates: 0,
+    attributed: [],
+    keptUnknown: [],
+    keptCounts: zeroCounts(UNKNOWN_KEEP_REASONS),
+    disabledBy: reason,
+  };
+}
+
+/**
+ * 話者不明の再帰属の計画。**何も変更しない純関数。** ②③の計画を入力に取る。
+ *
+ * run 1 本ごとに、次の順で **1 つの結論**を出す(上にあるものほど「そもそも判定できない」に近い)。
+ *
+ * 1. run の全行が数値の `seq` を持たなければ `noSeq`、持つが値が割れていれば `mixedFinal`
+ * 2. 両隣が run と同じ final なら `sameFinalBoth`、どちらとも別 final なら `differentFinal`
+ *    (隣が再接続の印・範囲外なら「別 final」扱い。`mismatch` run では起きないが、防御的に
+ *    `sameFinalNeighbor()` で自然に落ちる)
+ * 3. 片側だけ同じ final なら、その隣を anchor にする。anchor が major でなければ `anchorNotMajor`、
+ *    major なら X → anchor へ再帰属
+ *
+ * **反対側の隣が major かどうかは見ない。** `Y(minor, seq 9) → X(seq 10) → A(seq 10)` は A へ戻す
+ * (X→Y の境目は跨がない)。長さの上限も足さない — 候補は③で `MINOR_ISLAND_MAX_WORDS` 以下に
+ * 絞られている。**ゲートは②と同一**で、②が `disabledBy` なら同じ理由で無効(③③b と同じ)。
+ *
+ * @param plan ②`planMinorIslandMerges()` の戻り(`majors` / `disabledBy`)
+ * @param unresolvedPlan ③`planUnresolvedMinors()` の戻り(`neutralizedRuns` が候補)
+ * @param lines **⓪①通過後の配列**(`correctSpeakers()` の `jittered`)。run の前後の行の `seq` を見る。
+ *   `indexes` はこの配列の添字(②③の適用は行数も並びも変えないので、合成後の配列にもそのまま当たる)
+ *
+ * `attributed` / `keptUnknown` は走査順のまま(③の `neutralizedRuns` の順 ＝ 添字昇順)。診断は
+ * `from → to` ごとに集約して描く。
+ *
+ * @returns {{
+ *   candidates: number,
+ *   attributed: Array<{from:number, to:number, segments:number, words:number, indexes:number[],
+ *     evidence: Array<{kind:"seq", major:number}>}>,
+ *   keptUnknown: Array<{reason:string, speaker:number, segments:number, words:number, indexes:number[]}>,
+ *   keptCounts: {noSeq:number, mixedFinal:number, sameFinalBoth:number, differentFinal:number, anchorNotMajor:number},
+ *   disabledBy: string|null,
+ * }}
+ */
+export function planUnknownReattribution({ plan, unresolvedPlan, lines } = {}) {
+  // **計画は必須。** 渡されていないのを「有効・0件」と区別できないと、診断が
+  // 「話者不明の再帰属の候補 0 run」と言い切ってしまう(③③b と同じ)
+  if (!plan) return disabledUnknownPlan("noPlan");
+  if (plan.disabledBy) return disabledUnknownPlan(plan.disabledBy);
+
+  const runs = unresolvedPlan.neutralizedRuns;
+  // 候補が無ければ「有効・0 run」(③b と同じ)。通常のセッションはここで終わる
+  if (runs.length === 0) return disabledUnknownPlan(null);
+  const majorSet = new Set(plan.majors);
+
+  const attributed = [];
+  const keptUnknown = [];
+  const keptCounts = zeroCounts(UNKNOWN_KEEP_REASONS);
+  const keep = (reason, run) => {
+    keptCounts[reason]++;
+    keptUnknown.push({
+      reason,
+      speaker: run.speaker,
+      segments: run.indexes.length,
+      words: run.words,
+      indexes: [...run.indexes],
+    });
+  };
+  for (const run of runs) {
+    // 1. run の final。全行が同じ数値の `seq` を持つときだけ判定に進む(時間窓へは落とさない —
+    //    ⓪と同じで、挟まれていない分①より弱い証拠で動くので、緩い判定に落とすと寄せる側へ倒れる)。
+    //    「同じ final」は⓪①③b と同じ `sameSeq()`。`noSeq` を `mixedFinal` より優先するので、割れを見つけても最後まで走る
+    const runSeq = lines[run.indexes[0]].seq;
+    let verdict = null;
+    for (const i of run.indexes) {
+      const s = lines[i].seq;
+      if (typeof s !== "number") {
+        verdict = "noSeq";
+        break;
+      }
+      if (!sameSeq(runSeq, s)) verdict = "mixedFinal";
+    }
+    if (verdict) {
+      keep(verdict, run);
+      continue;
+    }
+    // 2. 両隣が同じ final か。隣は `indexes` の直前・直後の行そのもの(②の `neighbor()` の定義から、
+    //    `mismatch` run の両隣は確定 speaker の発話行)
+    const prev = lines[run.indexes[0] - 1];
+    const next = lines[run.indexes[run.indexes.length - 1] + 1];
+    const prevSame = sameFinalNeighbor(prev, runSeq);
+    const nextSame = sameFinalNeighbor(next, runSeq);
+    if (prevSame && nextSame) {
+      keep("sameFinalBoth", run);
+      continue;
+    }
+    if (!prevSame && !nextSame) {
+      keep("differentFinal", run);
+      continue;
+    }
+    // 3. 片側だけ同じ final。その隣が統合先で、**統合先は必ず主要 speaker**(②と同じ。minor へ
+    //    寄せても speaker の数は減らず、誤りを別の誤りに置き換えるだけ)
+    const anchor = prevSame ? prev : next;
+    if (!majorSet.has(anchor.speaker)) {
+      keep("anchorNotMajor", run);
+      continue;
+    }
+    attributed.push({
+      from: run.speaker,
+      to: anchor.speaker,
+      segments: run.indexes.length,
+      words: run.words,
+      indexes: [...run.indexes],
+      // 根拠は同一 final だけ。③b の `evidence` と同じ `{ kind, major }` の形にしてあるので、
+      // 診断は同じ表示名の表(`LONG_MINOR_EVIDENCE_LABELS` の `seq`)で描ける
+      evidence: [{ kind: "seq", major: anchor.speaker }],
+    });
+  }
+  return { candidates: runs.length, attributed, keptUnknown, keptCounts, disabledBy: null };
 }
 
 // ---- 第3b段: minor speaker の長い run の再帰属と中立化(#61) ----
@@ -1634,8 +1825,9 @@ export function mergeSameSpeaker(lines) {
  * どちらの段も自分の条件は緩めないまま、**後段が見える範囲だけが広がる**。
  *
  * ③は②の計画から作るので、②のあとでなければ成立しない(②が「統合先を決められなかった」と
- * 判定した run が入力そのもの)。③b(#61)は③が `tooLong` で見送った run を入力に取るので、
- * さらにそのあと。
+ * 判定した run が入力そのもの)。③a(#63)は③が印を立てた run を、③b(#61)は③が `tooLong` で
+ * 見送った run を入力に取るので、さらにそのあと。③a と③b の候補は互いに素なので、この 2 つの
+ * 順序は結果を変えない(③a の再帰属を③b の E1 に数えないことはテストで固定)。
  *
  * **主要 speaker の選定は raw の統計から取る。** `tests/app-wiring.test.ts` が
  * 「`collectSpeakerStats` は `finalLines` に対して呼ぶ」を固定しており(#46)、
@@ -1659,21 +1851,25 @@ function correctSpeakers(lines, opts) {
   // ③は②の計画から作る。**添字は①通過後の配列に対するもの**で、②の適用は行数も並びも
   // 変えない(`speaker` を書き換えるだけ)ので、そのまま合成後の配列にも当たる
   const unresolvedPlan = planUnresolvedMinors(plan);
-  // ③b(#61)は③が `tooLong` で見送った run を入力に取る。走査する行は⓪①通過後の `jittered`
-  // (前後の行の `seq` / `text` を見る)、遷移の統計は raw から。②③の適用は行数も並びも変えないので
-  // ③b の添字もそのまま合成後の配列に当たる
+  // ③a(#63)は③が印を立てた run を、③b(#61)は③が `tooLong` で見送った run を入力に取る。
+  // 走査する行はどちらも⓪①通過後の `jittered`(前後の行の `seq` / `text` を見る)、③b の遷移の統計は
+  // raw から。②③の適用は行数も並びも変えないので、③a③b の添字もそのまま合成後の配列に当たる
+  const unknownPlan = planUnknownReattribution({ plan, unresolvedPlan, lines: jittered });
   const longMinorPlan = planLongMinorRuns({ plan, unresolvedPlan, lines: jittered, stats });
-  // 適用は②③と同じ 2 つの操作の再利用。③b の再帰属は `speaker` の書き換え(`attributed` は②の
-  // `merges` と同じ `to` / `indexes` を持つ)、中立化は③と同じ印。③b 専用の適用関数は持たない
+  // 適用は②③と同じ 2 つの操作の再利用。③a③b の再帰属は `speaker` の書き換え(`attributed` は②の
+  // `merges` と同じ `to` / `indexes` を持つ。③a では `applyMerges()` が③の印も落とす)、③b の中立化は
+  // ③と同じ印。③a③b 専用の適用関数は持たない。順序は ② → ③ → ③a → ③b
   const afterIslands = applyNeutralize(applyMerges(jittered, plan), unresolvedPlan);
-  const corrected = applyNeutralize(applyMerges(afterIslands, { merges: longMinorPlan.attributed }), longMinorPlan);
-  return { boundaryPlan: boundary.plan, plan, unresolvedPlan, longMinorPlan, corrected };
+  const afterUnknown = applyMerges(afterIslands, { merges: unknownPlan.attributed });
+  const corrected = applyNeutralize(applyMerges(afterUnknown, { merges: longMinorPlan.attributed }), longMinorPlan);
+  return { boundaryPlan: boundary.plan, plan, unresolvedPlan, unknownPlan, longMinorPlan, corrected };
 }
 
 /**
- * 表示・エクスポート用の発話グループを作る。**この6段の順序が要点**で、
+ * 表示・エクスポート用の発話グループを作る。**この7段の順序が要点**で、
  * 先に speaker ラベルを直してからでないと同一話者としてまとまらない
- * (⓪boundary → ①jitter → ②minor island → ③中立化 → ③b 長い minor run → ④同一話者の結合)。
+ * (⓪boundary → ①jitter → ②minor island → ③中立化 → ③a 話者不明の再帰属 → ③b 長い minor run →
+ * ④同一話者の結合)。
  *
  * @param lines raw の `finalLines`（変更しない）
  * @param opts.expectedSpeakers 想定話者数の選択値(#48)
@@ -1705,17 +1901,14 @@ export function groupUtterances(lines, opts = {}) {
  * @returns {{
  *   boundaryPlan: BoundaryPlan,
  *   plan: object,
- *   unresolvedPlan: {
- *     neutralized: Array<{speaker:number, segments:number, words:number, indexes:number[]}>,
- *     skippedRuns: Array<{reason:string, speaker:number, words:number, indexes:number[]}>,
- *     disabledBy: string|null,
- *   },
+ *   unresolvedPlan: ReturnType<typeof planUnresolvedMinors>,
+ *   unknownPlan: ReturnType<typeof planUnknownReattribution>,
  *   longMinorPlan: ReturnType<typeof planLongMinorRuns>,
  *   displayDetected: number,
  * }}
  */
 export function planDisplayCorrection(lines, opts = {}) {
-  const { boundaryPlan, plan, unresolvedPlan, longMinorPlan, corrected } = correctSpeakers(lines, opts);
+  const { boundaryPlan, plan, unresolvedPlan, unknownPlan, longMinorPlan, corrected } = correctSpeakers(lines, opts);
   // **`displayDetected` は「表示上の通常話者数」**(#50)。中立化した speaker は
   // 画面にもエクスポートにも「話者C」としては出ないので、数に入れると
   // 「話者Cは表示されないのに表示上の話者数は3」という読めない値になる。
@@ -1728,12 +1921,13 @@ export function planDisplayCorrection(lines, opts = {}) {
   // `mergeSameSpeaker()` で隣接した異なる minor が `null === null` で1段落に溶ける
   const forCount = corrected.map((l) => (l.unresolved ? { ...l, speaker: null } : l));
   // 補正後に speaker が何人へ減ったか。**計画の merges から引き算しない** —
-  // 適用と数え方が別実装になり、片方だけ直したときに静かにずれる。③b(#61)で再帰属した行は
+  // 適用と数え方が別実装になり、片方だけ直したときに静かにずれる。③a(#63)③b(#61)で再帰属した行は
   // major として、中立化した行は不明として、同じ `corrected` から自然に数えられる
   return {
     boundaryPlan,
     plan,
     unresolvedPlan,
+    unknownPlan,
     longMinorPlan,
     displayDetected: collectSpeakerStats(forCount).detected,
   };

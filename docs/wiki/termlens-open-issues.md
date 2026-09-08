@@ -8,7 +8,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]], [[termlens-testing]]
 confidence: high
-updated: 2026-09-08
+updated: 2026-09-09
 ---
 
 # TermLens の課題と次の優先順位
@@ -277,6 +277,31 @@ updated: 2026-09-08
 >   数十 word 話す」形が出たときの見え方は未確認
 > - **「境界の時間差」を根拠に足す案（サーバーから分割点の gap ms を送る）は未着手**（#57 から持ち越し）。
 >   根拠を `{ kind, major }` の列で持つ形にしてあるので、別 Issue で `kind` を足せる
+
+> 2026-09-09 追記（Issue #63）: **③が `話者不明` にした minor 発話のうち、片側の major と同じ final に
+> 入っているものをその major へ戻す段（③a `planUnknownReattribution()`）を③と③b の間に足した。**
+> #61 マージ後の実機（想定 2 人、raw 4 speaker）では表示上の通常話者数は 2 に収束したが、中立化が
+> 8 seg 残った。③a の根拠は同一 final（`seq`）だけで、新しい閾値定数は無い（[[termlens-stt-pipeline]]）。
+>
+> **未検証のまま残るもの:**
+>
+> - **観測サンプル（中立化 8 seg）のうち何件が再帰属に進むか。** 8 seg のどれだけが「片側だけ同一 final」
+>   だったかは今までの診断に出ないので、マージ後の再計測（T11）で初めて分かる。0 件でも
+>   「話者不明の維持の理由」の内訳（`final 情報なし` / `run 内で final が割れる` / `両側が同一 final` /
+>   `どちらとも別 final` / `同一 final の隣が major でない`）が次の判断材料になる
+> - **誤帰属の可能性と歯止め。** Deepgram の final は時間で区切られるので、`A → X → B` の X が
+>   「B の発話の先頭が誤分離されたもの」でも A と同じ final に入りうる。その場合③a は X を A へ戻し、
+>   B の発言が A の名前で本文に残る（中立化より害が大きい。#61 の E1 と同じ判断）。歯止めは minor 判定済み
+>   ∧ 20 word 以下 ∧ 反対側が別 final ∧ 診断の `話者不明の再帰属 from → to` で追えること。**再帰属が
+>   実機で 1 件でも出たら本文と突き合わせて誤帰属でないかを人が確かめる**（T12）。誤帰属があれば
+>   veto の追加を新 Issue にする
+> - **句読点・文字種の veto（調査の案2）を足すかの判断材料。** ⓪の `BOUNDARY_PUNCTUATION` は読点を含むので
+>   そのままでは自然な連続まで止める。句点だけに絞るなら専用の定数が要り、「境目が句読点で閉じていた
+>   候補が実機で何件か」が無いと閾値を決められない。維持理由の内訳と誤帰属の有無を見てから
+>   `UNKNOWN_KEEP_REASONS` にキーを足す形で検討する（T13）
+> - **③が `edge` で中立化しない形（`A(seq=N) → X(seq=N)` で会話が終わる）は候補に入らない。** Issue の
+>   「反対側 major が存在しない」ケースで、含めるなら「③の対象に `edge` を足す」という #50 で見送った
+>   判断を先に開く必要がある。実機の `中立化の対象外: 端 N` の件数を見てから
 
 > 2026-08-26 追記: **Issue #21 で発話の切れ目を Deepgram のシグナルに委ねたため、
 > 未検証の範囲がさらに広がった。** `speech_final`（無音検出）と `UtteranceEnd`（word ギャップ）

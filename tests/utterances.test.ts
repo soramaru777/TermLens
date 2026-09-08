@@ -23,6 +23,7 @@ import {
   planDisplayCorrection,
   planLongMinorRuns,
   planMinorIslandMerges,
+  planUnknownReattribution,
   planUnresolvedMinors,
   smoothMinorSpeakerIslands,
   smoothSpeakerBoundaries,
@@ -2305,7 +2306,7 @@ const KATA8 = "ア".repeat(8);
  * `islandLines()` を通してから、要素ごとに `seq` / `text` を上書きする。E2（同じ final）と
  * E4（文字種）を 1 行単位で作るため。上書きしない行は `islandLines()` のまま（`seq` が行ごとに
  * 違い、⓪①には掛からない）。行の組み立てを写さないのは、`islandLines()` の細工を変えたときに
- * こちらが追随しなくなるのを避けるため。
+ * こちらが追随しなくなるのを避けるため。③a（#63）の境目の `seq` にも `seqLines` の別名で使う。
  */
 function longLines(spec: LongSpec): Line[] {
   const base = islandLines(spec.map((e) => (e === "reconnect" ? e : [e[0], e[1]])));
@@ -2779,4 +2780,359 @@ test("③b の候補は skippedRuns の tooLong と 1 対 1 で、結論の合�
   assert.equal(long.runs, tooLong.length);
   // どこにも数えない run を作らない
   assert.equal(long.attributed.length + long.neutralized.length + long.kept.length, long.runs);
+});
+
+// ---- 話者不明にした minor 発話の同一 final による再帰属（③a、#63） ----
+//
+// ③が印を立てた run だけを入力に取る段。固定したいのは 4 つ。
+// 1. **根拠は同一 final（`seq`）だけで、片側だけ同じ final のときにその major へ戻す** —
+//    両側が同じ / どちらとも別 / `seq` 無し / run 内で割れる / 同じ final の隣が major でない、はすべて維持
+// 2. **③の判定と印は変えない**（③の `neutralized` はそのまま。再帰属した行の印が消えるのは適用側の不変条件）
+// 3. **③b とは互いに素で、③a の再帰属を③b の E1 に数えない**（根拠の連鎖を作らない）
+// 4. **ゲートは②と同一**で、raw / text / 行数は不変
+//
+// fixture はここでも合成データ。`longLines()` は「行ごとの `seq` / `text` の上書きが要る fixture」全般に
+// 使える（③b 専用ではない）ので、この節では `seqLines` の名で使う。境目の final は `seq` の一致だけで
+// 決まり、文字列は⓪①に掛からない長さ（8 文字）であることにしか意味が無い。
+
+const seqLines = longLines;
+
+/** ③a の計画。本番と同じ経路（`planDisplayCorrection()` の 1 回の計算）から取る */
+function unknownPlanOf(lines: Line[], expectedSpeakers: string = EXPECTED_2) {
+  return planDisplayCorrection(lines, { expectedSpeakers }).unknownPlan;
+}
+
+/** ③a の維持理由の内訳。0 埋めに差分だけ重ねる（全キーを毎回書かない） */
+const keptCountsOf = (over: Record<string, number> = {}) => ({
+  noSeq: 0,
+  mixedFinal: 0,
+  sameFinalBoth: 0,
+  differentFinal: 0,
+  anchorNotMajor: 0,
+  ...over,
+});
+
+/**
+ * `A(seq 100) → X(seq 100) → B(seq 101)`。X は直前の A と同じ final、直後の B は別 final。
+ * `0: 200 / 1: 160 / 2: 5`（2 は 1.4% で絶対 minor）。②は `mismatch`、③が中立化し、③a が A へ戻す。
+ * **この Issue が扱う形そのもの。**
+ */
+const SAME_FINAL_PREV_SPEC: LongSpec = [
+  [0, 150],
+  [1, 100],
+  [0, 50, { seq: 100, text: HIRA8 }],
+  [2, 5, { seq: 100, text: HIRA8 }],
+  [1, 60, { seq: 101, text: HIRA8 }],
+];
+
+/** `A(seq 100) → X(seq 101) → B(seq 101)`。上の鏡像で、X は直後の B と同じ final */
+const SAME_FINAL_NEXT_SPEC: LongSpec = [
+  [0, 150],
+  [1, 100],
+  [0, 50, { seq: 100, text: HIRA8 }],
+  [2, 5, { seq: 101, text: HIRA8 }],
+  [1, 60, { seq: 101, text: HIRA8 }],
+];
+
+/** 両側が同じ final。A と B の境目に挟まった断片の形で、どちらへ戻すかを決められない(`sameFinalBoth`) */
+const SAME_FINAL_BOTH_SPEC: LongSpec = [
+  [0, 150],
+  [1, 100],
+  [0, 50, { seq: 100, text: HIRA8 }],
+  [2, 5, { seq: 100, text: HIRA8 }],
+  [1, 60, { seq: 100, text: HIRA8 }],
+];
+
+/**
+ * ③a の候補（短い `mismatch` run 2 本）と③b の候補（長い `mismatch` run 1 本）が同じ minor に共存する形。
+ * 短い run はどちらも直前の 0 と同じ final（③a が 0 へ戻す）。長い run は直後の 0 と同じ final（E2→0）で、
+ * **③a の再帰属 2 本を E1 に数えると `safe merge 2 seg → 0` が立って再帰属してしまう**形にしてある。
+ * 文字種はカタカナで E4 を切り、遷移は 0 / 1 に 3:3 で偏らない。`0: 1200 / 1: 300 / 2: 39`（2 は 2.5% で絶対）。
+ */
+const COEXIST_SPEC: LongSpec = [
+  [0, 1000],
+  [1, 100],
+  [0, 50, { seq: 100, text: HIRA8 }],
+  [2, 5, { seq: 100, text: HIRA8 }],
+  [1, 100, { seq: 101, text: HIRA8 }],
+  [0, 50, { seq: 102, text: HIRA8 }],
+  [2, 4, { seq: 102, text: HIRA8 }],
+  [1, 100, { seq: 103, text: HIRA8 }],
+  [2, 30, { seq: 104, text: KATA8 }],
+  [0, 100, { seq: 104, text: HIRA8 }],
+];
+
+test("A(10) X(10) B(11): 話者不明にした X を同じ final の A へ戻す", () => {
+  const lines = seqLines(SAME_FINAL_PREV_SPEC);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  // ③の判定は変えない。印を立てた run がそのまま③a の候補になる（run 単位の一覧も同じ行）
+  assert.deepEqual(planOf(lines).skippedRuns, [{ reason: "mismatch", speaker: 2, words: 5, indexes: [3] }]);
+  assert.deepEqual(correction.unresolvedPlan.neutralized, [{ speaker: 2, segments: 1, words: 5, indexes: [3] }]);
+  assert.deepEqual(correction.unresolvedPlan.neutralizedRuns, [{ speaker: 2, words: 5, indexes: [3] }]);
+  const unknown = correction.unknownPlan;
+  assert.equal(unknown.disabledBy, null);
+  assert.equal(unknown.candidates, 1);
+  assert.deepEqual(unknown.attributed, [
+    { from: 2, to: 0, segments: 1, words: 5, indexes: [3], evidence: [{ kind: "seq", major: 0 }] },
+  ]);
+  assert.deepEqual(unknown.keptUnknown, []);
+  assert.deepEqual(unknown.keptCounts, keptCountsOf());
+  // ④で X の text は A の段落に入り（同じ final なので run も区切りなしで連結）、印は無く、表示上の通常話者数は 2
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 1]);
+  assert.deepEqual(groups[2].texts, [HIRA8, HIRA8]);
+  assert.deepEqual(groups[2].runs, [HIRA8 + HIRA8]);
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+  assert.equal(correction.displayDetected, 2);
+});
+
+test("A(10) X(11) B(11): 向きは対称で、同じ final の B へ戻す", () => {
+  const lines = seqLines(SAME_FINAL_NEXT_SPEC);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  const unknown = correction.unknownPlan;
+  assert.deepEqual(unknown.attributed, [
+    { from: 2, to: 1, segments: 1, words: 5, indexes: [3], evidence: [{ kind: "seq", major: 1 }] },
+  ]);
+  assert.deepEqual(unknown.keptUnknown, []);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 1]);
+  assert.deepEqual(groups[3].texts, [HIRA8, HIRA8]);
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+  assert.equal(correction.displayDetected, 2);
+});
+
+test("A(10) X(10) B(10): 両側が同じ final なら戻さず話者不明のまま（sameFinalBoth）", () => {
+  const lines = seqLines(SAME_FINAL_BOTH_SPEC);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  const unknown = correction.unknownPlan;
+  assert.equal(unknown.candidates, 1);
+  assert.deepEqual(unknown.attributed, []);
+  assert.deepEqual(unknown.keptUnknown, [{ reason: "sameFinalBoth", speaker: 2, segments: 1, words: 5, indexes: [3] }]);
+  assert.deepEqual(unknown.keptCounts, keptCountsOf({ sameFinalBoth: 1 }));
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 2, 1]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, true, false]);
+  assert.equal(correction.displayDetected, 2);
+});
+
+test("A(10) X(11) B(12): どちらとも別 final なら戻さない（differentFinal。③のテストと同じ形）", () => {
+  const lines = islandLines(MISMATCH_SPEC);
+  const unknown = unknownPlanOf(lines);
+  assert.deepEqual(unknown.attributed, []);
+  assert.deepEqual(unknown.keptUnknown, [{ reason: "differentFinal", speaker: 2, segments: 1, words: 5, indexes: [3] }]);
+  assert.deepEqual(unknown.keptCounts, keptCountsOf({ differentFinal: 1 }));
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, true, false]);
+});
+
+test("X に seq が無ければ戻さない（noSeq。旧セッションの復元は今までどおり）", () => {
+  // 隣の A に `seq` があっても、X 自身に無ければ同じ final を確かめられない。時間窓へは落とさない
+  const lines = seqLines([
+    [0, 150],
+    [1, 100],
+    [0, 50, { seq: 100, text: HIRA8 }],
+    [2, 5, { seq: undefined, text: HIRA8 }],
+    [1, 60, { seq: 101, text: HIRA8 }],
+  ]);
+  const unknown = unknownPlanOf(lines);
+  assert.deepEqual(unknown.attributed, []);
+  assert.deepEqual(unknown.keptUnknown, [{ reason: "noSeq", speaker: 2, segments: 1, words: 5, indexes: [3] }]);
+  assert.deepEqual(unknown.keptCounts, keptCountsOf({ noSeq: 1 }));
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, true, false]);
+});
+
+test("run の中で final が割れていれば戻さない（mixedFinal）", () => {
+  // X の 2 行は同じ run（②が切らない）だが `seq` が 100 / 101 に割れる。A(100) B(102)
+  const lines = seqLines([
+    [0, 150],
+    [1, 100],
+    [0, 50, { seq: 100, text: HIRA8 }],
+    [2, 3, { seq: 100, text: HIRA8 }],
+    [2, 3, { seq: 101, text: HIRA8 }],
+    [1, 60, { seq: 102, text: HIRA8 }],
+  ]);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.deepEqual(correction.unresolvedPlan.neutralizedRuns, [{ speaker: 2, words: 6, indexes: [3, 4] }]);
+  const unknown = correction.unknownPlan;
+  assert.equal(unknown.candidates, 1);
+  assert.deepEqual(unknown.attributed, []);
+  assert.deepEqual(unknown.keptUnknown, [{ reason: "mixedFinal", speaker: 2, segments: 2, words: 6, indexes: [3, 4] }]);
+  assert.deepEqual(unknown.keptCounts, keptCountsOf({ mixedFinal: 1 }));
+  // 同じ raw speaker の中立行は 1 段落にまとまる（#50 の規則のまま）
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 2, 1]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, true, false]);
+  assert.equal((groups[3].texts as string[]).length, 2);
+});
+
+test("Y(minor,10) X(10) A(11): 同じ final の隣が major でなければ戻さない（anchorNotMajor）", () => {
+  // X → Y の遷移は観測された話者交代なので跨がない。Y から見ても同じ final の隣は X（minor）
+  const lines = seqLines([
+    [0, 150],
+    [1, 100],
+    [3, 4, { seq: 100, text: HIRA8 }],
+    [2, 5, { seq: 100, text: HIRA8 }],
+    [0, 60, { seq: 101, text: HIRA8 }],
+  ]);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.deepEqual(planOf(lines).majors, [0, 1]);
+  assert.deepEqual(planOf(lines).minors, [2, 3]);
+  const unknown = correction.unknownPlan;
+  assert.equal(unknown.candidates, 2);
+  assert.deepEqual(unknown.attributed, []);
+  assert.deepEqual(unknown.keptUnknown, [
+    { reason: "anchorNotMajor", speaker: 3, segments: 1, words: 4, indexes: [2] },
+    { reason: "anchorNotMajor", speaker: 2, segments: 1, words: 5, indexes: [3] },
+  ]);
+  assert.deepEqual(unknown.keptCounts, keptCountsOf({ anchorNotMajor: 2 }));
+  // 隣接した異なる minor の中立行は溶けない（#50 の不変条件）
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 3, 2, 0]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, true, true, false]);
+  assert.equal(correction.displayDetected, 2);
+});
+
+test("Y(minor,9) X(10) A(10): 反対側が minor でも別 final なら A へ戻す", () => {
+  // 反対側の隣が major かどうかは見ない。X→Y の境目は跨がない（Y は別 final なので影響しない）
+  const lines = seqLines([
+    [0, 150],
+    [1, 100],
+    [3, 4, { seq: 99, text: HIRA8 }],
+    [2, 5, { seq: 100, text: HIRA8 }],
+    [0, 60, { seq: 100, text: HIRA8 }],
+  ]);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  const unknown = correction.unknownPlan;
+  assert.equal(unknown.candidates, 2);
+  assert.deepEqual(unknown.attributed, [
+    { from: 2, to: 0, segments: 1, words: 5, indexes: [3], evidence: [{ kind: "seq", major: 0 }] },
+  ]);
+  // Y は X とも別 final なので維持
+  assert.deepEqual(unknown.keptUnknown, [{ reason: "differentFinal", speaker: 3, segments: 1, words: 4, indexes: [2] }]);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 3, 0]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, true, false]);
+  assert.deepEqual(groups[3].texts, [HIRA8, HIRA8]);
+  assert.equal(correction.displayDetected, 2);
+});
+
+test("短い mismatch run は③a、長い run は③b が扱い、③a の再帰属は③b の E1 に数えない", () => {
+  const lines = seqLines(COEXIST_SPEC);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.deepEqual(planOf(lines).merges, [], "fixture に②の safe merge がある（E1 を観測できない）");
+  assert.deepEqual(kindsOf(planOf(lines)), { 2: "absolute" });
+  // ③: 短い 2 本に印、長い 1 本は `tooLong` へ付け替え
+  assert.deepEqual(correction.unresolvedPlan.neutralizedRuns, [
+    { speaker: 2, words: 5, indexes: [3] },
+    { speaker: 2, words: 4, indexes: [6] },
+  ]);
+  assert.deepEqual(correction.unresolvedPlan.skippedRuns, [{ reason: "tooLong", speaker: 2, words: 30, indexes: [8] }]);
+  // ③a: 短い 2 本を 0 へ（走査順のまま）
+  const unknown = correction.unknownPlan;
+  assert.equal(unknown.candidates, 2);
+  // 候補は再帰属と維持に漏れなく分かれる(診断の「候補」の run 数は計画の `candidates` から出す)
+  assert.equal(unknown.candidates, unknown.attributed.length + unknown.keptUnknown.length);
+  assert.deepEqual(
+    unknown.attributed.map((a: { to: number; indexes: number[] }) => [a.to, a.indexes]),
+    [
+      [0, [3]],
+      [0, [6]],
+    ],
+  );
+  assert.deepEqual(unknown.keptUnknown, []);
+  // ③b: 長い 1 本は E1 が無いので再帰属せず（③a の 2 本を数えれば `safe merge 2 seg → 0` + E2→0 で再帰属してしまう）、
+  // 絶対 minor・run 1 本・上限以下で中立化
+  const long = correction.longMinorPlan;
+  assert.equal(long.runs, 1);
+  assert.deepEqual(long.attributed, [], "③a の再帰属が③b の E1 に数えられている");
+  assert.deepEqual(evidenceOf(long.speakers[0].evidence), ["seq→0"]);
+  assert.deepEqual(long.neutralized, [{ speaker: 2, segments: 1, words: 30, indexes: [8] }]);
+  // ④: 短い 2 本は 0 の段落へ、長い 1 本だけ話者不明
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 1, 0, 1, 2, 0]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, false, false, false, false, true, false]);
+  assert.equal(correction.displayDetected, 2);
+});
+
+test("想定話者数が自動・検出が想定以下なら③a も無効（②のゲートをそのまま引き継ぐ。独自ゲートは無い）", () => {
+  const lines = seqLines(SAME_FINAL_PREV_SPEC);
+  const empty = {
+    candidates: 0,
+    attributed: [],
+    keptUnknown: [],
+    keptCounts: keptCountsOf(),
+    disabledBy: "auto",
+  };
+  assert.deepEqual(unknownPlanOf(lines, "auto"), empty);
+  // 検出 3 で想定 3 なら減らす理由が無い
+  assert.deepEqual(unknownPlanOf(lines, "3"), { ...empty, disabledBy: "detectedNotOver" });
+  // 無効でも全キーをこの順で持つ（診断の表示名の表と突き合わせる）
+  assert.deepEqual(Object.keys(unknownPlanOf(lines, "auto").keptCounts), [
+    "noSeq",
+    "mixedFinal",
+    "sameFinalBoth",
+    "differentFinal",
+    "anchorNotMajor",
+  ]);
+  // 計画そのものが無ければ `noPlan`（「有効・0 件」と区別する。③③b と同じ）
+  assert.deepEqual(planUnknownReattribution({}), { ...empty, disabledBy: "noPlan" });
+  // 戻す形でも「自動」なら何も起きない
+  const groups = groupUtterances(lines, { expectedSpeakers: "auto" }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 2, 1]);
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+});
+
+test("⓪が寄せる 3 文字以下の断片は③の候補にならず、③a の候補も 0（⓪との重複なし）", () => {
+  // 同じ final の 1 文字の断片は⓪が A へ寄せるので、②の走査には X が現れない
+  const lines = seqLines([
+    [0, 150],
+    [1, 100],
+    [0, 50, { seq: 100, text: ANCHOR6 }],
+    [2, 1, { seq: 100, text: "あ" }],
+    [1, 60, { seq: 101, text: HIRA8 }],
+  ]);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.equal(correction.boundaryPlan.applied.length, 1, "⓪が寄せていない");
+  // ②の計画は⓪①通過後の行に対するもの（raw に直接当てると X の run が見える）
+  assert.deepEqual((correction.plan as { skippedRuns: unknown[] }).skippedRuns, []);
+  assert.deepEqual(correction.unresolvedPlan.neutralizedRuns, []);
+  // 「有効・0 run」（無効ではない）
+  assert.equal(correction.unknownPlan.disabledBy, null);
+  assert.equal(correction.unknownPlan.candidates, 0);
+  assert.deepEqual(correction.unknownPlan.attributed, []);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 0, 1]);
+  assert.equal(correction.displayDetected, 2);
+});
+
+test("③a でも raw は書き換わらず、テキストと行数は変わらず、同じ入力なら同じ計画になる", () => {
+  for (const spec of [SAME_FINAL_PREV_SPEC, SAME_FINAL_NEXT_SPEC, COEXIST_SPEC]) {
+    const lines = seqLines(spec);
+    const snapshot = structuredClone(lines);
+    groupUtterances(lines, { expectedSpeakers: EXPECTED_2 });
+    planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+    assert.deepEqual(lines, snapshot, "raw を書き換えている");
+    for (const l of lines) assert.equal("unresolved" in l, false, "raw に表示用の印が漏れている");
+    // ③と④の文字数・行数が一致する（#52 の不変条件。再帰属はラベルしか変えない）
+    assert.deepEqual(displayedChars(lines, EXPECTED_2), receivedChars(lines));
+    const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+    assert.equal(
+      groups.reduce((n: number, g) => n + (g.texts as string[]).length, 0),
+      lines.length,
+    );
+    assert.deepEqual(unknownPlanOf(lines), unknownPlanOf(lines), "同じ入力で計画が変わる");
+  }
+});
+
+test("③で印が立った行が③a で再帰属されると印が消え、通常の段落に入る（applyMerges の不変条件）", () => {
+  // 印が残っていれば `mergeSameSpeaker()` は通常の発話と絶対に結合しない（#50）ので、
+  // X が B の段落に入ること自体が「印が落ちた」ことの観測になる
+  const lines = seqLines(SAME_FINAL_NEXT_SPEC);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.deepEqual(correction.unresolvedPlan.neutralized[0].indexes, [3], "③が印を立てていない");
+  assert.deepEqual(correction.unknownPlan.attributed[0].indexes, [3]);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.equal(groups.length, 4, "X が独立した段落として残っている");
+  for (const g of groups) assert.equal("unresolved" in g, false, "印が表示に残っている");
 });
