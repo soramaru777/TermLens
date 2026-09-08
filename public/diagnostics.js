@@ -551,6 +551,61 @@ function unresolvedRows(unresolvedPlan, ratioBasis) {
   ];
 }
 
+// ---- 話者不明の再帰属(③a、#63)の診断 ----
+//
+// ③が `話者不明` にした run のうち、③a が同一 final を根拠に major へ戻したもの / 戻さなかったもの。
+// 閾値定数は無いが、**維持の理由別件数**が「句読点・文字種の veto(調査の案2)を足すか」を人が
+// 判断する唯一の材料になる(②③③b と同じ理由で 0 でも全キーを出す)。
+
+/**
+ * 維持の理由の表示名。**順序も含めて `[key, label]` の列**(`ISLAND_SKIP_LABELS` と同じ形)。
+ * キーの定義箇所は `utterances.js` の `UNKNOWN_KEEP_REASONS` で、この表がそれと一致することは
+ * `tests/diagnostics.test.ts` が `planUnknownReattribution({}).keptCounts` のキー列と突き合わせて固定する。
+ *
+ * 読み方: `どちらとも別 final` が多ければ同一 final という根拠そのものが実機で成立しにくい、
+ * `両側が同一 final` は「A と B の境目に挟まった断片」の形(どちらへ戻すかを決められない)、
+ * `同一 final の隣が major でない` は minor どうしの隣接(`X → Y` の交代は跨がない)。
+ */
+export const UNKNOWN_KEEP_LABELS = Object.freeze([
+  ["noSeq", "final 情報なし"],
+  ["mixedFinal", "run 内で final が割れる"],
+  ["sameFinalBoth", "両側が同一 final"],
+  ["differentFinal", "どちらとも別 final"],
+  ["anchorNotMajor", "同一 final の隣が major でない"],
+]);
+
+/**
+ * 話者不明の再帰属の見出し行。**画面パネルと Markdown が同じ配列から描く**(既存の規則)。
+ * 出るのは speaker 番号・件数・word 数・理由名だけで、会話本文は 1 文字も入らない。
+ *
+ * ③の `表示中立化 N seg` は据え置き(③の判定は変えない)。再帰属した分はこの行で読む。
+ * 根拠の表示名は③b の `LONG_MINOR_EVIDENCE_LABELS` の `seq` を引く(同じ「同一 final」なので表を増やさない)。
+ */
+function unknownReattributionRows(unknownPlan, ratioBasis) {
+  // 計画そのものを渡されていない(古い呼び出し)なら何も出さない(「0 件」と紛れないため)
+  if (!unknownPlan) return [];
+  // ②が無効なら③a も無効。「効いていない」と「効いた結果 0 件」を区別する
+  if (unknownPlan.disabledBy) return [["話者不明の再帰属", `無効（${disabledLabel(unknownPlan.disabledBy)}）`]];
+  const view = ratioBasisView(ratioBasis);
+  const { candidates, attributed, keptUnknown, keptCounts } = unknownPlan;
+  const amount = (xs) => `${xs.length} run / ${sumBy(xs, "segments")} seg / ${sumBy(xs, "words")} ${view.unit}`;
+  const attributedBy = tally(attributed, (a) => `${a.from} → ${a.to}`);
+  return [
+    // 候補の行は run 数だけ(③b の `長い minor run: N run` と同じ)。候補は③の `neutralizedRuns` そのものなので、
+    // seg / word は直前の「表示中立化」の行と必ず同じ値になり、繰り返しても情報にならない。
+    // 見出しは「再帰属」と別にする — 同じ見出しが 2 行並ぶと画面パネルでどちらが候補か読めない
+    ["話者不明の再帰属の候補", `${candidates} run`],
+    ["話者不明の再帰属", amount(attributed)],
+    // from→to の明細。再帰属が実機で 1 件でも出たら、この組を手掛かりに本文と突き合わせる
+    ...[...attributedBy].map(([key, x]) => [
+      `話者不明の再帰属 ${key}`,
+      `${x.runs} run / ${x.segments} seg / ${x.words} ${view.unit}（根拠: ${[...x.kinds].map(evidenceLabel).join(", ")}）`,
+    ]),
+    ["話者不明の維持", amount(keptUnknown)],
+    ["話者不明の維持の理由", skipBreakdown(UNKNOWN_KEEP_LABELS, (key) => keptCounts[key])],
+  ];
+}
+
 // ---- 長い minor run(#61)の診断 ----
 //
 // ③が `tooLong` で見送った run を③b が「再帰属 / 中立化 / 維持」のどれにしたか。
@@ -609,15 +664,19 @@ function longMinorDecision(s) {
 }
 
 /**
- * `{key → {runs, words, kinds}}` に集約する(from→to / speaker ごとの明細行のため)。
- * `kinds` は要素の `evidence` の種別の集合(1 パスで拾う。無い要素なら空のまま)
+ * `{key → {runs, segments, words, kinds}}` に集約する(from→to / speaker ごとの明細行のため。
+ * ③a(#63)と③b で共有)。`kinds` は要素の `evidence` の種別の集合(1 パスで拾う。無い要素なら空のまま)
  */
+/** `xs` の `field` の和(③③a③b の `seg` / `word` の合計は全部これ。単位表記を変えるとき 3 関数を触らない) */
+const sumBy = (xs, field) => xs.reduce((n, x) => n + x[field], 0);
+
 function tally(items, keyOf) {
   const out = new Map();
   for (const x of items) {
     const key = keyOf(x);
-    const entry = out.get(key) ?? { runs: 0, words: 0, kinds: new Set() };
+    const entry = out.get(key) ?? { runs: 0, segments: 0, words: 0, kinds: new Set() };
     entry.runs++;
+    entry.segments += x.segments;
     entry.words += x.words;
     for (const e of x.evidence ?? []) entry.kinds.add(e.kind);
     out.set(key, entry);
@@ -636,12 +695,11 @@ function longMinorRows(longMinorPlan, ratioBasis) {
   if (longMinorPlan.disabledBy) return [["長い minor run", `無効（${disabledLabel(longMinorPlan.disabledBy)}）`]];
   const view = ratioBasisView(ratioBasis);
   const { attributed, neutralized, keptCounts, evidenceCounts, speakers, thresholds: t } = longMinorPlan;
-  const sum = (xs) => xs.reduce((n, x) => n + x.words, 0);
   const attributedBy = tally(attributed, (a) => `${a.from} → ${a.to}`);
   const neutralizedBy = tally(neutralized, (n) => n.speaker);
   return [
     ["長い minor run", `${longMinorPlan.runs} run`],
-    ["長い minor run の再帰属", `${attributed.length} run / ${sum(attributed)} ${view.unit}`],
+    ["長い minor run の再帰属", `${attributed.length} run / ${sumBy(attributed, "words")} ${view.unit}`],
     // from→to の明細に、その組で採用した根拠の種別を添える(同じ from→to なら E1 は共通)
     ...[...attributedBy].map(([key, x]) => [
       `長い minor run の再帰属 ${key}`,
@@ -653,7 +711,7 @@ function longMinorRows(longMinorPlan, ratioBasis) {
       "長い minor run の再帰属の根拠",
       skipBreakdown(LONG_MINOR_EVIDENCE_LABELS, (key) => evidenceCounts[key]),
     ],
-    ["長い minor run の中立化", `${neutralized.length} run / ${sum(neutralized)} ${view.unit}`],
+    ["長い minor run の中立化", `${neutralized.length} run / ${sumBy(neutralized, "words")} ${view.unit}`],
     ...[...neutralizedBy].map(([speaker, x]) => [
       `長い minor run の中立化 ${speaker} → ${UNRESOLVED_SPEAKER_LABEL}`,
       `${x.runs} run / ${x.words} ${view.unit}`,
@@ -733,6 +791,7 @@ export function speakerDiagRows({
   boundaryPlan,
   islandPlan,
   unresolvedPlan,
+  unknownPlan,
   longMinorPlan,
   displayDetected,
 }) {
@@ -756,7 +815,8 @@ export function speakerDiagRows({
   }
   // 中立化(#50)は②の明細の後。**同じ計画から描く**ので Markdown と数字が割れることはない
   rows.push(...unresolvedRows(unresolvedPlan, speakerStats.ratioBasis));
-  // 長い minor run(#61)は③の直後(パイプラインの順)。**同じ計画から描く**
+  // 話者不明の再帰属(③a、#63)と長い minor run(③b、#61)は③の直後にパイプラインの順で。**同じ計画から描く**
+  rows.push(...unknownReattributionRows(unknownPlan, speakerStats.ratioBasis));
   rows.push(...longMinorRows(longMinorPlan, speakerStats.ratioBasis));
   for (const w of speakerWarnings(speakerStats, expectedSpeakers)) rows.push(["警告", w]);
   return rows;
@@ -787,6 +847,7 @@ function speakerSection({
   boundaryPlan,
   islandPlan,
   unresolvedPlan,
+  unknownPlan,
   longMinorPlan,
   displayDetected,
 }) {
@@ -795,6 +856,7 @@ function speakerSection({
   const bRows = boundaryRows(boundaryPlan);
   const islandRows = minorIslandRows(islandPlan, speakerStats.ratioBasis);
   const neutralRows = unresolvedRows(unresolvedPlan, speakerStats.ratioBasis);
+  const unknownRows = unknownReattributionRows(unknownPlan, speakerStats.ratioBasis);
   const longRows = longMinorRows(longMinorPlan, speakerStats.ratioBasis);
   const view = ratioBasisView(speakerStats.ratioBasis);
   const rows = speakerStats.speakers.map((s) => [
@@ -858,7 +920,10 @@ function speakerSection({
           // 中立化(#50)は②の明細の後。**画面パネルと同じ行データ**から描く
           ...bullets(neutralRows),
           ...(neutralRows.length ? [""] : []),
-          // 長い minor run(#61)は③の後。②③と同じ 1 回の計算から来るので、②の節の中に続けて出す
+          // 話者不明の再帰属(③a、#63)と長い minor run(③b、#61)は③の後にパイプラインの順で。
+          // ②③と同じ 1 回の計算から来るので、②の節の中に続けて出す
+          ...bullets(unknownRows),
+          ...(unknownRows.length ? [""] : []),
           ...bullets(longRows),
           ...(longRows.length ? [""] : []),
         ]
@@ -1084,8 +1149,9 @@ function textIntegritySection({ integrity, received, displayed }) {
  * @param boundaryPlan `planDisplayCorrection()` の `boundaryPlan`(#55)。渡さなければ節ごと出ない
  * @param islandPlan `planMinorIslandMerges()` の戻り(#48)。渡さなければ節ごと出ない
  * @param unresolvedPlan `planUnresolvedMinors()` の戻り(#50)。渡さなければ中立化の行が出ない
+ * @param unknownPlan `planUnknownReattribution()` の戻り(#63)。渡さなければ話者不明の再帰属の行が出ない
  * @param longMinorPlan `planLongMinorRuns()` の戻り(#61)。渡さなければ長い minor run の行が出ない
- * @param displayDetected 表示上の**通常**話者数(`planDisplayCorrection()`、#48 / #50 / #61)
+ * @param displayDetected 表示上の**通常**話者数(`planDisplayCorrection()`、#48 / #50 / #61 / #63)
  * @param textIntegrity `ServerMessage.text_integrity` の中身(#52)。渡さなければ節ごと出ない
  * @param receivedChars ③ `finalLines` の文字数(`countTextChars()` の戻り、#52)
  * @param displayedChars ④ `groupUtterances()` の出力の文字数(`countTextChars()` の戻り、#52)
@@ -1104,6 +1170,7 @@ export function buildDiagnosticsMarkdown({
   boundaryPlan,
   islandPlan,
   unresolvedPlan,
+  unknownPlan,
   longMinorPlan,
   displayDetected,
   textIntegrity,
@@ -1144,6 +1211,7 @@ export function buildDiagnosticsMarkdown({
       boundaryPlan,
       islandPlan,
       unresolvedPlan,
+      unknownPlan,
       longMinorPlan,
       displayDetected,
     }),

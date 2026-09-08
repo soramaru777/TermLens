@@ -18,7 +18,7 @@ sources:
   - tests/utterances.test.ts
 related: [[termlens-architecture]], [[termlens-term-extraction]], [[termlens-open-issues]], [[termlens-deployment]], [[termlens-testing]]
 confidence: high
-updated: 2026-09-08
+updated: 2026-09-09
 ---
 
 # TermLens STT パイプライン
@@ -252,13 +252,14 @@ diarizer の metadata だけ。**会話本文・音声・絶対時刻・`request
 
 #### 想定話者数を超えた少数 speaker の島を寄せる（Issue #48）
 
-**表示側の補正は 5 段**（#50 で③、#55 で⓪、#61 で③b が加わり、グループ化まで含めて 6 段）。どの段も
+**表示側の補正は 6 段**（#50 で③、#55 で⓪、#61 で③b、#63 で③a が加わり、グループ化まで含めて 7 段）。どの段も
 raw の `finalLines` は書き換えず、表示・エクスポート用コピーだけを直す。テキストも行数も
 変えない。
 
 > 2026-09-05 まで: 3 段（①②③。グループ化まで含めて 4 段）。#55 で⓪が先頭に加わった。
 > 2026-09-07 まで: 4 段（⓪①②③。グループ化まで含めて 5 段）。#61 で③の後ろに③b が加わった
 > （⓪①②③④ の番号はコード・テストのコメントに広く使われているので振り直していない）。
+> 2026-09-08 まで: 5 段（⓪①②③③b。グループ化まで含めて 6 段）。#63 で③と③b の間に③a が加わった。
 
 ```
 finalLines（raw / localStorage に保存されるのもこれ）
@@ -267,10 +268,11 @@ finalLines（raw / localStorage に保存されるのもこれ）
   │                                          │
   │                          主要 speaker の選定・③b の遷移(E3)に使う
   │                                          ▼
-  └─ ⓪ smoothSpeakerBoundaries() ─▶ ① smoothSpeakerJitter() ─▶ ② planMinorIslandMerges() ─▶ ③ planUnresolvedMinors() ─▶ ③b planLongMinorRuns() ─▶ ④ mergeSameSpeaker()
-     #55 同一 final の断片           #36 局所 jitter              + applyMerges                + applyNeutralize             + applyMerges/Neutralize    + runs（連結子）
-                                                                  #48 minor island             #50 中立化                    #61 長い minor run          #55
-                                                                                               └ tooLong の run ──────────▶ ┘
+  └─ ⓪ smoothSpeakerBoundaries() ─▶ ① smoothSpeakerJitter() ─▶ ② planMinorIslandMerges() ─▶ ③ planUnresolvedMinors() ─▶ ③a planUnknownReattribution() ─▶ ③b planLongMinorRuns() ─▶ ④ mergeSameSpeaker()
+     #55 同一 final の断片           #36 局所 jitter              + applyMerges                + applyNeutralize             + applyMerges（印も落とす）      + applyMerges/Neutralize    + runs（連結子）
+                                                                  #48 minor island             #50 中立化                    #63 話者不明の再帰属             #61 長い minor run          #55
+                                                                                               ├ 印を立てた run ──────────▶ ┘                                │
+                                                                                               └ tooLong の run ───────────────────────────────────────────▶ ┘
 ```
 
 順序は `correctSpeakers()` の中に閉じてあり、呼び出し側の規律にはしていない。
@@ -428,7 +430,7 @@ Markdown・診断が同じ文言を引く）。
 
 | 見送り理由 | 中立化 | なぜ |
 |---|---|---|
-| `mismatch` かつ run が上限以下 | する | 「統合先を安全に決められない」そのもの |
+| `mismatch` かつ run が上限以下 | する | 「統合先を安全に決められない」そのもの。2026-09-09 から: ③は据え置きのまま、**③a（#63）が同一 final で major へ戻せるものは戻す** |
 | `mismatch` かつ run が上限超え | しない | 下の `tooLong` と同じ理由。**③で長さを当て直す** |
 | `tooLong` | しない | 誤割り当てされた**本物の発話**でありうる（隠すと発言者が消えたように見える）。2026-09-08 から: ③は触らず、**③b（#61）がより厳しい条件で引き取る** |
 | `edge` / `boundary` / `unknown` | しない | そもそも隣を見られなかっただけで、島かどうかの判断が付いていない |
@@ -465,8 +467,11 @@ Markdown・診断が同じ文言を引く）。
 `finalLines` は `localStorage` から**検証なしで**復元されるので、`unresolved` にも任意の値が
 入りうる。素通りさせると、想定話者数が既定の `auto`（＝この段が無効）でも画面には中立チップが
 出て、診断は「無効（想定話者数が自動）」と言う — **画面と診断が違う事実を語る**。
-`applyNeutralize()` は最初に印を落としてから計画を当てる（`definedSpeaker()` / `num()` /
-`normalizeExpectedSpeakers()` と同じ、消費側で丸める規律）。
+復元データ由来の印は `correctSpeakers()` の入口の `stripRestoredMarks()` で 1 回だけ落とす
+（`definedSpeaker()` / `num()` / `normalizeExpectedSpeakers()` と同じ、消費側で丸める規律）。
+
+> 2026-09-08 まで: `applyNeutralize()` が最初に印を落としてから計画を当てていた。③の後で同じ印を
+> 立てる段（③b、#61）が呼び直せないため、剥がす責務を入口へ移した（2026-09-08 更新）。
 
 ##### ②に `skippedRuns` を足した
 
@@ -511,6 +516,106 @@ Markdown・診断が同じ文言を引く）。
 実データを見た人がどちらの数字を見ているのか分からなくなる。②と同じく「効いていない」
 （ゲートで無効）と「効いた結果 0 件」も区別する。
 
+#### 話者不明にした minor 発話を同一 final で major へ戻す（Issue #63）
+
+#61 マージ後の実機（想定 2 人、raw 4 speaker）では表示上の通常話者数は 2 に収束したが、#50 が
+`話者不明` にした minor 発話が 8 seg 残った。その一部は `A(seq=10) → X(seq=10) → B(seq=11)` の形で、
+X は A と**同じ Deepgram final** に入っている — A の発話の途中で speaker が誤分離された可能性が高く、
+⓪（#55/#57）が同じ根拠で寄せている断片の、長さだけが⓪の上限（3〜5 文字）を超えたもの。③の判定は
+据え置いたまま、③と③b の間に **③a `planUnknownReattribution()`** を足し、「同一 final」という根拠を
+**minor と判定済みで③が印を立てた run に限って** `MINOR_ISLAND_MAX_WORDS`（20）まで広げた。
+
+##### 位置と入力
+
+- 入力は **③の戻り `neutralizedRuns`**（新設。run 単位・走査順 `{ speaker, words, indexes }`）だけ。
+  既存の `neutralized`（speaker 単位に集約）では run の境目が消えていて前後の `seq` を見られない。
+  ②が `skippedRuns` を足した #50 と同じ理由で③に足し、**③a で run を切り直さない**（「同一 minor の連続を
+  別 speaker・話者不明・再接続で切る」規則は②の 1 か所のまま）。`neutralized` / `skippedRuns` は不変
+- 独自に minor 判定はしない。②のゲート・#59 の minor 判定・③の `mismatch` と 20 word 上限を通った run
+  だけが候補になる。Issue の「反対側 major が存在しない」形（`A(seq=N) → X(seq=N)` で会話が終わる）は
+  ③が `edge` で中立化しないので候補に入らない（含めるなら「③の対象に `edge` を足す」という #50 で
+  見送った別の判断）
+- **ゲートは②と同一**。②が `disabledBy` なら③a も同じ理由で無効、計画が無ければ `noPlan`、候補 0 件は
+  「有効・0 run」（③b と同じ）
+- 走査する行は⓪①通過後の配列（③b と同じ）。②③の適用は行数も並びも変えないので添字はそのまま
+  合成後の配列に当たる
+- **③b の候補（`tooLong`）とは互いに素**なので、③a を③b の前に置いても③b の結果は変わらない。
+  ③b の E1（safe merge）は②の `merges` だけを数え、**③a の再帰属は E1 に数えない**（根拠の連鎖を
+  作らない。③a が 2 本戻した minor の長い run が E1 + E2 で再帰属しないことを fixture で固定）
+
+##### 判定（run 1 本に結論は 1 つ。根拠は同一 final だけで、新しい閾値定数は無い）
+
+1. run の全行が数値の `seq` を持たなければ `noSeq`、持つが値が割れていれば `mixedFinal`（時間窓へは
+   落とさない。⓪と同じで、挟まれていない分①より弱い証拠で動くので緩い判定に落とすと寄せる側へ倒れる）
+2. 両隣（`indexes` の直前・直後の行そのもの）が run と同じ final なら `sameFinalBoth`（Issue の
+   「両側同一 seq」。A と B の境目に挟まった断片の形で、どちらへ戻すかを決められない）、どちらとも
+   別 final なら `differentFinal`（Issue の「全て別 final」）。隣が再接続の印・範囲外なら「別 final」扱い
+3. 片側だけ同じ final なら、その隣を anchor にする。anchor が major でなければ `anchorNotMajor`、
+   major なら **X → anchor へ再帰属**（`evidence: [{ kind: "seq", major }]`）
+
+**反対側の隣が major かどうかは見ない。** `Y(minor, seq 9) → X(seq 10) → A(seq 10)` は A へ戻す
+（X→Y の境目は跨がない。Y は別 final なので影響しない）。`Y(seq 10) → X(seq 10) → A(seq 11)` は
+`anchorNotMajor` で維持（`X → Y` の遷移は観測された話者交代）。長さの上限は足さない — 候補は③で
+20 word 以下に絞られている。`seq` の無い旧セッションは全件 `noSeq` で今までどおり。
+
+維持理由キーは `utterances.js` の `UNKNOWN_KEEP_REASONS`（`noSeq → mixedFinal → sameFinalBoth →
+differentFinal → anchorNotMajor` の順。判定の優先順位もこの順）。
+
+##### 適用
+
+- ②③b と同じく `applyMerges()` に `{ merges: attributed }` を渡す。③a 専用の適用関数は持たない
+- **`applyMerges()` が speaker を書いた行から `unresolved` の印を落とす**ように 1 行足した。「帰属先が
+  決まった行に印は残らない」を適用側の不変条件にしたもので、②③b が当たる行にはそもそも印が無い
+  （②は③より前、③b の候補は③が印を立てない `tooLong`）ので挙動が変わるのは③a だけ。印が残ると
+  `mergeSameSpeaker()` が通常の発話と結合しないので、再帰属した X が major の段落に入ること自体が
+  印の落ちたことの観測になる（テストで固定）
+- 適用順は **② → ③ → ③a → ③b → ④**。`planDisplayCorrection()` の戻りに `unknownPlan` を足し、
+  `displayDetected` は `corrected` から数える既存の仕組みのままで再帰属した行は major として数えられる
+
+##### 診断への出方
+
+`### 表示補正（minor island）` の中で③の行（`表示中立化` / `中立化の対象外`）の直後、③b の行の前に
+出る（画面パネルと Markdown は同じ配列から）。会話本文は 1 文字も出ない。
+
+```
+- 話者不明の再帰属の候補: 6 run
+- 話者不明の再帰属: 4 run / 4 seg / 11 word
+- 話者不明の再帰属 2 → 0: 3 run / 3 seg / 8 word（根拠: 同一 final）
+- 話者不明の再帰属 2 → 1: 1 run / 1 seg / 3 word（根拠: 同一 final）
+- 話者不明の維持: 2 run / 2 seg / 5 word
+- 話者不明の維持の理由: final 情報なし 0 / run 内で final が割れる 0 / 両側が同一 final 1 / どちらとも別 final 1 / 同一 final の隣が major でない 0
+```
+
+- ③の `表示中立化 N seg` は据え置き（③の判定は変えない）。再帰属した分は「話者不明の再帰属」の行で読む
+- 表示名は `diagnostics.js` の `UNKNOWN_KEEP_LABELS`（キーは `utterances.js`。順序一致をテストで固定。
+  #59/#61 と同じ流儀）。根拠の表示名は③b の `LONG_MINOR_EVIDENCE_LABELS` の `seq`（`同一 final`）を
+  `labelOf()` で引き、表を増やしていない。`from → to` の集約は③b の `tally()` を流用（`segments` を足した）
+- 無効時は `話者不明の再帰属: 無効（…）` の 1 行、計画を渡されていなければ行ごと出さない（②③③b と同じ）
+
+**読み方**: `どちらとも別 final` が多ければ同一 final という根拠そのものが実機で成立しにくい、
+`両側が同一 final` は境目に挟まった断片の形、`同一 final の隣が major でない` は minor どうしの隣接。
+再帰属が実機で 1 件でも出たら、`from → to` を手掛かりに本文と突き合わせて誤帰属でないかを人が確かめる。
+
+##### 調査コメントからの調整点
+
+1. **維持理由を 4 つから 5 つにした。** 調査時は `sameFinalBoth / differentFinal / noSeq / mixedFinal` の
+   4 つで、「同一 final の隣が major でない」を `differentFinal` に混ぜる形だった。混ぜると内訳から
+   「反対側が別 final なのに寄らなかった」件数が読めなくなる（veto を足すかどうかの材料は「同一 final が
+   片側だけ成立したのに戻せなかった」数でなければならない）ので `anchorNotMajor` を分けた
+2. **句読点・文字種・時間差の veto は入れなかった**（調査の案2）。⓪の `BOUNDARY_PUNCTUATION` は読点
+   `、` を含むので「この機能は、」→「自動で動きます」のような自然な連続まで止めてしまい、句点だけに
+   絞るにも本 Issue 専用の定数と閾値判断が要る。その判断材料（境目が句読点で閉じていた候補が実機で何件か）
+   は今は無い。維持理由の内訳が溜まってから `UNKNOWN_KEEP_REASONS` にキーを足す形で検討する
+   （#48〜#61 の「閾値は実機の内訳を見て人が動かす」の流儀）
+
+##### リスクと歯止め
+
+誤帰属（B のターンの先頭が A の final の中で始まっていた場合）は中立化より害が大きい（相手の発言が
+major の名前で本文に残る。#61 の E1 と同じ判断）。Deepgram の final は時間で区切られるので、
+`A → X → B` の X が「B の発話の先頭が誤分離されたもの」でも A と同じ final に入りうる。歯止めは
+(1) X が minor 判定済み、(2) 20 word 以下、(3) 反対側が別 final、(4) 診断で `from → to` を追えること。
+観測サンプル（中立化 8 seg）のうち何件が再帰属に進むかは未検証（[[termlens-open-issues]]）。
+
 #### 長い minor run の再帰属と中立化（Issue #61）
 
 #59 マージ後の実機 3 サンプル目（想定 2 人、word 比 `79.4 / 18.0 / 2.6`）では minor は正しく
@@ -535,7 +640,7 @@ Markdown・診断が同じ文言を引く）。
   `correctSpeakers()` の入口の `stripRestoredMarks()` 1 回だけ**で、`applyNeutralize()` は印を立てるだけの
   純粋な適用にしてある（③の適用に剥がす責務を同居させると、③の後で同じ印を立てる段が呼び直せない）。
   どの適用も**計画が空なら入力をそのまま返す**（`groupUtterances()` は final ごとに呼ばれ、適用は
-  4 回あるので、何も変えない段まで全行コピーを繰り返さない）
+  ②③③a③b で 5 回あるので、何も変えない段まで全行コピーを繰り返さない）
 
 ##### 根拠（run 1 本ごとに `{ kind, major }` の列。向きは「major M の発話が誤割り当てされた」）
 
@@ -620,7 +725,8 @@ from→to ごとに出る。speaker 別の行の「根拠」は結論にかか�
 引き続き `correctSpeakers()` の中に閉じてある。
 
 > 2026-09-07 まで: 上の 4 段。#61 で③の後ろに③b（長い minor run）が加わり 5 段（グループ化まで
-> 含めて 6 段）になった（2026-09-08 更新。段数の正は #48 の節の冒頭）。
+> 含めて 6 段）になった（2026-09-08 更新）。#63 で③と③b の間に③a（話者不明の再帰属）が加わり
+> 6 段（グループ化まで含めて 7 段）になった（2026-09-09 更新。段数の正は #48 の節の冒頭）。
 
 きっかけは #52 の結論。「発話の冒頭が数文字欠けて見える」は文字の欠落ではなく、**word 単位の
 話者分割が語や短い句の途中に境界を入れていた**（`A: テキ | B: ストを確認します`）。この形は

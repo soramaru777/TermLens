@@ -25,6 +25,7 @@ import {
   MINOR_KIND_LABELS,
   LONG_MINOR_KEEP_LABELS,
   LONG_MINOR_EVIDENCE_LABELS,
+  UNKNOWN_KEEP_LABELS,
 } from "../public/diagnostics.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
 // 表示補正の計画は utterances.js が唯一の定義箇所（#48）。**診断もそこを通る**ので、
@@ -33,6 +34,7 @@ import {
   planDisplayCorrection,
   planLongMinorRuns,
   planMinorIslandMerges,
+  planUnknownReattribution,
   smoothSpeakerBoundaries,
 } from "../public/utterances.js";
 
@@ -257,6 +259,8 @@ const MD_ARGS = {
   islandPlan: null,
   // #50 の中立化。同じく既定では計画を渡していない状態
   unresolvedPlan: null,
+  // #63 の話者不明の再帰属。同じく既定では計画を渡していない状態
+  unknownPlan: null,
   // #61 の長い minor run。同じく既定では計画を渡していない状態
   longMinorPlan: null,
   displayDetected: null,
@@ -561,7 +565,8 @@ function islandArgs(lines: ReturnType<typeof line>[], expectedSpeakers = "2") {
     boundaryPlan: correction.boundaryPlan,
     islandPlan: correction.plan,
     unresolvedPlan: correction.unresolvedPlan,
-    // ③b の計画（#61）も同じ 1 回の計算から
+    // ③a（#63）③b（#61）の計画も同じ 1 回の計算から
+    unknownPlan: correction.unknownPlan,
     longMinorPlan: correction.longMinorPlan,
     displayDetected: correction.displayDetected,
   };
@@ -827,6 +832,100 @@ test("画面パネルにも中立化の行が出る", () => {
     rows.find(([k]) => k === "表示中立化 2 → 話者不明"),
     ["表示中立化 2 → 話者不明", "1 seg / 3 word"],
   );
+});
+
+// ---- 話者不明の再帰属（③a、#63） ----
+//
+// ③が `話者不明` にした run のうち、③a が同一 final を根拠に major へ戻したもの / 戻さなかったもの。
+// 閾値定数は無いが、維持の理由別件数が「句読点・文字種の veto を足すか」を人が判断する唯一の材料になる。
+// 会話本文は入らない。
+
+/**
+ * 想定 2 人・検出 3。`0(seq 10) → 2(seq 10) → 1(seq 11)`。③が中立化し、③a が 0 へ戻す形。
+ * `line()` の `seq` は既定で全行 1 なので、境目だけ上書きする（テキストは 6 文字で⓪①には掛からない）
+ */
+const UNKNOWN_ATTRIBUTE_LINES = [
+  line(0, 120, 240, 1_010_000),
+  line(1, 76, 152, 1_020_000),
+  { ...line(0, 20, 40, 1_030_000), seq: 10 },
+  { ...line(2, 3, 6, 1_040_000), seq: 10 },
+  { ...line(1, 20, 40, 1_050_000), seq: 11 },
+];
+
+/** 見送り理由と同じ流儀: キーの定義箇所は `utterances.js` で、表示名の表が順序まで一致する */
+test("話者不明の維持理由の表示名は全キーにあり、順序も計画と一致する", () => {
+  const empty = planUnknownReattribution({});
+  assert.deepEqual(
+    UNKNOWN_KEEP_LABELS.map(([key]) => key),
+    Object.keys(empty.keptCounts),
+  );
+  for (const [, label] of UNKNOWN_KEEP_LABELS) assert.ok(label.length > 0);
+});
+
+test("話者不明の再帰属が候補・from→to・根拠つきで Markdown に出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(UNKNOWN_ATTRIBUTE_LINES));
+  // ③の行は据え置き（③の判定は変えない）。再帰属した分はこの節の行で読む
+  assert.match(md, /- 表示中立化: 1 seg \/ 3 word/);
+  assert.match(md, /- 表示中立化 2 → 話者不明: 1 seg \/ 3 word/);
+  assert.match(md, /- 表示上の通常話者数: 2/);
+  assert.match(md, /- 話者不明の再帰属の候補: 1 run$/m);
+  assert.match(md, /- 話者不明の再帰属: 1 run \/ 1 seg \/ 3 word/);
+  assert.match(md, /- 話者不明の再帰属 2 → 0: 1 run \/ 1 seg \/ 3 word（根拠: 同一 final）/);
+  assert.match(md, /- 話者不明の維持: 0 run \/ 0 seg \/ 0 word/);
+  assert.match(
+    md,
+    /- 話者不明の維持の理由: final 情報なし 0 \/ run 内で final が割れる 0 \/ 両側が同一 final 0 \/ どちらとも別 final 0 \/ 同一 final の隣が major でない 0/,
+  );
+});
+
+test("維持だけの場合も候補と理由の内訳が Markdown に出る", () => {
+  // `line()` は全行 `seq: 1` なので、`0 → 2 → 1` は両側が同一 final で維持になる
+  const md = buildDiagnosticsMarkdown(islandArgs(NEUTRALIZE_LINES));
+  assert.match(md, /- 話者不明の再帰属の候補: 1 run$/m);
+  assert.match(md, /- 話者不明の再帰属: 0 run \/ 0 seg \/ 0 word/);
+  assert.doesNotMatch(md, /- 話者不明の再帰属 \d+ → /, "再帰属が無いのに from→to の行が出ている");
+  assert.match(md, /- 話者不明の維持: 1 run \/ 1 seg \/ 3 word/);
+  assert.match(md, /- 話者不明の維持の理由: final 情報なし 0 \/ run 内で final が割れる 0 \/ 両側が同一 final 1 \//);
+  // 表示上の通常話者数は③のまま
+  assert.match(md, /- 表示上の通常話者数: 2/);
+});
+
+test("②がゲートで無効なら③a も無効と 1 行出す", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(UNKNOWN_ATTRIBUTE_LINES, "auto"));
+  assert.match(md, /- 話者不明の再帰属: 無効（想定話者数が自動）/);
+  assert.doesNotMatch(md, /- 話者不明の維持/, "無効のときに 0 件の内訳を並べない");
+});
+
+test("計画を渡さなければ話者不明の再帰属の行も出さない", () => {
+  const md = buildDiagnosticsMarkdown({ ...SPEAKER_MD_ARGS });
+  assert.doesNotMatch(md, /- 話者不明の再帰属/);
+  assert.doesNotMatch(md, /- 話者不明の維持/);
+});
+
+test("話者不明の再帰属の行に会話本文が混入しない", () => {
+  const marker = "このもじれつはほんぶんのしるし";
+  const lines = UNKNOWN_ATTRIBUTE_LINES.map((l) => ({ ...l, text: marker }));
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.equal(md.includes(marker), false);
+  assert.match(md, /- 話者不明の再帰属 2 → 0: /, "行そのものは出ている");
+  const rows = speakerDiagRows(islandArgs(lines)) as Array<[string, string]>;
+  for (const [, value] of rows) assert.equal(String(value).includes(marker), false);
+});
+
+/** **画面パネルと Markdown は同じ行データから描く**（#46 からの規則） */
+test("画面パネルにも話者不明の再帰属の行が③と③b の間に出る", () => {
+  const rows = speakerDiagRows(islandArgs(UNKNOWN_ATTRIBUTE_LINES)) as Array<[string, string]>;
+  const labels = rows.map(([k]) => k);
+  assert.ok(labels.includes("話者不明の再帰属"));
+  assert.ok(labels.includes("話者不明の維持"));
+  assert.ok(labels.includes("話者不明の維持の理由"));
+  assert.deepEqual(
+    rows.find(([k]) => k === "話者不明の再帰属 2 → 0"),
+    ["話者不明の再帰属 2 → 0", "1 run / 1 seg / 3 word（根拠: 同一 final）"],
+  );
+  // ③（表示中立化）の直後、③b（長い minor run）の前に並ぶ（パイプラインの順）
+  assert.ok(labels.indexOf("中立化の対象外") < labels.indexOf("話者不明の再帰属"));
+  assert.ok(labels.indexOf("話者不明の維持の理由") < labels.indexOf("長い minor run"));
 });
 
 // ---- 長い minor run（③b、#61） ----
