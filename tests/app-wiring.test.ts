@@ -193,7 +193,9 @@ const ISLAND_WIRING = [
   // 呼び直すと、中立化の件数が表示に効いたものとずれる（②の計画と同じ理由）
   // **⓪の計画（#55）も同じ1回の計算から。** 別途 `smoothSpeakerBoundaries()` を呼び直すと
   // 境界補正の件数が表示に効いたものとずれる（②③と同じ理由）
-  "const { boundaryPlan, plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {",
+  // **③b の計画（#61）も同じ1回の計算から。** 別途 `planLongMinorRuns()` を呼び直すと
+  // 再帰属・中立化の件数が表示に効いたものとずれる
+  "const { boundaryPlan, plan: islandPlan, unresolvedPlan, longMinorPlan, displayDetected } = planDisplayCorrection(finalLines, {",
 ];
 
 test("診断の2箇所は表示補正の計画を同じ形で作る", () => {
@@ -213,6 +215,28 @@ test("診断の2箇所は表示補正の計画を同じ形で作る", () => {
     CODE,
     /planMinorIslandMerges\(/,
     "app.js が raw から直接計画を立てている（planDisplayCorrection を通すこと）",
+  );
+});
+
+/**
+ * **③b の計画（#61）も、画面パネルと Markdown が同じ1回の計算から受け取り、そのまま渡す。**
+ * 片方だけ渡し忘れると、画面には長い minor run の行が出るのに Markdown には出ない（例外は出ない）。
+ * 受け取り方（分割代入）は上の `ISLAND_WIRING` が固定している。
+ */
+test("診断の2箇所は長い minor run の計画を同じ形で受け渡す", () => {
+  for (const name of ["renderDiagnostics", "buildDiagnosticsMd"]) {
+    const body = fnBody(name);
+    assert.match(
+      body,
+      /\n\s+unresolvedPlan,\n\s+longMinorPlan,\n/,
+      `${name} が longMinorPlan を診断に渡していない`,
+    );
+  }
+  // 計画は純関数側（utterances.js）の `planDisplayCorrection()` からしか来ない
+  assert.doesNotMatch(
+    CODE,
+    /planLongMinorRuns\(/,
+    "app.js が③b の計画を直接立てている（planDisplayCorrection を通すこと）",
   );
 });
 

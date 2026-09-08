@@ -323,6 +323,10 @@ const ISLAND_DISABLED_LABELS = {
   tooFewWords: "総 word 数が閾値未満",
 };
 
+/** `disabledBy` の表示名。表に無いキー(③b の `noPlan` など)はキーをそのまま出す(黙って消さない) */
+const disabledLabel = (reason) =>
+  Object.hasOwn(ISLAND_DISABLED_LABELS, reason) ? ISLAND_DISABLED_LABELS[reason] : reason;
+
 /**
  * 見送り理由の内訳を `<表示名> <件数> / …` の 1 セルにする。②③⓪の 3 つの内訳が同じ形で
  * 出るのは、ここ 1 か所で整形しているから(区切りや欠損時の扱いを変えるときに 3 か所を直さない)。
@@ -332,6 +336,12 @@ const ISLAND_DISABLED_LABELS = {
 function skipBreakdown(labels, countOf) {
   return labels.map(([key, label]) => `${label} ${countOf(key)}`).join(" / ");
 }
+
+/**
+ * `[key, label]` 表からの表示名。**表に無いキーはキーをそのまま出す**(黙って消さない)。
+ * `[key, label]` 形の表はすべてここを通す(`skipBreakdown()` と同じく、方針を 1 か所に置く)
+ */
+const labelOf = (labels, key) => labels.find(([k]) => k === key)?.[1] ?? key;
 
 /**
  * 見送った理由の表示名。**順序も含めてここが定義箇所。**
@@ -368,7 +378,7 @@ export const MINOR_KIND_LABELS = Object.freeze([
  * 相対比と相対の適合は、基準になる主要 speaker が無ければどちらも `-`。
  */
 function minorJudgementRow(j) {
-  const kind = MINOR_KIND_LABELS.find(([key]) => key === j.kind)?.[1] ?? j.kind;
+  const kind = labelOf(MINOR_KIND_LABELS, j.kind);
   const hasRel = j.relativeRatio != null;
   const fit = (ok) => (ok ? "適合" : "超過");
   const parts = [
@@ -389,12 +399,7 @@ function minorIslandRows(islandPlan, ratioBasis) {
   // 計画そのものを渡されていない(古い呼び出し)なら何も出さない。
   // 「補正0件」と紛れないよう、行ごと出さないことで区別する
   if (!islandPlan) return [];
-  if (islandPlan.disabledBy) {
-    const why = Object.hasOwn(ISLAND_DISABLED_LABELS, islandPlan.disabledBy)
-      ? ISLAND_DISABLED_LABELS[islandPlan.disabledBy]
-      : islandPlan.disabledBy;
-    return [["表示補正", `無効（${why}）`]];
-  }
+  if (islandPlan.disabledBy) return [["表示補正", `無効（${disabledLabel(islandPlan.disabledBy)}）`]];
   const view = ratioBasisView(ratioBasis);
   const segments = islandPlan.merges.reduce((n, m) => n + m.segments, 0);
   const words = islandPlan.merges.reduce((n, m) => n + m.words, 0);
@@ -519,12 +524,7 @@ function unresolvedRows(unresolvedPlan, ratioBasis) {
   if (!unresolvedPlan) return [];
   // ②が無効なら③も無効。**「効いていない」と「効いた結果0件」を区別する**
   // (`minorIslandRows()` と同じ規律。理由の表示名も同じ表から引く)
-  if (unresolvedPlan.disabledBy) {
-    const why = Object.hasOwn(ISLAND_DISABLED_LABELS, unresolvedPlan.disabledBy)
-      ? ISLAND_DISABLED_LABELS[unresolvedPlan.disabledBy]
-      : unresolvedPlan.disabledBy;
-    return [["表示中立化", `無効（${why}）`]];
-  }
+  if (unresolvedPlan.disabledBy) return [["表示中立化", `無効（${disabledLabel(unresolvedPlan.disabledBy)}）`]];
   const view = ratioBasisView(ratioBasis);
   const neutralized = unresolvedPlan.neutralized ?? [];
   const segments = neutralized.reduce((n, x) => n + x.segments, 0);
@@ -548,6 +548,128 @@ function unresolvedRows(unresolvedPlan, ratioBasis) {
       "中立化の対象外",
       skipBreakdown(NEUTRALIZE_SKIP_LABELS, (key) => skippedRuns.filter((r) => r.reason === key).length),
     ],
+  ];
+}
+
+// ---- 長い minor run(#61)の診断 ----
+//
+// ③が `tooLong` で見送った run を③b が「再帰属 / 中立化 / 維持」のどれにしたか。
+// 閾値 5 つはすべて 1 サンプル由来の暫定値なので、**維持の理由別件数と根拠の種別別件数**が
+// 人が閾値を動かすための唯一の材料になる(②③と同じ理由で 0 でも全キーを出す)。
+
+/**
+ * 維持の理由の表示名。**順序も含めて `[key, label]` の列**(`ISLAND_SKIP_LABELS` と同じ形)。
+ * キーの定義箇所は `utterances.js` の `LONG_MINOR_KEEP_REASONS` で、この表がそれと一致することは
+ * `tests/diagnostics.test.ts` が `planLongMinorRuns({}).keptCounts` のキー列と突き合わせて固定する。
+ *
+ * 読み方: `絶対判定でない` が多ければ相対 minor を対象に含めるか、`run が複数` / `run が長い` が
+ * 多ければ `LONG_MINOR_MAX_RUNS` / `LONG_MINOR_MAX_WORDS` を、`根拠が割れている` は本物の第三者の疑い。
+ */
+export const LONG_MINOR_KEEP_LABELS = Object.freeze([
+  ["conflictingEvidence", "根拠が割れている"],
+  ["notAbsolute", "絶対判定でない"],
+  ["ratioTooHigh", "比率が高い"],
+  ["manyRuns", "run が複数"],
+  ["runTooLong", "run が長い"],
+]);
+
+/**
+ * 根拠の種別の表示名(`utterances.js` の `LONG_MINOR_EVIDENCE_KINDS` と順序まで一致。
+ * `planLongMinorRuns({}).evidenceCounts` のキー列と突き合わせて固定する)。
+ * `safe merge` = 同じ minor の別 run が②で同じ major へ寄っている(再帰属の必須条件)。
+ * `遷移の偏り` は再帰属の裏付けには数えない(safe merge 済みの島と同じ出どころで独立でない)が、
+ * 反対根拠と「何が見えていたか」の行には出るので表示名を持つ。
+ */
+export const LONG_MINOR_EVIDENCE_LABELS = Object.freeze([
+  ["merge", "safe merge"],
+  ["seq", "同一 final"],
+  ["continuity", "文字種"],
+  ["transition", "遷移の偏り"],
+]);
+
+const evidenceLabel = (kind) => labelOf(LONG_MINOR_EVIDENCE_LABELS, kind);
+/** 根拠の列を `safe merge→0, 同一 final→0` の形に。向きは「major M の発話が誤割り当てされた」 */
+const evidenceText = (evidence) =>
+  evidence.length ? evidence.map((e) => `${evidenceLabel(e.kind)}→${e.major}`).join(", ") : "なし";
+
+/**
+ * speaker 別まとめの結論の表示名。維持は理由を括弧で添える(理由は run ごとに立つので複数ありうる)。
+ * `mixed` は現行の閾値では「1 本は再帰属、残りは `manyRuns` で維持」の形だけだが、`LONG_MINOR_MAX_RUNS` を
+ * 上げると再帰属 + 中立化の形も出るので、あるものだけを並べる(閾値を動かすかどうかの材料になる)。
+ */
+function longMinorDecision(s) {
+  const why = () => s.reasons.map((r) => labelOf(LONG_MINOR_KEEP_LABELS, r)).join(", ");
+  if (s.decision === "attributed") return `再帰属 → ${s.to}`;
+  if (s.decision === "neutralized") return "中立化";
+  if (s.decision === "kept") return `維持（${why()}）`;
+  const parts = [];
+  if (s.to != null) parts.push(`再帰属 → ${s.to}`);
+  if (s.reasons.length) parts.push(`維持: ${why()}`);
+  return parts.length ? `混在（${parts.join(" / ")}）` : "混在";
+}
+
+/**
+ * `{key → {runs, words, kinds}}` に集約する(from→to / speaker ごとの明細行のため)。
+ * `kinds` は要素の `evidence` の種別の集合(1 パスで拾う。無い要素なら空のまま)
+ */
+function tally(items, keyOf) {
+  const out = new Map();
+  for (const x of items) {
+    const key = keyOf(x);
+    const entry = out.get(key) ?? { runs: 0, words: 0, kinds: new Set() };
+    entry.runs++;
+    entry.words += x.words;
+    for (const e of x.evidence ?? []) entry.kinds.add(e.kind);
+    out.set(key, entry);
+  }
+  return out;
+}
+
+/**
+ * 長い minor run の見出し行。**画面パネルと Markdown が同じ配列から描く**(既存の規則)。
+ * 出るのは speaker 番号・件数・word 数・理由名・根拠の種別名だけで、会話本文は 1 文字も入らない。
+ */
+function longMinorRows(longMinorPlan, ratioBasis) {
+  // 計画そのものを渡されていない(古い呼び出し)なら何も出さない(「0 件」と紛れないため)
+  if (!longMinorPlan) return [];
+  // ②が無効なら③b も無効。「効いていない」と「効いた結果 0 件」を区別する
+  if (longMinorPlan.disabledBy) return [["長い minor run", `無効（${disabledLabel(longMinorPlan.disabledBy)}）`]];
+  const view = ratioBasisView(ratioBasis);
+  const { attributed, neutralized, keptCounts, evidenceCounts, speakers, thresholds: t } = longMinorPlan;
+  const sum = (xs) => xs.reduce((n, x) => n + x.words, 0);
+  const attributedBy = tally(attributed, (a) => `${a.from} → ${a.to}`);
+  const neutralizedBy = tally(neutralized, (n) => n.speaker);
+  return [
+    ["長い minor run", `${longMinorPlan.runs} run`],
+    ["長い minor run の再帰属", `${attributed.length} run / ${sum(attributed)} ${view.unit}`],
+    // from→to の明細に、その組で採用した根拠の種別を添える(同じ from→to なら E1 は共通)
+    ...[...attributedBy].map(([key, x]) => [
+      `長い minor run の再帰属 ${key}`,
+      `${x.runs} run / ${x.words} ${view.unit}（根拠: ${[...x.kinds].map(evidenceLabel).join(", ")}）`,
+    ]),
+    // **再帰属した run に付いていた根拠だけ**の内訳(`evidenceCounts` の定義)。speaker 別の行の
+    // 「根拠:」は結論にかかわらず集めた全部なので、行名で区別する
+    [
+      "長い minor run の再帰属の根拠",
+      skipBreakdown(LONG_MINOR_EVIDENCE_LABELS, (key) => evidenceCounts[key]),
+    ],
+    ["長い minor run の中立化", `${neutralized.length} run / ${sum(neutralized)} ${view.unit}`],
+    ...[...neutralizedBy].map(([speaker, x]) => [
+      `長い minor run の中立化 ${speaker} → ${UNRESOLVED_SPEAKER_LABEL}`,
+      `${x.runs} run / ${x.words} ${view.unit}`,
+    ]),
+    ["長い minor run の維持", skipBreakdown(LONG_MINOR_KEEP_LABELS, (key) => keptCounts[key])],
+    // 閾値は計画の `thresholds` から(#59 と同じ理由)。過去の Markdown がどの値で判定したかを読めるように
+    [
+      "長い minor run の閾値",
+      `比率 ${pct1(t.neutralizeMaxRatio)} / run ${t.maxRuns} 本 / ${t.maxWords} word / safe merge ${t.minMergeSegments} seg / 遷移偏り ${pct1(t.transitionBias)}`,
+    ],
+    // speaker ごとのまとめ。候補になった speaker だけ。「本当に偽 speaker だったのか」を実データで
+    // 確かめる材料で、根拠は結論にかかわらず集めた全部を出す(維持でも「何が見えていたか」が読める)
+    ...speakers.map((s) => [
+      `speaker ${s.speaker} (長い run)`,
+      `${labelOf(MINOR_KIND_LABELS, s.kind)} ${pct1(s.ratio)} / ${s.longRuns} 本 / ${longMinorDecision(s)} / 根拠: ${evidenceText(s.evidence)}`,
+    ]),
   ];
 }
 
@@ -611,6 +733,7 @@ export function speakerDiagRows({
   boundaryPlan,
   islandPlan,
   unresolvedPlan,
+  longMinorPlan,
   displayDetected,
 }) {
   if (!speakerStats || speakerStats.totalSegments <= 0) return [];
@@ -633,6 +756,8 @@ export function speakerDiagRows({
   }
   // 中立化(#50)は②の明細の後。**同じ計画から描く**ので Markdown と数字が割れることはない
   rows.push(...unresolvedRows(unresolvedPlan, speakerStats.ratioBasis));
+  // 長い minor run(#61)は③の直後(パイプラインの順)。**同じ計画から描く**
+  rows.push(...longMinorRows(longMinorPlan, speakerStats.ratioBasis));
   for (const w of speakerWarnings(speakerStats, expectedSpeakers)) rows.push(["警告", w]);
   return rows;
 }
@@ -662,6 +787,7 @@ function speakerSection({
   boundaryPlan,
   islandPlan,
   unresolvedPlan,
+  longMinorPlan,
   displayDetected,
 }) {
   if (!speakerStats || speakerStats.totalSegments <= 0) return [];
@@ -669,6 +795,7 @@ function speakerSection({
   const bRows = boundaryRows(boundaryPlan);
   const islandRows = minorIslandRows(islandPlan, speakerStats.ratioBasis);
   const neutralRows = unresolvedRows(unresolvedPlan, speakerStats.ratioBasis);
+  const longRows = longMinorRows(longMinorPlan, speakerStats.ratioBasis);
   const view = ratioBasisView(speakerStats.ratioBasis);
   const rows = speakerStats.speakers.map((s) => [
     String(s.speaker),
@@ -731,6 +858,9 @@ function speakerSection({
           // 中立化(#50)は②の明細の後。**画面パネルと同じ行データ**から描く
           ...bullets(neutralRows),
           ...(neutralRows.length ? [""] : []),
+          // 長い minor run(#61)は③の後。②③と同じ 1 回の計算から来るので、②の節の中に続けて出す
+          ...bullets(longRows),
+          ...(longRows.length ? [""] : []),
         ]
       : []),
   ];
@@ -954,7 +1084,8 @@ function textIntegritySection({ integrity, received, displayed }) {
  * @param boundaryPlan `planDisplayCorrection()` の `boundaryPlan`(#55)。渡さなければ節ごと出ない
  * @param islandPlan `planMinorIslandMerges()` の戻り(#48)。渡さなければ節ごと出ない
  * @param unresolvedPlan `planUnresolvedMinors()` の戻り(#50)。渡さなければ中立化の行が出ない
- * @param displayDetected 表示上の**通常**話者数(`planDisplayCorrection()`、#48 / #50)
+ * @param longMinorPlan `planLongMinorRuns()` の戻り(#61)。渡さなければ長い minor run の行が出ない
+ * @param displayDetected 表示上の**通常**話者数(`planDisplayCorrection()`、#48 / #50 / #61)
  * @param textIntegrity `ServerMessage.text_integrity` の中身(#52)。渡さなければ節ごと出ない
  * @param receivedChars ③ `finalLines` の文字数(`countTextChars()` の戻り、#52)
  * @param displayedChars ④ `groupUtterances()` の出力の文字数(`countTextChars()` の戻り、#52)
@@ -973,6 +1104,7 @@ export function buildDiagnosticsMarkdown({
   boundaryPlan,
   islandPlan,
   unresolvedPlan,
+  longMinorPlan,
   displayDetected,
   textIntegrity,
   receivedChars,
@@ -1012,6 +1144,7 @@ export function buildDiagnosticsMarkdown({
       boundaryPlan,
       islandPlan,
       unresolvedPlan,
+      longMinorPlan,
       displayDetected,
     }),
     ...textIntegritySection({

@@ -12,10 +12,16 @@ import {
   MINOR_ISLAND_RELATIVE_MAX_RATIO,
   MINOR_ISLAND_RELATIVE_CAP_RATIO,
   MIN_TOTAL_WORDS_FOR_ISLANDS,
+  LONG_MINOR_NEUTRALIZE_MAX_RATIO,
+  LONG_MINOR_MAX_RUNS,
+  LONG_MINOR_MAX_WORDS,
+  LONG_MINOR_MIN_MERGE_SEGMENTS,
+  LONG_MINOR_TRANSITION_BIAS,
   BACKCHANNEL_WORDS,
   groupUtterances,
   mergeSameSpeaker,
   planDisplayCorrection,
+  planLongMinorRuns,
   planMinorIslandMerges,
   planUnresolvedMinors,
   smoothMinorSpeakerIslands,
@@ -1389,7 +1395,7 @@ test("同じ run の連続する中立行は1段落にまとまる", () => {
  * `tooLong` に到達しない。③で長さを当て直さないと「長い run は隠さない」という
  * #48 から続く安全弁が**この段だけ効かず**、上限なしで隠すことになる。
  */
-test("前後不一致でも run が長ければ中立化しない", () => {
+test("前後不一致でも run が長ければ③は中立化しない（tooLong に付け替えて③b が引き取る）", () => {
   const lines = islandLines([
     [0, 600],
     [1, 400],
@@ -1413,10 +1419,16 @@ test("前後不一致でも run が長ければ中立化しない", () => {
   assert.deepEqual(neutral.skippedRuns, [
     { reason: "tooLong", speaker: 2, words: MINOR_ISLAND_MAX_WORDS + 1, indexes: [3] },
   ]);
-  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
-    Record<string, unknown>
-  >;
-  assert.equal(unresolvedOf(groups).some(Boolean), false);
+  // `tooLong` に付け替えた run は③b（#61）が引き取る。この fixture は絶対 minor・run 1 本・
+  // `LONG_MINOR_MAX_WORDS` 以下なので③b の側で中立化されるが、**③の印ではない**
+  // （③b の判定は下の #61 の節で固定する。ここで見るのは③が隠していないことだけ）
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.deepEqual(correction.unresolvedPlan.neutralized, [], "③が長い run を隠している");
+  assert.deepEqual(
+    correction.longMinorPlan.neutralized.map((n: { indexes: number[] }) => n.indexes),
+    [[3]],
+    "③b が tooLong の run を引き取っていない",
+  );
 });
 
 /**
@@ -1525,7 +1537,7 @@ test("skipped の件数と skippedRuns の理由別件数が一致する", () =>
  * **中立化するのは `mismatch` だけ。** `tooLong` は「誤割り当てされた本物の発話」でありうるし、
  * 残り3つは「そもそも隣を見られなかった」。どちらも「統合先を決められなかった」とは意味が違う。
  */
-test("tooLong / boundary / edge / unknown の run は中立化しない", () => {
+test("tooLong / boundary / edge / unknown の run は③では中立化しない（③b の候補になるのは tooLong だけ）", () => {
   const lines = islandLines([
     [2, 3], // 端
     [0, 600],
@@ -1551,10 +1563,21 @@ test("tooLong / boundary / edge / unknown の run は中立化しない", () => 
     neutral.skippedRuns.map((r: { reason: string }) => r.reason).sort(),
     ["boundary", "edge", "tooLong", "unknown"],
   );
+  // ③b（#61）は `tooLong` だけを引き取る。`boundary` / `edge` / `unknown` は③b の候補にもならない
+  // （「そもそも隣を見られなかった」run は、どの段でも隠さない）
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  assert.deepEqual(correction.unresolvedPlan.neutralized, [], "対象外の run まで③が中立化している");
+  assert.equal(correction.longMinorPlan.runs, 1, "tooLong 以外の run が③b の候補になっている");
   const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<
     Record<string, unknown>
   >;
-  assert.equal(unresolvedOf(groups).some(Boolean), false, "対象外の run まで中立化している");
+  // 中立化されるのは③b が引き取った `tooLong` の 1 行（添字 4）だけ
+  assert.deepEqual(speakersOf(groups), [2, 0, 1, 0, 2, 0, null, 2, 0, null, 2, null, 0]);
+  assert.deepEqual(
+    unresolvedOf(groups),
+    [false, false, false, false, true, false, false, false, false, false, false, false, false],
+    "tooLong 以外の run まで中立化している",
+  );
 });
 
 test("想定話者数が自動なら中立化しない（②のゲートをそのまま引き継ぐ）", () => {
@@ -2247,4 +2270,513 @@ test("#57 の fixture でもテキストと行数は 1 つも変わらず、③�
     smoothSpeakerBoundaries(lines);
     assert.equal(JSON.stringify(lines), snapshot, "入力を書き換えている");
   }
+});
+
+// ---- 長い minor run の再帰属と中立化（③b、#61） ----
+//
+// ②③が `tooLong` で見送った run だけを入力に取る段。固定したいのは 4 つ。
+// 1. **再帰属は E1（同じ minor の safe merge が 1 つの major にだけ寄っている）が必須** —
+//    根拠の無い実データでは眠ったままになり、誤帰属の入口が「合成 fixture でしか通らない」状態を保つ
+// 2. **中立化は絶対判定・比率・run の本数・run の長さのすべてで測り、E2〜E4 は止めない** —
+//    `B → X → A` の X が両隣と同じ final にあるのは「境目に挟まった断片」の形そのもの
+// 3. **維持の理由は 1 run に 1 つ**。優先順位は
+//    `conflictingEvidence → notAbsolute → ratioTooHigh → manyRuns → runTooLong`
+// 4. **ゲートは②と同一で、run は切り直さない** — `boundary` / `unknown` / `edge` は候補にならない
+//
+// fixture はここでも合成データ。文字列は文字種にしか意味が無い（E4 の連続性を意図的に切るために
+// カタカナを使う）。実会話・固有名詞は入れない。
+
+type LongSpec = Array<
+  [speaker: number | null, words: number, over?: { seq?: number; text?: string }] | "reconnect"
+>;
+
+/**
+ * ひらがな 8 文字。⓪の anchor 長さ（`BOUNDARY_EXTENDED_CHAR_LIMIT`）を超えるので、同じ final を
+ * 共有させる行に使っても⓪の chain 判定に掛からない。
+ */
+const HIRA8 = "あ".repeat(8);
+/**
+ * カタカナ 8 文字。ひらがなの隣との文字種の連続性が「弱」になる（`continuity()` の表）ので、
+ * E4 を意図的に切りたい run に使う。既定の `LONG`（ひらがな）どうしは「中」で E4 が両側に付く。
+ */
+const KATA8 = "ア".repeat(8);
+
+/**
+ * `islandLines()` を通してから、要素ごとに `seq` / `text` を上書きする。E2（同じ final）と
+ * E4（文字種）を 1 行単位で作るため。上書きしない行は `islandLines()` のまま（`seq` が行ごとに
+ * 違い、⓪①には掛からない）。行の組み立てを写さないのは、`islandLines()` の細工を変えたときに
+ * こちらが追随しなくなるのを避けるため。
+ */
+function longLines(spec: LongSpec): Line[] {
+  const base = islandLines(spec.map((e) => (e === "reconnect" ? e : [e[0], e[1]])));
+  return base.map((l, i) => {
+    const e = spec[i];
+    return e === "reconnect" ? l : { ...l, ...(e[2] ?? {}) };
+  });
+}
+
+/** ③b の計画。本番と同じ経路（`planDisplayCorrection()` の 1 回の計算）から取る */
+function longPlanOf(lines: Line[], expectedSpeakers: string = EXPECTED_2) {
+  return planDisplayCorrection(lines, { expectedSpeakers }).longMinorPlan;
+}
+
+/** 根拠を `kind→major` の列に畳む（向きまで含めて比較するため） */
+const evidenceOf = (evidence: Array<{ kind: string; major: number }>) =>
+  evidence.map((e) => `${e.kind}→${e.major}`);
+
+/**
+ * 再帰属の形。`2 → 0` が②で 2 seg safe merge されていて（E1）、長い run が直前の 0 と同じ final に
+ * ある（E2）。遷移も `0 ↔ 2` が 5/6 で 0 に偏る（E3）。run の文字種をカタカナにして、後ろの 1 との
+ * 文字種の連続性（E4）が反対根拠にならないようにしてある。
+ * `0: 1250 / 1: 100 / 2: 37`（2 は 2.7% で絶対 minor）。
+ */
+const ATTRIBUTE_SPEC: LongSpec = [
+  [0, 1000],
+  [2, 3],
+  [0, 100],
+  [2, 4],
+  [0, 100],
+  [0, 50, { seq: 100, text: HIRA8 }],
+  [2, 30, { seq: 100, text: KATA8 }],
+  [1, 100],
+];
+
+/** 実機で観測された形（`79.4 / 18.0 / 2.6`、`B → X(長) → A` が 1 本、safe merge 0 件） */
+const OBSERVED_LONG_SPEC: LongSpec = [
+  [0, 600],
+  [1, 180],
+  [2, 26],
+  [0, 194],
+];
+
+test("E1 が一意で E2 も同じ major を指す長い run を主要 speaker へ再帰属する", () => {
+  const lines = longLines(ATTRIBUTE_SPEC);
+  const plan = planOf(lines);
+  assert.deepEqual(plan.merges, [{ from: 2, to: 0, segments: 2, words: 7, indexes: [1, 3] }]);
+  assert.deepEqual(planUnresolvedMinors(plan).skippedRuns, [
+    { reason: "tooLong", speaker: 2, words: 30, indexes: [6] },
+  ]);
+
+  const long = longPlanOf(lines);
+  assert.equal(long.disabledBy, null);
+  assert.equal(long.runs, 1);
+  assert.deepEqual(long.attributed, [
+    {
+      from: 2,
+      to: 0,
+      segments: 1,
+      words: 30,
+      indexes: [6],
+      evidence: [
+        { kind: "merge", major: 0 },
+        { kind: "seq", major: 0 },
+        { kind: "transition", major: 0 },
+      ],
+    },
+  ]);
+  assert.deepEqual(long.neutralized, []);
+  assert.deepEqual(long.kept, []);
+  assert.deepEqual(long.evidenceCounts, { merge: 1, seq: 1, continuity: 0, transition: 1 });
+  assert.deepEqual(
+    long.speakers.map((s: { speaker: number; decision: string; to: number | null }) => [s.speaker, s.decision, s.to]),
+    [[2, "attributed", 0]],
+  );
+  // ④で 0 の段落へ結合し、表示上の通常話者数は 2
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1]);
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+  assert.equal(planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 }).displayDetected, 2);
+});
+
+test("E1 が無い長い run は再帰属せず、絶対 minor・run 1 本・上限以下なら中立化する（観測サンプルの形）", () => {
+  const lines = longLines(OBSERVED_LONG_SPEC);
+  assert.deepEqual(planOf(lines).merges, [], "fixture に safe merge がある（E1 を観測できない）");
+  const long = longPlanOf(lines);
+  assert.deepEqual(long.attributed, []);
+  assert.deepEqual(long.neutralized, [{ speaker: 2, segments: 1, words: 26, indexes: [2] }]);
+  assert.deepEqual(long.kept, []);
+  // 両隣との文字種の連続性（E4）は付いているが、中立化を止めない（設計の調整点 1）
+  assert.deepEqual(evidenceOf(long.speakers[0].evidence), ["continuity→1", "continuity→0"]);
+  assert.equal(long.speakers[0].decision, "neutralized");
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 2, 0]);
+  assert.deepEqual(unresolvedOf(groups), [false, false, true, false]);
+  assert.equal(planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 }).displayDetected, 2);
+});
+
+test("相対判定の minor は長い run を中立化しない（notAbsolute。Issue の「現状維持」の形）", () => {
+  // 2 は 4.5%（最小の主要 46% に対して 0.098 → 相対 minor）。長い run が 2 本で 0/1 の双方に隣接
+  const lines = longLines([
+    [0, 300],
+    [2, 22],
+    [1, 460],
+    [2, 23],
+    [0, 195],
+  ]);
+  assert.deepEqual(kindsOf(planOf(lines)), { 2: "relative" }, "fixture が相対判定になっていない");
+  const long = longPlanOf(lines);
+  assert.equal(long.runs, 2);
+  assert.deepEqual(long.kept, [
+    { reason: "notAbsolute", speaker: 2, words: 22, indexes: [1] },
+    { reason: "notAbsolute", speaker: 2, words: 23, indexes: [3] },
+  ]);
+  assert.deepEqual(long.keptCounts, {
+    conflictingEvidence: 0,
+    notAbsolute: 2,
+    ratioTooHigh: 0,
+    manyRuns: 0,
+    runTooLong: 0,
+  });
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 2, 1, 2, 0], "speaker 2 が表示から消えている");
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+  assert.equal(planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 }).displayDetected, 3);
+});
+
+test("絶対 minor でも長い run が複数あれば中立化しない（manyRuns）", () => {
+  // 2 は 2.5%（絶対）だが長い run が 2 本
+  const lines = longLines([
+    [0, 1000],
+    [2, MINOR_ISLAND_MAX_WORDS + 1],
+    [1, 400],
+    [2, MINOR_ISLAND_MAX_WORDS + 1],
+    [0, 258],
+  ]);
+  assert.deepEqual(kindsOf(planOf(lines)), { 2: "absolute" });
+  const long = longPlanOf(lines);
+  assert.equal(long.speakers[0].longRuns, 2);
+  assert.ok(long.speakers[0].longRuns > LONG_MINOR_MAX_RUNS);
+  assert.deepEqual(long.neutralized, []);
+  assert.deepEqual(
+    long.kept.map((k: { reason: string }) => k.reason),
+    ["manyRuns", "manyRuns"],
+  );
+  assert.equal(long.speakers[0].decision, "kept");
+  assert.deepEqual(long.speakers[0].reasons, ["manyRuns"]);
+});
+
+test("絶対 minor でも run が LONG_MINOR_MAX_WORDS を超えれば中立化しない（runTooLong）", () => {
+  const build = (words: number) =>
+    longLines([
+      [0, 2000],
+      [1, 500],
+      [2, words],
+      [0, 430],
+    ]);
+  // 上限ちょうどは中立化する（境界は「以下」）
+  const just = longPlanOf(build(LONG_MINOR_MAX_WORDS));
+  assert.equal(just.neutralized.length, 1, "上限ちょうどで維持になっている");
+  assert.deepEqual(just.kept, []);
+  // 1 つ超えたら維持
+  const over = longPlanOf(build(LONG_MINOR_MAX_WORDS + 1));
+  assert.deepEqual(over.neutralized, []);
+  assert.deepEqual(over.kept, [
+    { reason: "runTooLong", speaker: 2, words: LONG_MINOR_MAX_WORDS + 1, indexes: [2] },
+  ]);
+});
+
+test("safe merge の帰属先が複数の major に割れていれば再帰属も中立化もしない（conflictingEvidence）", () => {
+  // `2 → 0` と `2 → 1` が両方 safe merge されていて、長い run が 1 本（2 は 2.7% で絶対）
+  const lines = longLines([
+    [0, 600],
+    [2, 3],
+    [0, 100],
+    [1, 200],
+    [2, 4],
+    [1, 100],
+    [0, 50],
+    [2, 25],
+    [1, 100],
+  ]);
+  const plan = planOf(lines);
+  assert.deepEqual(
+    plan.merges.map((m: { from: number; to: number }) => `${m.from}→${m.to}`),
+    ["2→0", "2→1"],
+    "fixture の safe merge が割れていない",
+  );
+  const long = longPlanOf(lines);
+  assert.deepEqual(long.attributed, []);
+  assert.deepEqual(long.neutralized, [], "根拠が割れているのに隠している");
+  assert.deepEqual(long.kept, [{ reason: "conflictingEvidence", speaker: 2, words: 25, indexes: [7] }]);
+  // 割れた E1 は根拠として載せない（載せると「safe merge→0」だけが見えて一意に読める）
+  assert.equal(long.speakers[0].evidence.some((e: { kind: string }) => e.kind === "merge"), false);
+});
+
+test("E1 が一意でも反対の major を指す根拠があれば再帰属せず、条件を満たせば中立化する", () => {
+  // E1 は `2 → 0`（2 seg）だが、長い run は直後の 1 と同じ final（E2 が 1 を指す）
+  const lines = longLines([
+    [0, 1000],
+    [2, 3],
+    [0, 100],
+    [2, 4],
+    [0, 100],
+    [0, 50],
+    [2, 30, { seq: 100, text: KATA8 }],
+    [1, 100, { seq: 100, text: HIRA8 }],
+  ]);
+  assert.equal(planOf(lines).merges.length, 1);
+  const long = longPlanOf(lines);
+  assert.deepEqual(evidenceOf(long.speakers[0].evidence), ["merge→0", "seq→1", "transition→0"]);
+  assert.deepEqual(long.attributed, [], "反対根拠があるのに再帰属している");
+  assert.deepEqual(long.neutralized, [{ speaker: 2, segments: 1, words: 30, indexes: [6] }]);
+  assert.deepEqual(long.kept, []);
+});
+
+test("E1 が一意でも E2〜E4 が 1 つも無ければ再帰属せず、条件を満たせば中立化する", () => {
+  // E1 は `2 → 0`（2 seg）。長い run は `1 → 2 → 1`（②の時点で tooLong）で、`seq` は別、
+  // 文字種はカタカナで連続性なし、遷移は `0 ↔ 2` が 4/6 で偏り（0.75）に届かない
+  const lines = longLines([
+    [0, 1000],
+    [2, 3],
+    [0, 100],
+    [2, 4],
+    [0, 100],
+    [1, 200],
+    [2, 30, { text: KATA8 }],
+    [1, 100],
+  ]);
+  const plan = planOf(lines);
+  assert.equal(plan.merges.length, 1);
+  assert.equal(plan.skipped.tooLong, 1, "②で tooLong になっていない");
+  const long = longPlanOf(lines);
+  assert.deepEqual(evidenceOf(long.speakers[0].evidence), ["merge→0"]);
+  assert.deepEqual(long.attributed, [], "E1 だけで再帰属している");
+  assert.deepEqual(long.neutralized, [{ speaker: 2, segments: 1, words: 30, indexes: [6] }]);
+});
+
+test("E1 と E3 だけでは再帰属しない（E3 は safe merge 済みの島と同じ出どころで、E1 と独立でない）", () => {
+  // `2 → 0` の島が 3 本（E1。遷移も `0 ↔ 2` に 6 本積まれる）。長い run は `1 → 2 → 1` で、`seq` は別、
+  // 文字種はカタカナで連続性なし。遷移は 0 に 6/8 = 0.75 で偏り（`LONG_MINOR_TRANSITION_BIAS`）に届く —
+  // これで再帰属してしまうと、run そのものの根拠がゼロなのに「複数の独立した根拠」に見える
+  const lines = longLines([
+    [0, 1000],
+    [2, 3],
+    [0, 100],
+    [2, 4],
+    [0, 100],
+    [2, 5],
+    [0, 100],
+    [1, 200],
+    [2, 30, { text: KATA8 }],
+    [1, 100],
+  ]);
+  const plan = planOf(lines);
+  assert.deepEqual(plan.merges, [{ from: 2, to: 0, segments: 3, words: 12, indexes: [1, 3, 5] }]);
+  assert.equal(plan.skipped.tooLong, 1, "②で tooLong になっていない");
+  const long = longPlanOf(lines);
+  assert.deepEqual(evidenceOf(long.speakers[0].evidence), ["merge→0", "transition→0"]);
+  assert.deepEqual(long.attributed, [], "E1 + E3 だけで再帰属している");
+  assert.deepEqual(long.neutralized, [{ speaker: 2, segments: 1, words: 30, indexes: [8] }]);
+});
+
+test("seq の無い行（旧セッションの復元）では E2 が付かない", () => {
+  // 再帰属の形から `seq` だけ落とす。E1 は残るが、境目の根拠が無いので再帰属せず中立化に落ちる
+  const lines = longLines(
+    ATTRIBUTE_SPEC.map((e) =>
+      e === "reconnect" || e[2]?.seq == null ? e : [e[0], e[1], { ...e[2], seq: undefined }],
+    ) as LongSpec,
+  );
+  assert.equal(planOf(lines).merges.length, 1);
+  const long = longPlanOf(lines);
+  assert.equal(long.speakers[0].evidence.some((e: { kind: string }) => e.kind === "seq"), false);
+  assert.deepEqual(long.attributed, []);
+  assert.deepEqual(long.neutralized, [{ speaker: 2, segments: 1, words: 30, indexes: [6] }]);
+});
+
+test("隣が主要 speaker でない run には E2 / E4 が付かない（対象外 speaker に挟まれた形）", () => {
+  // 3 は 13% で主要でも minor でもない（`others`）。長い run の両隣が 3 で、同じ final・同じ文字種でも
+  // 根拠にはならない（統合先は必ず主要 speaker）。②は `mismatch`、③が `tooLong` に付け替える
+  const lines = longLines([
+    [0, 1000],
+    [1, 300],
+    [3, 100, { seq: 100, text: HIRA8 }],
+    [2, 30, { seq: 100, text: HIRA8 }],
+    [3, 100, { seq: 100, text: HIRA8 }],
+  ]);
+  const plan = planOf(lines);
+  assert.deepEqual(plan.others, [3]);
+  assert.equal(plan.skipped.mismatch, 1);
+  const long = longPlanOf(lines);
+  assert.equal(long.runs, 1);
+  assert.deepEqual(long.speakers[0].evidence, []);
+  // 根拠が無くても中立化の条件（絶対 minor・run 1 本・上限以下）は満たす
+  assert.deepEqual(long.neutralized, [{ speaker: 2, segments: 1, words: 30, indexes: [3] }]);
+});
+
+test("同じ speaker の run が再帰属と維持に割れたら speaker のまとめは mixed（manyRuns は候補の本数で数える）", () => {
+  // 再帰属の形に、根拠の無い長い run（`1 → 2 → 1`）をもう 1 本足す。遷移は 0 に 5/8 で偏らない
+  const lines = longLines([
+    [0, 2000],
+    [2, 3],
+    [0, 100],
+    [2, 4],
+    [0, 100],
+    [0, 50, { seq: 100, text: HIRA8 }],
+    [2, 30, { seq: 100, text: KATA8 }],
+    [1, 100],
+    [2, 25, { text: KATA8 }],
+    [1, 100],
+  ]);
+  const long = longPlanOf(lines);
+  assert.equal(long.runs, 2);
+  assert.deepEqual(long.attributed.map((a: { indexes: number[] }) => a.indexes), [[6]]);
+  assert.deepEqual(long.kept, [{ reason: "manyRuns", speaker: 2, words: 25, indexes: [8] }]);
+  assert.deepEqual(long.neutralized, []);
+  assert.equal(long.speakers[0].decision, "mixed");
+  assert.equal(long.speakers[0].to, 0);
+  assert.deepEqual(long.speakers[0].reasons, ["manyRuns"]);
+});
+
+/**
+ * **現行値では `ratioTooHigh` は単独で効かない**（`absolute` ⇒ `ratio < 3%` ＝ `LONG_MINOR_NEUTRALIZE_MAX_RATIO`）。
+ * 後から比率を締めたときの歯止めとして、判定明細だけ差し替えて判定順を固定する
+ * （#59 の「上限のみで落ちる」と同じく、実分布では作れない形を直接与える）。
+ */
+test("比率が LONG_MINOR_NEUTRALIZE_MAX_RATIO 以上なら中立化しない（ratioTooHigh。notAbsolute より後）", () => {
+  const lines = longLines(OBSERVED_LONG_SPEC);
+  const plan = planOf(lines);
+  const forced = {
+    ...plan,
+    minorJudgements: plan.minorJudgements.map((j: { speaker: number }) =>
+      j.speaker === 2 ? { ...j, kind: "absolute", ratio: LONG_MINOR_NEUTRALIZE_MAX_RATIO } : j,
+    ),
+  };
+  const long = planLongMinorRuns({
+    plan: forced,
+    unresolvedPlan: planUnresolvedMinors(forced),
+    lines,
+    stats: collectSpeakerStats(lines),
+  });
+  assert.deepEqual(long.neutralized, []);
+  assert.deepEqual(long.kept.map((k: { reason: string }) => k.reason), ["ratioTooHigh"]);
+});
+
+test("想定話者数が自動なら③b も無効（②のゲートをそのまま引き継ぐ。独自ゲートは無い）", () => {
+  const long = longPlanOf(longLines(ATTRIBUTE_SPEC), "auto");
+  assert.equal(long.disabledBy, "auto");
+  assert.equal(long.runs, 0);
+  assert.deepEqual(long.attributed, []);
+  assert.deepEqual(long.neutralized, []);
+  assert.deepEqual(long.kept, []);
+  assert.deepEqual(long.speakers, []);
+  // 無効でも全キーを持つ（診断が `undefined` の分岐を持たないため）
+  assert.deepEqual(Object.keys(long.keptCounts), [
+    "conflictingEvidence",
+    "notAbsolute",
+    "ratioTooHigh",
+    "manyRuns",
+    "runTooLong",
+  ]);
+  assert.deepEqual(Object.keys(long.evidenceCounts), ["merge", "seq", "continuity", "transition"]);
+  assert.deepEqual(long.thresholds, {
+    neutralizeMaxRatio: LONG_MINOR_NEUTRALIZE_MAX_RATIO,
+    maxRuns: LONG_MINOR_MAX_RUNS,
+    maxWords: LONG_MINOR_MAX_WORDS,
+    minMergeSegments: LONG_MINOR_MIN_MERGE_SEGMENTS,
+    transitionBias: LONG_MINOR_TRANSITION_BIAS,
+  });
+  // 計画そのものが無ければ `noPlan`（「有効・0 件」と区別する。③と同じ）
+  assert.equal(planLongMinorRuns({}).disabledBy, "noPlan");
+  assert.deepEqual(planLongMinorRuns({}), { ...long, disabledBy: "noPlan" });
+  // 再帰属の形でも「自動」なら何も起きない
+  const groups = groupUtterances(longLines(ATTRIBUTE_SPEC), { expectedSpeakers: "auto" }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 2, 0, 2, 0, 2, 1]);
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+});
+
+test("#59 で minor でない speaker（others）の長い run は候補にならない", () => {
+  // 2 は 6%（絶対も相対も外）。②は run を作らないので③b にも来ない
+  const lines = longLines([
+    [0, 500],
+    [1, 300],
+    [2, 60],
+    [0, 140],
+  ]);
+  const plan = planOf(lines);
+  assert.deepEqual(plan.others, [2]);
+  assert.deepEqual(plan.minors, []);
+  const long = longPlanOf(lines);
+  assert.equal(long.disabledBy, null);
+  assert.equal(long.runs, 0);
+  assert.deepEqual(long.speakers, []);
+  const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+  assert.deepEqual(speakersOf(groups), [0, 1, 2, 0]);
+  assert.equal(unresolvedOf(groups).some(Boolean), false);
+});
+
+test("再接続境界・話者不明・端に接する長い run は③b の候補にならない", () => {
+  const specs: Array<[string, LongSpec]> = [
+    ["boundary", [[0, 600], [1, 180], [2, 26], "reconnect", [0, 194]]],
+    ["unknown", [[0, 600], [1, 180], [2, 26], [null, 5], [0, 189]]],
+    ["edge", [[2, 26], [0, 600], [1, 374]]],
+  ];
+  for (const [reason, spec] of specs) {
+    const lines = longLines(spec);
+    const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+    assert.deepEqual(
+      correction.unresolvedPlan.skippedRuns.map((r: { reason: string }) => r.reason),
+      [reason],
+      `${reason}: ②の見送り理由が想定と違う`,
+    );
+    assert.equal(correction.longMinorPlan.runs, 0, `${reason}: ③b の候補になっている`);
+    assert.deepEqual(correction.longMinorPlan.neutralized, []);
+    const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+    assert.equal(unresolvedOf(groups).some(Boolean), false, `${reason}: 隠している`);
+    assert.equal(correction.displayDetected, 3);
+  }
+});
+
+test("③b でも raw は書き換わらず、テキストと行数は変わらず、同じ入力なら同じ計画になる", () => {
+  for (const spec of [ATTRIBUTE_SPEC, OBSERVED_LONG_SPEC]) {
+    const lines = longLines(spec);
+    const snapshot = structuredClone(lines);
+    groupUtterances(lines, { expectedSpeakers: EXPECTED_2 });
+    planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+    assert.deepEqual(lines, snapshot, "raw を書き換えている");
+    for (const l of lines) assert.equal("unresolved" in l, false, "raw に表示用の印が漏れている");
+    // ③と④の文字数・行数が一致する（#52 の不変条件。再帰属も中立化もラベルしか変えない）
+    assert.deepEqual(displayedChars(lines, EXPECTED_2), receivedChars(lines));
+    const groups = groupUtterances(lines, { expectedSpeakers: EXPECTED_2 }) as Array<Record<string, unknown>>;
+    assert.equal(
+      groups.reduce((n: number, g) => n + (g.texts as string[]).length, 0),
+      lines.length,
+    );
+    assert.deepEqual(longPlanOf(lines), longPlanOf(lines), "同じ入力で計画が変わる");
+  }
+});
+
+test("③b の閾値は②③より緩くならない", () => {
+  // 長い run を隠す線は、短い島を黙って寄せる線（#50）より緩くしない
+  assert.ok(LONG_MINOR_NEUTRALIZE_MAX_RATIO <= MINOR_ISLAND_MAX_RATIO);
+  // 長い run の下限は③の `MINOR_ISLAND_MAX_WORDS` で決まる。上限がそれ以下だと何も通らない
+  assert.ok(LONG_MINOR_MAX_WORDS > MINOR_ISLAND_MAX_WORDS);
+  assert.ok(LONG_MINOR_MAX_RUNS >= 1);
+  assert.ok(LONG_MINOR_MIN_MERGE_SEGMENTS >= 1);
+  assert.ok(LONG_MINOR_TRANSITION_BIAS > 0.5 && LONG_MINOR_TRANSITION_BIAS <= 1, "過半数未満を「偏り」と呼ばない");
+});
+
+test("③b の候補は skippedRuns の tooLong と 1 対 1 で、結論の合計が候補数と一致する", () => {
+  // ③のテストと同じ「全理由入り」の fixture（tooLong は `0 → 2 → 0`、2 は 2.1% で絶対）
+  const lines = longLines([
+    [2, 3],
+    [0, 600],
+    [1, 400],
+    [0, 100],
+    [2, MINOR_ISLAND_MAX_WORDS + 1],
+    [0, 100],
+    "reconnect",
+    [2, 3],
+    [0, 100],
+    [null, 5],
+    [2, 3],
+    [null, 5],
+    [0, 100],
+  ]);
+  const correction = planDisplayCorrection(lines, { expectedSpeakers: EXPECTED_2 });
+  const tooLong = correction.unresolvedPlan.skippedRuns.filter((r: { reason: string }) => r.reason === "tooLong");
+  assert.equal(tooLong.length, 1);
+  const long = correction.longMinorPlan;
+  assert.equal(long.runs, tooLong.length);
+  // どこにも数えない run を作らない
+  assert.equal(long.attributed.length + long.neutralized.length + long.kept.length, long.runs);
 });

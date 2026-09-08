@@ -8,7 +8,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]], [[termlens-testing]]
 confidence: high
-updated: 2026-09-07
+updated: 2026-09-08
 ---
 
 # TermLens の課題と次の優先順位
@@ -245,6 +245,38 @@ updated: 2026-09-07
 >   調査時の案3。判定行の相対比が数サンプル溜まってから判断する
 > - **マージ後の実機再計測は未実施**（T11）。raw 比率・major/minor/extra・absolute/relative の内訳・
 >   #48 統合件数・#50 中立化件数・表示上の通常話者数・3 人目として残る短断片数・STT 文字数完全性を見る
+>
+> 2026-09-08 追記: 上の再計測は #61 の実機 3 サンプル目として実施済み（`79.4 / 18.0 / 2.6`、`absolute` 判定）。
+> 相対閾値・絶対上限・崩れた分布・「谷」判定の項はそのまま未検証。
+
+> 2026-09-08 追記（Issue #61）: **実機 3 サンプル目が取れ、minor 判定済みの speaker の長い run を
+> 再帰属または中立化する段（③b `planLongMinorRuns()`）を③の後ろに足した。** 想定 2 人で word 比
+> `79.4 / 18.0 / 2.6`。minor は `absolute` と正しく判定されたが、その cluster が `B → X(長) → A` の
+> 1 本の長い run で、②は `前後の主要speaker不一致 1`、③は `run が長い 1` で見送り、表示上の通常話者数が
+> 3 のまま残った。③b は③の `tooLong` だけを入力に取り、E1（同じ minor の safe merge が 1 つの major に
+> 寄っている）が必須の再帰属と、`absolute` / 比率 / run の本数 / run の長さで測る中立化を行う
+> （[[termlens-stt-pipeline]]）。観測サンプルは中立化に落ち、表示上の通常話者数は 2 になる見込み。
+>
+> **未検証のまま残るもの:**
+>
+> - **閾値 5 つ（`LONG_MINOR_NEUTRALIZE_MAX_RATIO` 0.03 / `LONG_MINOR_MAX_RUNS` 1 / `LONG_MINOR_MAX_WORDS` 60 /
+>   `LONG_MINOR_MIN_MERGE_SEGMENTS` 2 / `LONG_MINOR_TRANSITION_BIAS` 0.75）はすべて 1 サンプル由来の暫定値。**
+>   診断の「長い minor run の維持」の理由別件数を見て人が動かす前提。比率 3% は `MINOR_ISLAND_MAX_RATIO` と
+>   同じ値なので、現行値では `absolute` 種別のゲートと同じ意味で `比率が高い` は単独で効かない
+> - **マージ後の実機再計測が未実施**（T10）。raw 比率・minor 判定理由・長い minor run 数・
+>   attributed / neutralized / kept 件数・表示上の通常話者数・`話者C` として残る run の有無・STT 文字数完全性・
+>   本物の話者交代を誤統合していないか、を見る。`話者不明` 段落の見た目の目視確認（T11）も未実施
+> - **E1 の再帰属は実データで 0 件からの出発。** 観測サンプルには safe merge が無く、再帰属の経路は合成
+>   fixture でしか通っていない。実機で 1 件でも出たら、診断の「根拠」の内訳と本文を突き合わせて誤帰属で
+>   ないかを人が確かめる。誤帰属は相手の発言が major の名前で本文に残るので、中立化より害が大きい。
+>   再帰属の裏付けは run の境目を見る E2（同じ final）/ E4（文字種）だけで、E3（遷移の偏り）は
+>   safe merge 済みの島と同じ出どころなので数えない。E4 は境目のテキストの文字種次第で付いたり
+>   付かなかったりするため、再帰属が実機でどの程度成立するかは実データ待ち
+> - **本物の第三者の長い発言を中立化で隠す可能性。** `話者不明` として本文は残るので消失はしないが、
+>   誰の発言かが読めなくなる。歯止めは `absolute` かつ run 1 本かつ 60 word 以下。実機で「第三者が 1 回だけ
+>   数十 word 話す」形が出たときの見え方は未確認
+> - **「境界の時間差」を根拠に足す案（サーバーから分割点の gap ms を送る）は未着手**（#57 から持ち越し）。
+>   根拠を `{ kind, major }` の列で持つ形にしてあるので、別 Issue で `kind` を足せる
 
 > 2026-08-26 追記: **Issue #21 で発話の切れ目を Deepgram のシグナルに委ねたため、
 > 未検証の範囲がさらに広がった。** `speech_final`（無音検出）と `UtteranceEnd`（word ギャップ）
