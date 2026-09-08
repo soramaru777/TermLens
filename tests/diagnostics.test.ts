@@ -23,11 +23,18 @@ import {
   BOUNDARY_SKIP_LABELS,
   BOUNDARY_KIND_LABELS,
   MINOR_KIND_LABELS,
+  LONG_MINOR_KEEP_LABELS,
+  LONG_MINOR_EVIDENCE_LABELS,
 } from "../public/diagnostics.js";
 import { collectSpeakerStats } from "../public/speaker-stats.js";
 // 表示補正の計画は utterances.js が唯一の定義箇所（#48）。**診断もそこを通る**ので、
 // 「表示に効かせた補正」と「診断に出す件数」が別実装になりようがない
-import { planDisplayCorrection, planMinorIslandMerges, smoothSpeakerBoundaries } from "../public/utterances.js";
+import {
+  planDisplayCorrection,
+  planLongMinorRuns,
+  planMinorIslandMerges,
+  smoothSpeakerBoundaries,
+} from "../public/utterances.js";
 
 /**
  * 収音診断（#26）。固定するのは2つ。
@@ -250,6 +257,8 @@ const MD_ARGS = {
   islandPlan: null,
   // #50 の中立化。同じく既定では計画を渡していない状態
   unresolvedPlan: null,
+  // #61 の長い minor run。同じく既定では計画を渡していない状態
+  longMinorPlan: null,
   displayDetected: null,
   // #52 のテキスト完全性。既定では**サーバーから累計を受けていない**状態（節ごと出ない）
   textIntegrity: null,
@@ -552,6 +561,8 @@ function islandArgs(lines: ReturnType<typeof line>[], expectedSpeakers = "2") {
     boundaryPlan: correction.boundaryPlan,
     islandPlan: correction.plan,
     unresolvedPlan: correction.unresolvedPlan,
+    // ③b の計画（#61）も同じ 1 回の計算から
+    longMinorPlan: correction.longMinorPlan,
     displayDetected: correction.displayDetected,
   };
 }
@@ -815,6 +826,149 @@ test("画面パネルにも中立化の行が出る", () => {
   assert.deepEqual(
     rows.find(([k]) => k === "表示中立化 2 → 話者不明"),
     ["表示中立化 2 → 話者不明", "1 seg / 3 word"],
+  );
+});
+
+// ---- 長い minor run（③b、#61） ----
+//
+// ③が `tooLong` で見送った run を③b が「再帰属 / 中立化 / 維持」のどれにしたか。閾値 5 つは
+// すべて 1 サンプル由来の暫定値なので、維持の理由別件数と根拠の種別別件数が人が閾値を動かす
+// ための唯一の材料になる。会話本文は入らない。
+
+/** 想定 2 人・検出 3。`1 → 2(26 word) → 0` の長い run が 1 本、safe merge 0 件（実機で観測された形） */
+const LONG_NEUTRALIZE_LINES = [
+  line(0, 600, 1200, 1_010_000),
+  line(1, 180, 360, 1_020_000),
+  line(2, 26, 52, 1_030_000),
+  line(0, 194, 388, 1_040_000),
+];
+
+/**
+ * 再帰属の形。`2 → 0` が 2 seg safe merge されていて、長い run（30 word）は直前の 0 と同じ final
+ * （`seq: 1`。直後の 1 だけ別 final）。run の末尾を句読点で閉じて、後ろの 1 との文字種の連続性が
+ * 反対根拠にならないようにしてある。
+ */
+const LONG_ATTRIBUTE_LINES = [
+  line(0, 1000, 2000, 1_010_000),
+  line(2, 3, 6, 1_020_000),
+  line(0, 100, 200, 1_030_000),
+  line(2, 4, 8, 1_040_000),
+  line(0, 100, 200, 1_050_000),
+  line(0, 50, 100, 1_060_000),
+  { ...line(2, 30, 60, 1_070_000), text: `${"x".repeat(59)}。` },
+  { ...line(1, 100, 200, 1_080_000), seq: 2 },
+];
+
+/** 見送り理由と同じ流儀: キーの定義箇所は `utterances.js` で、表示名の表が順序まで一致する */
+test("長い minor run の維持理由・根拠の表示名は全キーにあり、順序も計画と一致する", () => {
+  const empty = planLongMinorRuns({});
+  assert.deepEqual(
+    LONG_MINOR_KEEP_LABELS.map(([key]) => key),
+    Object.keys(empty.keptCounts),
+  );
+  assert.deepEqual(
+    LONG_MINOR_EVIDENCE_LABELS.map(([key]) => key),
+    Object.keys(empty.evidenceCounts),
+  );
+  for (const [, label] of [...LONG_MINOR_KEEP_LABELS, ...LONG_MINOR_EVIDENCE_LABELS]) {
+    assert.ok(label.length > 0);
+  }
+});
+
+test("長い minor run の中立化が件数・speaker・閾値つきで Markdown に出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(LONG_NEUTRALIZE_LINES));
+  // raw の検出数は主のまま。③は隠さず（`run が長い 1`）、③b が中立化した
+  assert.match(md, /- 検出話者数: 3/);
+  assert.match(md, /- 表示上の通常話者数: 2/);
+  assert.match(md, /- 表示中立化: 0 seg \/ 0 word/);
+  assert.match(md, /- 中立化の対象外: run が長い 1 \//);
+  assert.match(md, /- 長い minor run: 1 run/);
+  assert.match(md, /- 長い minor run の再帰属: 0 run \/ 0 word/);
+  assert.match(md, /- 長い minor run の再帰属の根拠: safe merge 0 \/ 同一 final 0 \/ 文字種 0 \/ 遷移の偏り 0/);
+  assert.match(md, /- 長い minor run の中立化: 1 run \/ 26 word/);
+  assert.match(md, /- 長い minor run の中立化 2 → 話者不明: 1 run \/ 26 word/);
+  assert.match(
+    md,
+    /- 長い minor run の維持: 根拠が割れている 0 \/ 絶対判定でない 0 \/ 比率が高い 0 \/ run が複数 0 \/ run が長い 0/,
+  );
+  // 閾値は計画の `thresholds` から。後から動かしたとき、過去の Markdown がどの値で判定したかを読める
+  assert.match(md, /- 長い minor run の閾値: 比率 3\.0% \/ run 1 本 \/ 60 word \/ safe merge 2 seg \/ 遷移偏り 75\.0%/);
+  // speaker ごとのまとめ。根拠は結論にかかわらず集めた全部（この fixture は両隣と同じ final ＝ E2 が両側、
+  // `line()` のテキストは英数どうしで文字種の連続性が「強」＝ E4 も両側）。行末まで固定する
+  assert.match(
+    md,
+    /^- speaker 2 \(長い run\): 絶対 2\.6% \/ 1 本 \/ 中立化 \/ 根拠: 同一 final→1, 同一 final→0, 文字種→1, 文字種→0$/m,
+  );
+});
+
+test("長い minor run の再帰属が from→to と根拠つきで Markdown に出る", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(LONG_ATTRIBUTE_LINES));
+  assert.match(md, /- 表示補正: 2 seg \/ 7 word/, "fixture の safe merge が 2 seg になっていない");
+  assert.match(md, /- 表示上の通常話者数: 2/);
+  assert.match(md, /- 長い minor run: 1 run/);
+  assert.match(md, /- 長い minor run の再帰属: 1 run \/ 30 word/);
+  assert.match(md, /- 長い minor run の再帰属 2 → 0: 1 run \/ 30 word（根拠: safe merge, 同一 final, 文字種, 遷移の偏り）/);
+  assert.match(md, /- 長い minor run の再帰属の根拠: safe merge 1 \/ 同一 final 1 \/ 文字種 1 \/ 遷移の偏り 1/);
+  assert.match(md, /- 長い minor run の中立化: 0 run \/ 0 word/);
+  assert.match(md, /- speaker 2 \(長い run\): 絶対 2\.7% \/ 1 本 \/ 再帰属 → 0 \/ 根拠: safe merge→0, 同一 final→0, 文字種→0, 遷移の偏り→0/);
+});
+
+test("維持した長い run は理由つきで Markdown に出る", () => {
+  // 2 は 4.5% の相対 minor。長い run 2 本とも `絶対判定でない` で維持
+  const lines = [
+    line(0, 300, 600, 1_010_000),
+    line(2, 22, 44, 1_020_000),
+    line(1, 460, 920, 1_030_000),
+    line(2, 23, 46, 1_040_000),
+    line(0, 195, 390, 1_050_000),
+  ];
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.match(md, /- 表示上の通常話者数: 3/);
+  assert.match(md, /- 長い minor run: 2 run/);
+  assert.match(md, /- 長い minor run の維持: 根拠が割れている 0 \/ 絶対判定でない 2 \/ 比率が高い 0 \/ run が複数 0 \/ run が長い 0/);
+  assert.match(md, /- speaker 2 \(長い run\): 相対 4\.5% \/ 2 本 \/ 維持（絶対判定でない） \/ 根拠: /);
+});
+
+test("②がゲートで無効なら③b も無効と 1 行出す", () => {
+  const md = buildDiagnosticsMarkdown(islandArgs(LONG_NEUTRALIZE_LINES, "auto"));
+  assert.match(md, /- 長い minor run: 無効（想定話者数が自動）/);
+  assert.doesNotMatch(md, /- 長い minor run の維持:/, "無効のときに 0 件の内訳を並べない");
+  assert.doesNotMatch(md, /- 長い minor run の閾値:/);
+});
+
+test("計画を渡さなければ長い minor run の行も出さない", () => {
+  const md = buildDiagnosticsMarkdown({ ...SPEAKER_MD_ARGS });
+  assert.doesNotMatch(md, /- 長い minor run/);
+});
+
+test("長い minor run の行に会話本文が混入しない", () => {
+  const marker = "このもじれつはほんぶんのしるし";
+  const lines = LONG_NEUTRALIZE_LINES.map((l) => ({ ...l, text: marker }));
+  const md = buildDiagnosticsMarkdown(islandArgs(lines));
+  assert.equal(md.includes(marker), false);
+  assert.match(md, /- 長い minor run: 1 run/, "行そのものは出ている");
+  const attributed = LONG_ATTRIBUTE_LINES.map((l) => ({ ...l, text: marker }));
+  const rows = speakerDiagRows(islandArgs(attributed)) as Array<[string, string]>;
+  for (const [, value] of rows) assert.equal(String(value).includes(marker), false);
+});
+
+/** **画面パネルと Markdown は同じ行データから描く**（#46 からの規則） */
+test("画面パネルにも長い minor run の行が出る", () => {
+  const rows = speakerDiagRows(islandArgs(LONG_NEUTRALIZE_LINES)) as Array<[string, string]>;
+  const labels = rows.map(([k]) => k);
+  assert.ok(labels.includes("長い minor run"));
+  assert.ok(labels.includes("長い minor run の維持"));
+  assert.ok(labels.includes("長い minor run の閾値"));
+  assert.deepEqual(
+    rows.find(([k]) => k === "長い minor run の中立化 2 → 話者不明"),
+    ["長い minor run の中立化 2 → 話者不明", "1 run / 26 word"],
+  );
+  // ③（表示中立化）の直後に並ぶ（パイプラインの順）
+  assert.ok(labels.indexOf("中立化の対象外") < labels.indexOf("長い minor run"));
+  const attributedRows = speakerDiagRows(islandArgs(LONG_ATTRIBUTE_LINES)) as Array<[string, string]>;
+  assert.deepEqual(
+    attributedRows.find(([k]) => k === "長い minor run の再帰属 2 → 0"),
+    ["長い minor run の再帰属 2 → 0", "1 run / 30 word（根拠: safe merge, 同一 final, 文字種, 遷移の偏り）"],
   );
 });
 

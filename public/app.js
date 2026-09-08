@@ -1398,7 +1398,7 @@ function renderDiagnostics() {
   // (詳細は utterances.js の planDisplayCorrection() のコメント)。
   // ここと buildDiagnosticsMd() は同じ形にすること
   const speakerStats = collectSpeakerStats(finalLines);
-  const { boundaryPlan, plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
+  const { boundaryPlan, plan: islandPlan, unresolvedPlan, longMinorPlan, displayDetected } = planDisplayCorrection(finalLines, {
     expectedSpeakers: getExpectedSpeakers(),
   });
   const stages = textIntegrityStages();
@@ -1423,6 +1423,7 @@ function renderDiagnostics() {
       boundaryPlan,
       islandPlan,
       unresolvedPlan,
+      longMinorPlan,
       displayDetected,
     }),
     // テキスト完全性(#52)。サーバーから `text_integrity` を1件も受けていなければ
@@ -1455,7 +1456,7 @@ function buildDiagnosticsMd() {
   // (詳細は utterances.js の planDisplayCorrection() のコメント)。
   // ここと renderDiagnostics() は同じ形にすること
   const speakerStats = collectSpeakerStats(finalLines);
-  const { boundaryPlan, plan: islandPlan, unresolvedPlan, displayDetected } = planDisplayCorrection(finalLines, {
+  const { boundaryPlan, plan: islandPlan, unresolvedPlan, longMinorPlan, displayDetected } = planDisplayCorrection(finalLines, {
     expectedSpeakers: getExpectedSpeakers(),
   });
   const stages = textIntegrityStages();
@@ -1480,6 +1481,7 @@ function buildDiagnosticsMd() {
     boundaryPlan,
     islandPlan,
     unresolvedPlan,
+    longMinorPlan,
     displayDetected,
     // ③④は1回の計算から両方取る(#52)。2回呼ぶと、その間に届いた final の行が
     // 片方にだけ入り、③と④が別々の時点の画面を指す

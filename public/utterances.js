@@ -2,6 +2,7 @@
 // 話者ラベルの揺れ(speaker jitter)の補正(#36)、
 // 想定話者数を超えて検出された少数 speaker の島の補正(#48)、
 // 統合先を決められなかった minor speaker の中立化(#50)、
+// minor speaker の長い run の再帰属と中立化(#61)、
 // そして連続する同一話者の結合と、段落内の連結子の出し分け(#55)。
 //
 // **app.js から切り出してあるのは、Node のテストから読めるようにするため**
@@ -122,6 +123,40 @@ export const MINOR_ISLAND_MAX_WORDS = 20;
 
 /** これ未満の総 word 数では主要 speaker の順位が信用できないので補正しない */
 export const MIN_TOTAL_WORDS_FOR_ISLANDS = 200;
+
+// ---- 長い minor run の閾値(#61) ----
+//
+// ②③は `MINOR_ISLAND_MAX_WORDS` を超える run を「誤割り当てされた本物の発話でありうる」として
+// 触らない。③b はその見送り(`tooLong`)だけを入力に取り、②③より**厳しい**条件で再帰属か中立化を
+// する。5 つとも実機 1 サンプル(`79.4 / 18.0 / 2.6`、長い run が 1 本)から置いた暫定値で、
+// 診断の「維持」の理由別件数を見て人が動かす。
+
+/**
+ * 長い run を中立化してよい minor 比率の上限(**未満**)。`MINOR_ISLAND_MAX_RATIO` と同じ値だが
+ * 別定数 — 「長い run を隠す線」は「短い島を黙って寄せる線」より緩くしてはいけない関係を、
+ * テストで `<=` として固定してある。`absolute` 種別のゲートとは別に持つのは、後からここを
+ * 2% に締めたくなったときに種別の定義(3%)を動かさずに済ませるため。
+ */
+export const LONG_MINOR_NEUTRALIZE_MAX_RATIO = 0.03;
+
+/** 同じ speaker の長い run がこれを超えたら中立化しない(何度も長く話す speaker は本物の第三者でありうる) */
+export const LONG_MINOR_MAX_RUNS = 1;
+
+/**
+ * 1 run の word 上限。**再帰属と中立化の両方**に掛ける。Issue の再帰属条件には長さの上限が無いが、
+ * 誤帰属(相手の発言が major の名前で本文に残る)は中立化より害が大きいので、中立化より緩い
+ * 条件にしない。比率だけだと長いセッションで 1 run が段落 1 つ分になる。
+ */
+export const LONG_MINOR_MAX_WORDS = 60;
+
+/** 再帰属の根拠 E1(同じ minor の別 run が②で同じ major へ safe merge されている)に要る segment 数 */
+export const LONG_MINOR_MIN_MERGE_SEGMENTS = 2;
+
+/**
+ * 根拠 E3 で「遷移が片方の major に偏っている」とみなす割合(遷移総数 2 以上のとき)。
+ * run 1 本の `B → X → A` は 1:1 なので付かない — 偏りは複数回の観測からしか出ない。
+ */
+export const LONG_MINOR_TRANSITION_BIAS = 0.75;
 
 // ---- speaker boundary の閾値(#55) ----
 //
@@ -1068,7 +1103,7 @@ export function planMinorIslandMerges(lines, { expectedSpeakers, stats } = {}) {
 }
 
 /**
- * 計画を適用した**コピー**を返す。引数の配列も要素も変更しない。
+ * 計画を適用した**コピー**を返す(計画が空なら入力をそのまま返す)。引数の配列も要素も変更しない。
  *
  * 直すのは `speaker` ラベルだけで、テキストも行数も入力のまま(#36 と同じ)。
  */
@@ -1076,8 +1111,13 @@ export function smoothMinorSpeakerIslands(lines, opts = {}) {
   return applyMerges(lines, planMinorIslandMerges(lines, opts));
 }
 
-/** 計画の `indexes` は `lines` の添字。**計画を立てた配列と同じものへ当てること** */
+/**
+ * 計画の `indexes` は `lines` の添字。**計画を立てた配列と同じものへ当てること。**
+ * **計画が空なら入力をそのまま返す。** `groupUtterances()` は final ごとに呼ばれ、適用は②③③b で
+ * 4 回あるので、何も変えない段まで全行コピーを繰り返さない(どの段も入力を変更しないので共有して安全)
+ */
 function applyMerges(lines, plan) {
+  if (plan.merges.length === 0) return lines;
   const out = lines.map((line) => ({ ...line }));
   for (const m of plan.merges) {
     for (const i of m.indexes) out[i].speaker = m.to;
@@ -1171,21 +1211,337 @@ export function planUnresolvedMinors(plan) {
 }
 
 /**
- * 計画を適用した**コピー**を返す。引数の配列も要素も変更しない。**`speaker` は変えない。**
+ * 計画を適用した**コピー**を返す(計画が空なら入力をそのまま返す。`applyMerges()` と同じ理由)。
+ * 引数の配列も要素も変更しない。**`speaker` は変えない。**
  *
  * 立てるのは `unresolved` の印だけ。テキストも行数も speaker 番号も入力のまま
- * (#36 / #48 と同じ規律で、この段でも「何も削除しない」)。
+ * (#36 / #48 と同じ規律で、この段でも「何も削除しない」)。**印を剥がすのはここではない** —
+ * 復元データ由来の印は `correctSpeakers()` の入口で 1 回だけ落とす(`stripRestoredMarks()`)。
+ * ここで剥がすと、③の後に同じ印を立てる段(③b)が呼び直せなくなる
  */
 function applyNeutralize(lines, plan) {
-  // **復元データ由来の印は信じない。** `finalLines` は localStorage から**検証なしで**
-  // 復元される(`app.js` の `finalLines.push(...session.finalLines)`)ので、`unresolved` にも
-  // 任意の値が入りうる。素通りさせると、想定話者数が既定の `auto`(＝この段が無効)でも
-  // 画面には中立チップが出て、診断は「無効（想定話者数が自動）」と言う —
-  // **画面と診断が違う事実を語る**。印はこのパイプラインが立てたものだけを有効にする
-  // (`definedSpeaker()` / `num()` / `normalizeExpectedSpeakers()` と同じ、消費側で丸める規律)
-  const out = lines.map(({ unresolved, ...rest }) => rest);
+  if (plan.neutralized.length === 0) return lines;
+  const out = lines.map((line) => ({ ...line }));
   for (const n of plan.neutralized) for (const i of n.indexes) out[i].unresolved = true;
   return out;
+}
+
+/**
+ * **復元データ由来の印は信じない。** `finalLines` は localStorage から**検証なしで**
+ * 復元される(`app.js` の `finalLines.push(...session.finalLines)`)ので、`unresolved` にも
+ * 任意の値が入りうる。素通りさせると、想定話者数が既定の `auto`(＝③③b が無効)でも
+ * 画面には中立チップが出て、診断は「無効（想定話者数が自動）」と言う —
+ * **画面と診断が違う事実を語る**。印はこのパイプラインが立てたものだけを有効にする
+ * (`definedSpeaker()` / `num()` / `normalizeExpectedSpeakers()` と同じ、消費側で丸める規律)。
+ *
+ * パイプラインの入口で 1 回だけ行う。この時点で全行がコピーになるので、以降の段は raw を触りようがない
+ */
+function stripRestoredMarks(lines) {
+  return lines.map(({ unresolved, ...rest }) => rest);
+}
+
+// ---- 第3b段: minor speaker の長い run の再帰属と中立化(#61) ----
+//
+// ②③は `MINOR_ISLAND_MAX_WORDS` を超える run を `tooLong` として見送る。実機(`79.4 / 18.0 / 2.6`)
+// では minor と正しく判定された speaker の**ほぼ全部が 1 本の長い run** で、②③のどちらにも
+// 掛からず「話者C」として残った。この段はその `tooLong` の run だけを入力に取る。
+//
+// 取る手は 3 つで、上から順に条件が厳しい:
+// - **再帰属**: 同じ minor の別 run が②で同じ major へ safe merge されている(E1)ことを必須にし、
+//   さらに run の境目の根拠(E2 同じ final / E4 文字種)が同じ major を指し、反対の major を指す
+//   根拠(E3 遷移の偏りを含む)が 1 つも無いときだけ
+//   `speaker` を書き換える。E1 は実機で 0 件なので、**この経路は実データでは眠ったまま**になる
+//   設計 — 誤帰属(相手の発言が major の名前で本文に残る)は中立化より害が大きい
+// - **中立化**: 再帰属できず、`absolute` 判定・比率・run の本数・run の長さのすべてが「本物の
+//   第三者らしくない」側にあるときだけ `unresolved` を立てる(③と同じ印)
+// - **維持**: どれかで落ちた run は raw speaker のまま残し、理由を 1 つ返す
+//
+// **run は切り直さない**(③と同じ規律)。`boundary` / `unknown` / `edge` は②で `tooLong` になれない
+// ので、「再接続境界を跨がない」はここで見なくても担保される。ゲートも②と同一で独自には足さない。
+//
+// 補正するのは `speaker` と `unresolved` の印だけで、テキストも行数も変えない(#36 と同じ規律)。
+
+/**
+ * 維持の理由キー。**順序も含めてここが定義箇所**で、`diagnostics.js` の `LONG_MINOR_KEEP_LABELS` が
+ * この順で表示名を持つ(一致はテストで固定。②の `emptySkipped()` と同じ流儀)。
+ * 判定の優先順位もこの順 — 上にあるものほど「speaker 全体の性質」に近く、`runTooLong` だけが
+ * run 1 本の性質。1 run に理由は 1 つ(②と同じ。二重に数えると閾値を決める材料にならない)。
+ */
+const LONG_MINOR_KEEP_REASONS = Object.freeze([
+  "conflictingEvidence",
+  "notAbsolute",
+  "ratioTooHigh",
+  "manyRuns",
+  "runTooLong",
+]);
+
+/**
+ * 根拠の種別キー。順序も含めてここが定義箇所(表示名は `diagnostics.js` の `LONG_MINOR_EVIDENCE_LABELS`)。
+ * 根拠は「この run は major M の発話が誤割り当てされたもの」を指す向きで `{ kind, major }` として持つ。
+ * 「境界の時間差」は行に無いので使わない(サーバーから gap を送るなら別 Issue で `kind` を足す)。
+ */
+const LONG_MINOR_EVIDENCE_KINDS = Object.freeze(["merge", "seq", "continuity", "transition"]);
+
+/** 閾値を計画に載せて診断へ渡す(`diagnostics.js` は `utterances.js` を import できない。#59 と同じ) */
+const LONG_MINOR_THRESHOLDS = Object.freeze({
+  neutralizeMaxRatio: LONG_MINOR_NEUTRALIZE_MAX_RATIO,
+  maxRuns: LONG_MINOR_MAX_RUNS,
+  maxWords: LONG_MINOR_MAX_WORDS,
+  minMergeSegments: LONG_MINOR_MIN_MERGE_SEGMENTS,
+  transitionBias: LONG_MINOR_TRANSITION_BIAS,
+});
+
+/** ゲートで弾かれたときの空の計画。**空でも必ず全キーを持たせる**(②③と同じ理由) */
+function disabledLongMinorPlan(reason) {
+  return {
+    runs: 0,
+    attributed: [],
+    neutralized: [],
+    kept: [],
+    keptCounts: zeroCounts(LONG_MINOR_KEEP_REASONS),
+    evidenceCounts: zeroCounts(LONG_MINOR_EVIDENCE_KINDS),
+    speakers: [],
+    thresholds: LONG_MINOR_THRESHOLDS,
+    disabledBy: reason,
+  };
+}
+
+/**
+ * 長い minor run の計画。**何も変更しない純関数。** ②③の計画を入力に取る。
+ *
+ * @param plan ②`planMinorIslandMerges()` の戻り(`merges` / `minorJudgements` / `majors` / `disabledBy`)
+ * @param unresolvedPlan ③`planUnresolvedMinors()` の戻り(`skippedRuns` の `tooLong` が候補)
+ * @param lines **⓪①通過後の配列**(`correctSpeakers()` の `jittered`)。run の前後の行の `seq` / `text` を見る。
+ *   `indexes` はこの配列の添字
+ * @param stats **raw の** `collectSpeakerStats()` の戻り(`transitions`)
+ *
+ * `neutralized` は③の `neutralized` と同じフィールドだが、③が speaker 単位に集約するのに対し
+ * **こちらは run 単位**(`LONG_MINOR_MAX_RUNS` を上げると同じ speaker の要素が複数並ぶ。診断側は集約して描く)。
+ *
+ * @returns {{
+ *   runs: number,
+ *   attributed: Array<{from:number, to:number, segments:number, words:number, indexes:number[],
+ *     evidence: Array<{kind:string, major:number}>}>,
+ *   neutralized: Array<{speaker:number, segments:number, words:number, indexes:number[]}>,
+ *   kept: Array<{reason:string, speaker:number, words:number, indexes:number[]}>,
+ *   keptCounts: {conflictingEvidence:number, notAbsolute:number, ratioTooHigh:number, manyRuns:number, runTooLong:number},
+ *   evidenceCounts: {merge:number, seq:number, continuity:number, transition:number},
+ *   speakers: Array<{speaker:number, ratio:number, kind:string, longRuns:number, decision:string,
+ *     to:number|null, evidence: Array<{kind:string, major:number}>, reasons:string[]}>,
+ *   thresholds: {neutralizeMaxRatio:number, maxRuns:number, maxWords:number, minMergeSegments:number, transitionBias:number},
+ *   disabledBy: string|null,
+ * }}
+ */
+export function planLongMinorRuns({ plan, unresolvedPlan, lines, stats } = {}) {
+  // **計画は必須。** 渡されていないのを「有効・0件」と区別できないと、診断が
+  // 「長い minor run 0 run」と言い切ってしまう(③と同じ)
+  if (!plan) return disabledLongMinorPlan("noPlan");
+  if (plan.disabledBy) return disabledLongMinorPlan(plan.disabledBy);
+
+  const rows = lines;
+  const majorSet = new Set(plan.majors);
+  // 候補は③が返した `tooLong` だけ。②が `A → X(長) → A` に付けたものも、③が `B → X(長) → A` を
+  // `mismatch` から付け替えたものも、③は素通しで返すので両方ここへ来る
+  const candidates = unresolvedPlan.skippedRuns.filter((r) => r.reason === "tooLong");
+  // 候補が無ければ「有効・0 run」。通常のセッションはここで終わり、下の前計算は走らない
+  if (candidates.length === 0) return disabledLongMinorPlan(null);
+
+  // ---- speaker ごとの事実(候補になった speaker ぶんだけ、1 回ずつ) ----
+  // run のループはここを 1 回引くだけ。E1(safe merge の帰属先)と E3(遷移の偏り)は speaker の性質で、
+  // run ごとに計算し直すものではない。判定明細は②の `minorJudgements` から(run の speaker は必ず minor)
+  const facts = new Map();
+  for (const run of candidates) {
+    const s = facts.get(run.speaker) ?? {
+      judgement: plan.minorJudgements.find((j) => j.speaker === run.speaker),
+      longRuns: 0,
+      // to → segments。②の `merges` は `from>to` で集約済みなので、size がそのまま「何 major に割れたか」
+      mergeTargets: new Map(),
+      transitions: { byMajor: new Map(), total: 0 },
+    };
+    s.longRuns++;
+    facts.set(run.speaker, s);
+  }
+  for (const m of plan.merges) {
+    const s = facts.get(m.from);
+    if (s) s.mergeTargets.set(m.to, (s.mergeTargets.get(m.to) ?? 0) + m.segments);
+  }
+  // E3: X を含む raw 遷移を major ごとに数える。**分母は X を含む全遷移**(相手が major でなくても
+  // 数に入れる) — 第三の speaker とのやり取りが多い X を「偏っている」と読まないため。
+  // `collectSpeakerStats()` は自己遷移を作らないので、1 つの遷移が同じ X に 2 度数えられることはない
+  for (const t of stats.transitions) {
+    for (const [x, other] of [
+      [t.from, t.to],
+      [t.to, t.from],
+    ]) {
+      const s = facts.get(x);
+      if (!s) continue;
+      s.transitions.total += t.count;
+      if (majorSet.has(other)) {
+        s.transitions.byMajor.set(other, (s.transitions.byMajor.get(other) ?? 0) + t.count);
+      }
+    }
+  }
+
+  // ---- 根拠の収集(run 1 本ごと) ----
+  // 同じ種別・同じ major は 1 つに畳む(前後の隣が同じ major で両方当たる `A → X → A` の形)。
+  // run の根拠と speaker 別まとめの根拠の両方をこれで積む(「同じ根拠」の定義を 1 か所に)
+  const pushEvidence = (list, kind, major) => {
+    if (!list.some((e) => e.kind === kind && e.major === major)) list.push({ kind, major });
+  };
+  // 隣は `indexes` の直前・直後の行。主要 speaker の発話行だけを隣として扱う(`majorSet` は番号しか
+  // 持たないので、再接続の印・話者不明・範囲外はこれ 1 つで落ちる)
+  const majorNeighbor = (i) => (majorSet.has(rows[i]?.speaker) ? rows[i] : null);
+  // 文字種の連続性(#57 と同じ規則)。手前側の行が句読点で閉じていれば後ろに続く語は無いが、
+  // それは `continuity()` が句読点を `none` に落とすことで既に効いている(`isPunctuated()` を重ねない)
+  const continues = (prevLine, nextLine) => continuityOk(continuity(lineText(prevLine), lineText(nextLine)));
+  const collectEvidence = (run, s) => {
+    const evidence = [];
+    const add = (kind, major) => pushEvidence(evidence, kind, major);
+    // E1: 帰属先が 1 つの major だけで、segment 数が足りていること。2 つ以上に割れていれば根拠にしない
+    // (割れた E1 を「safe merge→0」として載せると一意に読めてしまう)
+    if (s.mergeTargets.size === 1) {
+      const [[to, segments]] = s.mergeTargets.entries();
+      if (segments >= LONG_MINOR_MIN_MERGE_SEGMENTS) add("merge", to);
+    }
+    const first = rows[run.indexes[0]];
+    const last = rows[run.indexes[run.indexes.length - 1]];
+    const prev = majorNeighbor(run.indexes[0] - 1);
+    const next = majorNeighbor(run.indexes[run.indexes.length - 1] + 1);
+    // E2: 同じ final に major の行と入っている(⓪①と同じ `seq` の厳密一致。時間窓へは落とさない)
+    if (prev && sameSeq(first.seq, prev.seq)) add("seq", prev.speaker);
+    if (next && sameSeq(last.seq, next.seq)) add("seq", next.speaker);
+    // E4: 境目が語の途中(前後それぞれ独立)
+    if (prev && continues(prev, first)) add("continuity", prev.speaker);
+    if (next && continues(last, next)) add("continuity", next.speaker);
+    // E3: 遷移の偏り(下の再帰属の条件で述べるとおり、裏付けではなく反対根拠と診断にだけ使う)
+    const { byMajor, total } = s.transitions;
+    if (total >= 2) {
+      for (const [major, count] of byMajor) {
+        if (count / total >= LONG_MINOR_TRANSITION_BIAS) add("transition", major);
+      }
+    }
+    return evidence;
+  };
+
+  // ---- 判定 ----
+  const attributed = [];
+  const neutralized = [];
+  const kept = [];
+  const keptCounts = zeroCounts(LONG_MINOR_KEEP_REASONS);
+  const evidenceCounts = zeroCounts(LONG_MINOR_EVIDENCE_KINDS);
+  // 診断用の speaker 別まとめ。候補になった speaker だけ
+  const summaries = new Map();
+  const summaryOf = (run, s) => {
+    const summary = summaries.get(run.speaker) ?? {
+      speaker: run.speaker,
+      ratio: s.judgement.ratio,
+      kind: s.judgement.kind,
+      longRuns: s.longRuns,
+      decisions: [],
+      to: null,
+      evidence: [],
+      // 維持の理由は run ごとに立つ。同じ speaker で違う理由が並びうる(`manyRuns` は speaker の性質、
+      // `runTooLong` は run の性質で、判定順を入れ替えれば割れる)ので、最初の 1 つで代表させず出た順に全部持つ
+      reasons: [],
+    };
+    summaries.set(run.speaker, summary);
+    return summary;
+  };
+  const keep = (reason, run, summary) => {
+    keptCounts[reason]++;
+    kept.push({ reason, speaker: run.speaker, words: run.words, indexes: [...run.indexes] });
+    summary.decisions.push("kept");
+    if (!summary.reasons.includes(reason)) summary.reasons.push(reason);
+  };
+
+  for (const run of candidates) {
+    const s = facts.get(run.speaker);
+    const summary = summaryOf(run, s);
+    const evidence = collectEvidence(run, s);
+    for (const e of evidence) pushEvidence(summary.evidence, e.kind, e.major);
+    // E1 が 2 つ以上の major に割れている。再帰属も中立化もしない(本物の第三者の可能性を除外できない)
+    if (s.mergeTargets.size > 1) {
+      keep("conflictingEvidence", run, summary);
+      continue;
+    }
+    // **再帰属**: E1 が一意 + run の境目の根拠(E2 / E4)が同じ major + 反対の根拠なし + 長さ上限。
+    //
+    // **E3 は裏付けに数えない。** E3 は raw の遷移を数えるので、E1 の根拠になった safe merge 済みの島
+    // `A → X → A` がそのまま `A` 側に 2 遷移ずつ積まれる — 島が 3 本あれば run の両隣が別の major でも
+    // 6/8 = 0.75 に届き、E1 + E3 だけで「複数の独立した根拠」に見えてしまう。同じ島から出る 2 つは
+    // 独立ではないので、裏付けは run そのものの境目を見る E2 / E4 に限る。E3 は反対の major を
+    // 指したときに再帰属を止める側と、診断の「何が見えていたか」にだけ使う
+    const merge = evidence.find((e) => e.kind === "merge");
+    if (
+      merge &&
+      evidence.some((e) => (e.kind === "seq" || e.kind === "continuity") && e.major === merge.major) &&
+      evidence.every((e) => e.major === merge.major) &&
+      run.words <= LONG_MINOR_MAX_WORDS
+    ) {
+      attributed.push({
+        from: run.speaker,
+        to: merge.major,
+        segments: run.indexes.length,
+        words: run.words,
+        indexes: [...run.indexes],
+        evidence,
+      });
+      for (const e of evidence) evidenceCounts[e.kind]++;
+      summary.decisions.push("attributed");
+      summary.to = merge.major;
+      continue;
+    }
+    // **中立化**: 第三者らしさは比率・run の本数・run の長さで測る。E2〜E4 は再帰属の可否にだけ
+    // 効かせ、中立化の反対根拠には使わない — `B → X → A` の X が両隣と同じ final にあるのは
+    // 「A と B の境目に挟まった断片」の形そのもので、これで止めると実機の形が条件次第で維持に落ちる
+    if (summary.kind !== "absolute") {
+      keep("notAbsolute", run, summary);
+      continue;
+    }
+    if (!(summary.ratio < LONG_MINOR_NEUTRALIZE_MAX_RATIO)) {
+      keep("ratioTooHigh", run, summary);
+      continue;
+    }
+    if (summary.longRuns > LONG_MINOR_MAX_RUNS) {
+      keep("manyRuns", run, summary);
+      continue;
+    }
+    if (run.words > LONG_MINOR_MAX_WORDS) {
+      keep("runTooLong", run, summary);
+      continue;
+    }
+    neutralized.push({
+      speaker: run.speaker,
+      segments: run.indexes.length,
+      words: run.words,
+      indexes: [...run.indexes],
+    });
+    summary.decisions.push("neutralized");
+  }
+
+  // 走査は③の `skippedRuns` の順(＝行の添字の昇順)なので、どの列も入力だけで決まる。
+  // `attributed` / `neutralized` / `speakers` は③と同じく speaker 順に並べ替え、診断の行の並びを③と揃える。
+  // `kept` は走査順のまま(理由別の件数は `keptCounts` で読むので、並びに意味を持たせない)
+  attributed.sort((a, b) => a.from - b.from || a.to - b.to || a.indexes[0] - b.indexes[0]);
+  neutralized.sort((a, b) => a.speaker - b.speaker || a.indexes[0] - b.indexes[0]);
+  const speakers = [...summaries.values()]
+    .sort((a, b) => a.speaker - b.speaker)
+    .map(({ decisions, ...s }) => ({
+      ...s,
+      // 同じ speaker の run が別々の結論になりうる(1 本は再帰属、残りは維持)。混在は隠さず `mixed`
+      decision: decisions.every((d) => d === decisions[0]) ? decisions[0] : "mixed",
+    }));
+  return {
+    runs: candidates.length,
+    attributed,
+    neutralized,
+    kept,
+    keptCounts,
+    evidenceCounts,
+    speakers,
+    thresholds: LONG_MINOR_THRESHOLDS,
+    disabledBy: null,
+  };
 }
 
 /**
@@ -1278,7 +1634,8 @@ export function mergeSameSpeaker(lines) {
  * どちらの段も自分の条件は緩めないまま、**後段が見える範囲だけが広がる**。
  *
  * ③は②の計画から作るので、②のあとでなければ成立しない(②が「統合先を決められなかった」と
- * 判定した run が入力そのもの)。
+ * 判定した run が入力そのもの)。③b(#61)は③が `tooLong` で見送った run を入力に取るので、
+ * さらにそのあと。
  *
  * **主要 speaker の選定は raw の統計から取る。** `tests/app-wiring.test.ts` が
  * 「`collectSpeakerStats` は `finalLines` に対して呼ぶ」を固定しており(#46)、
@@ -1289,31 +1646,34 @@ export function mergeSameSpeaker(lines) {
  * @param opts.expectedSpeakers 想定話者数の選択値(#48)。渡さなければ②は何もしない
  */
 function correctSpeakers(lines, opts) {
+  // 入口で復元データ由来の `unresolved` を落とす(理由は `stripRestoredMarks()` のコメント)
+  const cleaned = stripRestoredMarks(lines);
   // ⓪(#55)は「同じ final」という最も強い証拠だけで動くので先頭。①以降は⓪通過後の行を見る。
   // ⓪は行数も並びも変えないので、②③が①通過後の配列に対して立てる添字はそのまま合う
-  const boundary = smoothSpeakerBoundaries(lines);
+  const boundary = smoothSpeakerBoundaries(cleaned);
   // **走査する配列は⓪①通過後、統計は raw。** この2つの出どころは別物で、混同すると
   // 表示と診断がずれる(下の `planDisplayCorrection()` のコメントを参照)
   const jittered = smoothSpeakerJitter(boundary.lines);
-  const plan = planMinorIslandMerges(jittered, {
-    expectedSpeakers: opts.expectedSpeakers,
-    stats: collectSpeakerStats(lines), // ← raw から(#46)
-  });
+  const stats = collectSpeakerStats(lines); // ← raw から(#46)
+  const plan = planMinorIslandMerges(jittered, { expectedSpeakers: opts.expectedSpeakers, stats });
   // ③は②の計画から作る。**添字は①通過後の配列に対するもの**で、②の適用は行数も並びも
   // 変えない(`speaker` を書き換えるだけ)ので、そのまま合成後の配列にも当たる
   const unresolvedPlan = planUnresolvedMinors(plan);
-  return {
-    boundaryPlan: boundary.plan,
-    plan,
-    unresolvedPlan,
-    corrected: applyNeutralize(applyMerges(jittered, plan), unresolvedPlan),
-  };
+  // ③b(#61)は③が `tooLong` で見送った run を入力に取る。走査する行は⓪①通過後の `jittered`
+  // (前後の行の `seq` / `text` を見る)、遷移の統計は raw から。②③の適用は行数も並びも変えないので
+  // ③b の添字もそのまま合成後の配列に当たる
+  const longMinorPlan = planLongMinorRuns({ plan, unresolvedPlan, lines: jittered, stats });
+  // 適用は②③と同じ 2 つの操作の再利用。③b の再帰属は `speaker` の書き換え(`attributed` は②の
+  // `merges` と同じ `to` / `indexes` を持つ)、中立化は③と同じ印。③b 専用の適用関数は持たない
+  const afterIslands = applyNeutralize(applyMerges(jittered, plan), unresolvedPlan);
+  const corrected = applyNeutralize(applyMerges(afterIslands, { merges: longMinorPlan.attributed }), longMinorPlan);
+  return { boundaryPlan: boundary.plan, plan, unresolvedPlan, longMinorPlan, corrected };
 }
 
 /**
- * 表示・エクスポート用の発話グループを作る。**この5段の順序が要点**で、
+ * 表示・エクスポート用の発話グループを作る。**この6段の順序が要点**で、
  * 先に speaker ラベルを直してからでないと同一話者としてまとまらない
- * (⓪boundary → ①jitter → ②minor island → ③中立化 → ④同一話者の結合)。
+ * (⓪boundary → ①jitter → ②minor island → ③中立化 → ③b 長い minor run → ④同一話者の結合)。
  *
  * @param lines raw の `finalLines`（変更しない）
  * @param opts.expectedSpeakers 想定話者数の選択値(#48)
@@ -1350,11 +1710,12 @@ export function groupUtterances(lines, opts = {}) {
  *     skippedRuns: Array<{reason:string, speaker:number, words:number, indexes:number[]}>,
  *     disabledBy: string|null,
  *   },
+ *   longMinorPlan: ReturnType<typeof planLongMinorRuns>,
  *   displayDetected: number,
  * }}
  */
 export function planDisplayCorrection(lines, opts = {}) {
-  const { boundaryPlan, plan, unresolvedPlan, corrected } = correctSpeakers(lines, opts);
+  const { boundaryPlan, plan, unresolvedPlan, longMinorPlan, corrected } = correctSpeakers(lines, opts);
   // **`displayDetected` は「表示上の通常話者数」**(#50)。中立化した speaker は
   // 画面にもエクスポートにも「話者C」としては出ないので、数に入れると
   // 「話者Cは表示されないのに表示上の話者数は3」という読めない値になる。
@@ -1367,6 +1728,13 @@ export function planDisplayCorrection(lines, opts = {}) {
   // `mergeSameSpeaker()` で隣接した異なる minor が `null === null` で1段落に溶ける
   const forCount = corrected.map((l) => (l.unresolved ? { ...l, speaker: null } : l));
   // 補正後に speaker が何人へ減ったか。**計画の merges から引き算しない** —
-  // 適用と数え方が別実装になり、片方だけ直したときに静かにずれる
-  return { boundaryPlan, plan, unresolvedPlan, displayDetected: collectSpeakerStats(forCount).detected };
+  // 適用と数え方が別実装になり、片方だけ直したときに静かにずれる。③b(#61)で再帰属した行は
+  // major として、中立化した行は不明として、同じ `corrected` から自然に数えられる
+  return {
+    boundaryPlan,
+    plan,
+    unresolvedPlan,
+    longMinorPlan,
+    displayDetected: collectSpeakerStats(forCount).detected,
+  };
 }
