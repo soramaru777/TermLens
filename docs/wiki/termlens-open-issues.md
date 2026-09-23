@@ -6,9 +6,10 @@ scope: shared
 sources:
   - docs/local/status-2026-08-13.md
   - docs/raw/session-2026-08-13-fly-deploy.md
+  - https://github.com/soramaru777/TermLens/issues/65
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]], [[termlens-testing]]
 confidence: high
-updated: 2026-09-09
+updated: 2026-09-23
 ---
 
 # TermLens の課題と次の優先順位
@@ -29,6 +30,17 @@ updated: 2026-09-09
 > 2026-08-17 更新: 「会議ログのエクスポート」（弱点5）を Markdown ダウンロードとして実装し、
 > 優先順位から外した。ただしこれは**セッション復元の代わりにはならない**。持ち出せるのは
 > 停止まで到達できた場合だけで、リロードや切断で失われる問題（弱点4）は残っている。
+
+> 2026-09-23 追記: **エクスポートの拡張（Issue #65「名前を付けてZIP保存」）は設計まで済み・未実装。**
+> 2026-09-23 時点で `L4:実行指示待ち`。採用は案1（ブラウザ内で無圧縮 store 方式の ZIP を自前生成）。
+> フロントはビルドレス・外部ライブラリなしのため、ライブラリを入れずに `public/zip.js` の純関数で作る。
+> 日本語ファイル名は UTF-8 フラグ（general purpose bit 11）を立てて格納する。
+> 設計時の既定（判断点に回答が無かったため置いた値）は次のとおり。
+>
+> - ZIP 内はフォルダ有り（`<名前>/文字起こし.md` / `用語カード.md` / `収音診断.md`）。収音診断は出せるときだけ含める
+> - 名前は export 行に常設のテキスト欄で受ける（`prompt()` は PWA / iOS で挙動が不安定なため使わない）
+> - 既存の個別ボタン 3 つは残す（#26 の「診断だけ本文なしで渡す」用途のため）
+> - `showSaveFilePicker` は使わず、既存の共有シート / `<a download>` の経路に載せる
 
 ## A. 未検証
 
