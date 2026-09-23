@@ -499,10 +499,16 @@ test("開始のたびに診断の状態を初期化する", () => {
  * 旧条件（`!hasDiagnostics()` だけ）に戻すと、復元セッションから話者分離の診断を
  * 取り出す経路が消える — ボタンが押せないだけで例外は出ないので気づけない。
  */
-test("診断のダウンロードは、収音か発話のどちらかがあれば押せる", () => {
+test("診断は、収音か発話のどちらかがあれば ZIP に入る", () => {
+  // #65 で個別ボタンを撤去し、条件は canExportDiagnostics() に移した(式は #46 のまま)
   assert.match(
     CODE,
-    /dlDiagnosticsBtn\.disabled = !hasDiagnostics\(\) && spokenLines\(\)\.length === 0/,
+    /const canExportDiagnostics = \(\) => hasDiagnostics\(\) \|\| spokenLines\(\)\.length > 0/,
+  );
+  assert.match(
+    fnBody("buildExportZip"),
+    /if \(canExportDiagnostics\(\)\) entries\.push\(\{ name: `\$\{name\}\/収音診断\.md`, data: buildDiagnosticsMd\(\) \}\)/,
+    "診断を ZIP に入れる条件が canExportDiagnostics() になっていない",
   );
 });
 
@@ -521,8 +527,63 @@ test("診断の状態は代入1箇所で組み立てる", () => {
 });
 
 test("診断のエクスポートは純関数に委譲する", () => {
-  assert.match(HTML, /id="dl-diagnostics"/, "診断のエクスポートボタンがない");
   assert.match(APP, /buildDiagnosticsMarkdown\(\{/, "app.js が診断の Markdown を自前で組んでいる");
+});
+
+// ---- 名前を付けて ZIP 保存（#65） ----
+//
+// 保存は「名前欄 + まとめて保存(.zip)」だけ（2026-09-23 に個別ボタン3つを撤去）。
+// 配線が抜けても例外は出ず、ボタンが何もしないか、未保存警告が消えないだけなので固定する。
+
+test("export 行は名前欄と ZIP ボタンだけで、個別ボタンは無い", () => {
+  assert.match(HTML, /id="export-name"/, "名前欄が無い");
+  assert.match(HTML, /id="dl-zip"/, "ZIP ボタンが無い");
+  for (const id of ["dl-transcript", "dl-terms", "dl-diagnostics"]) {
+    assert.doesNotMatch(HTML, new RegExp(`id="${id}"`), `撤去したはずの ${id} が残っている`);
+  }
+  assert.doesNotMatch(CODE, /saveMarkdown\(/, "個別保存の経路が残っている");
+});
+
+test("app.js は zip.js から buildZip と sanitizeExportName を import する", () => {
+  assert.match(
+    APP,
+    /import \{ buildZip, sanitizeExportName \} from "\.\/zip\.js";/,
+  );
+});
+
+test("buildExportZip は名前を整形し、同じ build*() から ZIP を組んで application/zip の File にする", () => {
+  const body = fnBody("buildExportZip");
+  assert.match(body, /sanitizeExportName\(exportNameInput\.value,/);
+  assert.match(body, /buildZip\(entries,/);
+  assert.match(body, /new File\(\[bytes\], `\$\{name\}\.zip`, \{ type: "application\/zip" \}\)/);
+  // Markdown は画面用と同じ関数を呼ぶ(ZIP 用に組み直さない)
+  assert.match(body, /buildTranscriptMarkdown\(\)/);
+  assert.match(body, /buildTermsMarkdown\(\)/);
+  assert.match(body, /buildDiagnosticsMd\(\)/);
+  // 可否の判定は showExport() と同じ関数を使う
+  assert.match(body, /canExportTranscript\(\)/);
+  assert.match(body, /canExportTerms\(\)/);
+  assert.match(CODE, /await saveFile\(file\)/, "ZIP を saveFile() に渡していない");
+});
+
+test("ZIP を保存できたら、入れた分の savedTranscript / savedTerms を立てる", () => {
+  // 個別ボタンを撤去したので、未保存警告を解除する経路はここだけになる
+  assert.match(
+    CODE,
+    /if \(await saveFile\(file\)\) \{\s*if \(transcript\) savedTranscript = true;\s*if \(terms\) savedTerms = true;\s*discardWarned = false;/,
+  );
+});
+
+test("ZIP ボタンは入れられる中身が1つも無いときだけ押せない", () => {
+  assert.match(
+    fnBody("showExport"),
+    /dlZipBtn\.disabled = !canExportTranscript\(\) && !canExportTerms\(\) && !canExportDiagnostics\(\)/,
+  );
+});
+
+test("保存名は localStorage に書かず、セッション初期化で空に戻す", () => {
+  assert.doesNotMatch(CODE, /localStorage\.setItem\([^)]*exportName/, "保存名を localStorage に書いている");
+  assert.match(fnBody("clearSessionContent"), /exportNameInput\.value = ""/);
 });
 
 // ---- カードの識別子（#38） ----

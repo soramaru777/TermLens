@@ -189,6 +189,7 @@ button.primary:disabled { opacity: 0.5; }
 /* 停止後のダウンロード行 */
 #export-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 8px 14px;
   background: #eef3f1;
@@ -205,6 +206,16 @@ button.primary:disabled { opacity: 0.5; }
   font-size: 0.9rem;
   font-weight: 600;
   cursor: pointer;
+}
+#export-name {
+  flex-basis: 100%;
+  padding: 9px 10px;
+  border: 1px solid #cfd6d4;
+  border-radius: 8px;
+  background: #fff;
+  font-family: inherit;
+  /* 16px 未満だと iOS Safari がフォーカス時に画面を拡大する */
+  font-size: 16px;
 }
 .export-btn:disabled {
   border-color: #cfd6d4;
