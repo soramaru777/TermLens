@@ -38,6 +38,9 @@ import {
 // 別の final は半角スペース。連結子の規則は `mergeSameSpeaker()` が決めるので、
 // 画面と Markdown で割れない(`texts` を直接連結しないこと)
 import { groupUtterances, planDisplayCorrection } from "./utterances.js";
+// 保存用 ZIP の組み立てと保存名の整形は zip.js が定義箇所(#65)。会議本文をサーバーへ
+// 送らないため、ZIP はブラウザ内で組む
+import { buildZip, sanitizeExportName } from "./zip.js";
 // 話者統計の集計・想定話者数の選択肢は speaker-stats.js が唯一の定義箇所(#46)。
 // **集計は raw の finalLines に対して行う**(groupUtterances() の結果ではない) —
 // 表示補正の効き具合を測るための統計が、補正後の値になってしまうため。
@@ -88,8 +91,8 @@ const cardNav = $("card-nav");
 const cardPosition = $("card-position");
 const latestBtn = $("latest-btn");
 const exportRow = $("export-row");
-const dlTranscriptBtn = $("dl-transcript");
-const dlTermsBtn = $("dl-terms");
+const exportNameInput = $("export-name");
+const dlZipBtn = $("dl-zip");
 const persistToggle = $("persist-toggle");
 const restoreBanner = $("restore-banner");
 const restoreInfo = $("restore-info");
@@ -100,7 +103,6 @@ const captureModeHintEl = $("capture-mode-hint");
 const captureModeRow = $("capture-mode-row");
 const captureModeCurrent = $("capture-mode-current");
 const expectedSpeakersSelect = $("expected-speakers");
-const dlDiagnosticsBtn = $("dl-diagnostics");
 const diagPanel = $("diag-panel");
 const diagTable = $("diag-table");
 
@@ -369,6 +371,9 @@ function clearSessionContent() {
   lowToggle = null;
   lowExpanded = false;
   cardsEl.classList.remove("show-low");
+  // 保存名も会議の内容の一部として扱う。前回の会議名が次の ZIP に付かないよう空に戻す
+  // (localStorage にも書かない。復元セッションでも空から始める)(#65)
+  exportNameInput.value = "";
   renderCardNav();
 }
 
@@ -1505,21 +1510,23 @@ const isStandalone = () =>
   window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
 
 // 保存できたら true、ユーザーがキャンセルしたら false を返す
-async function saveMarkdown(filename, text) {
-  const file = new File([text], filename, { type: "text/markdown" });
+async function saveFile(file) {
   if (isStandalone() && navigator.canShare?.({ files: [file] })) {
     try {
-      await navigator.share({ files: [file], title: filename });
+      await navigator.share({ files: [file], title: file.name });
       return true;
     } catch (err) {
       if (err.name === "AbortError") return false; // ユーザーがキャンセルした
+      // 共有シートが既に開いている(iOS で連打した 2 回目)。保存はしていないので
+      // <a download> に落とさず、未保存のまま返す
+      if (err.name === "InvalidStateError") return false;
       // それ以外は下のダウンロードにフォールバックする
     }
   }
   const url = URL.createObjectURL(file);
   const a = el("a");
   a.href = url;
-  a.download = filename;
+  a.download = file.name;
   document.body.append(a);
   a.click();
   a.remove();
@@ -1529,38 +1536,51 @@ async function saveMarkdown(filename, text) {
   return !isStandalone();
 }
 
-dlTranscriptBtn.addEventListener("click", async () => {
-  const stamp = fmtStamp(sessionStartedAt ?? new Date());
-  if (await saveMarkdown(`termlens-transcript-${stamp}.md`, buildTranscriptMarkdown())) {
-    savedTranscript = true;
+// ZIP に入れる中身の可否。showExport() の活性判定と buildExportZip() が**同じ式**を使う —
+// 別々に書くと「押せるのに中身が空」「入るはずの診断が入らない」に割れる(#65)
+const canExportTranscript = () => spokenLines().length > 0;
+const canExportTerms = () => cardData.size > 0;
+// **復元セッションでも出せる。** マイクを開いていなくても話者統計は出せるので、
+// 収音側の有無(hasDiagnostics)だけで閉じると #46 の診断が取り出せない
+const canExportDiagnostics = () => hasDiagnostics() || spokenLines().length > 0;
+
+/**
+ * 名前を付けた ZIP を組む(#65)。中身は `<名前>/文字起こし.md` / `用語カード.md` /
+ * `収音診断.md`(出せるものだけ)。Markdown は画面用と同じ build*() を呼ぶだけで、組み直さない。
+ * 戻り値の `transcript` / `terms` は ZIP に入れたかどうか(未保存警告の解除に使う)。
+ */
+function buildExportZip() {
+  const fallback = `termlens-${fmtStamp(sessionStartedAt ?? new Date())}`;
+  const name = sanitizeExportName(exportNameInput.value, fallback);
+  const transcript = canExportTranscript();
+  const terms = canExportTerms();
+  const entries = [];
+  if (transcript) entries.push({ name: `${name}/文字起こし.md`, data: buildTranscriptMarkdown() });
+  if (terms) entries.push({ name: `${name}/用語カード.md`, data: buildTermsMarkdown() });
+  if (canExportDiagnostics()) entries.push({ name: `${name}/収音診断.md`, data: buildDiagnosticsMd() });
+  const bytes = buildZip(entries, { mtime: sessionEndedAt ?? new Date() });
+  const file = new File([bytes], `${name}.zip`, { type: "application/zip" });
+  return { file, transcript, terms };
+}
+
+// 診断は会話本文を含まないため、未保存警告(discardWarned)の対象にしない(#26)。
+// ZIP に入れた文字起こし・用語カードの分だけ saved* を立てる
+dlZipBtn.addEventListener("click", async () => {
+  const { file, transcript, terms } = buildExportZip();
+  if (await saveFile(file)) {
+    if (transcript) savedTranscript = true;
+    if (terms) savedTerms = true;
     discardWarned = false; // 保存後は未保存のものが減るので、警告をやり直す
   }
-});
-dlTermsBtn.addEventListener("click", async () => {
-  const stamp = fmtStamp(sessionStartedAt ?? new Date());
-  if (await saveMarkdown(`termlens-terms-${stamp}.md`, buildTermsMarkdown())) {
-    savedTerms = true;
-    discardWarned = false;
-  }
-});
-// 診断は会話本文を含まないため、未保存警告(discardWarned)の対象にしない。
-// 対象にすると、診断を見ていない大多数のセッションでも「戻る」が毎回警告になり、
-// 本当に守りたい文字起こし・用語カードの警告まで無視されるようになる(#26)
-dlDiagnosticsBtn.addEventListener("click", async () => {
-  const stamp = fmtStamp(sessionStartedAt ?? new Date());
-  await saveMarkdown(`termlens-diagnostics-${stamp}.md`, buildDiagnosticsMd());
 });
 
 function showExport() {
   sessionEndedAt ??= new Date();
-  dlTranscriptBtn.disabled = spokenLines().length === 0;
-  dlTermsBtn.disabled = cardData.size === 0;
-  // **復元セッションでも押せる。** マイクを開いていなくても話者統計は出せるので、
-  // 収音側の有無(hasDiagnostics)だけで閉じると #46 の診断が取り出せない
-  dlDiagnosticsBtn.disabled = !hasDiagnostics() && spokenLines().length === 0;
-  // 押せる内容があるならパネルも出す。条件を1つにして「ボタンは押せるのに
+  // 入れられる中身が1つも無ければ押せない(buildZip は空の entries で throw する)
+  dlZipBtn.disabled = !canExportTranscript() && !canExportTerms() && !canExportDiagnostics();
+  // 診断を ZIP に入れられるならパネルも出す。条件を1つにして「ZIP には入るのに
   // 画面には何も無い」状態を作らない
-  diagPanel.hidden = dlDiagnosticsBtn.disabled;
+  diagPanel.hidden = !canExportDiagnostics();
   // **停止時にも描き直す。** 他の呼び出し元(開始時 / worklet の stats / stt_info 受信 /
   // toggle)はどれも停止後には来ないので、パネルを開いたまま停止すると、停止時の flush で
   // 届いた final がパネルに反映されず、ダウンロードした Markdown とだけ食い違う
@@ -1778,7 +1798,7 @@ stopBtn.addEventListener("click", async () => {
     // (確認ダイアログは PWA で扱いが不安定なため使わない)。
     // 片方だけ保存した場合も、保存していない側は失われるので警告する
     const unsaved =
-      (spokenLines().length > 0 && !savedTranscript) || (cardData.size > 0 && !savedTerms);
+      (canExportTranscript() && !savedTranscript) || (canExportTerms() && !savedTerms);
     if (unsaved && !discardWarned) {
       discardWarned = true;
       setStatus("未保存です。もう一度押すと破棄");

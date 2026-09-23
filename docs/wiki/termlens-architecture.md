@@ -5,9 +5,11 @@ project: termlens
 scope: shared
 sources:
   - README.md
-related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]]
+  - public/zip.js
+  - https://github.com/soramaru777/TermLens/issues/65
+related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-open-issues]]
 confidence: high
-updated: 2026-09-03
+updated: 2026-09-23
 ---
 
 # TermLens アーキテクチャ
@@ -106,6 +108,7 @@ scheduler.rematchCard()
 | `public/card-status.js` | カードの状態・見出しの導出、`card_update` の畳み込み、重複カードの統合（純関数だけ） |
 | `public/app.js` | UI 全般（話者段落、用語ハイライト、カードジャンプ、改名の適用） |
 | `public/utterances.js` | 表示・エクスポート用の発話グループ化（話者ラベルの揺れの補正 + 同一話者の結合、#36） |
+| `public/zip.js` | エクスポート用の無圧縮（store）ZIP の組み立て・CRC-32・保存名の整形（純関数、#65） |
 
 ## 設計上の選択
 
@@ -129,4 +132,17 @@ scheduler.rematchCard()
   折りたたみは DOM を動かさずクラスと CSS の `order` だけで表現する — `cardsEl.children` を
   走査している `findCardEl()` / `setActiveCard()` を壊すと、**例外を出さずに `card_update` が
   low カードにだけ届かなくなる**（[[termlens-term-extraction]]）
+- **エクスポートは名前を付けた ZIP 1つ**（#65）。停止後の export 行は名前欄 + `⬇ まとめて保存(.zip)`
+  だけで、中身は `<名前>/文字起こし.md` / `用語カード.md` / `収音診断.md`（診断は出せるときだけ）。
+  Markdown は画面用と同じ `build*()` を呼ぶので、個別の Markdown と中身は変わらない。
+  **ZIP はブラウザ内で組む** — サーバーで組むと会議本文を送ることになり「この端末にのみ保存」の方針に反する。
+  ビルドレス・外部ライブラリなしを保つため、ライブラリを入れず store 方式を `public/zip.js` に自前実装した
+  （対象は Markdown 数 MB 以下で圧縮の利点が小さい）。日本語名は UTF-8 フラグ（bit 11）で格納する。
+  **会議名は localStorage に書かない**（本文と同じ扱い。保存 OFF のときに何も残さないため）。
+  保存は共有シート（standalone PWA）/ `<a download>` の既存経路 `saveFile()` に載せる。
+  個別ボタンの撤去により、#26 の「診断だけを本文なしで渡す」経路は無くなった（ZIP を展開して
+  `収音診断.md` だけを渡す運用になる。[[termlens-stt-pipeline]]）。
+  保存名は Windows の予約名（`CON` 等）・制御文字・双方向制御文字を除き、UTF-8 で 200 バイトまでに切る。
+  > 2026-09-23 まで: 文字起こし・用語カード・収音診断を個別の `.md` ボタン 3 つで保存していた。
+  > #65 でユーザー判断により撤去（[[termlens-open-issues]]）。
 - **状態をサーバーに永続化していない。** ブラウザメモリのみのため、リロードで全消失する（[[termlens-open-issues]] の弱点4）
