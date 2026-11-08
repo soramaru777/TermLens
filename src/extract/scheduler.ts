@@ -553,10 +553,9 @@ export class ExtractionScheduler {
         // 同じ扱い)。内訳を出すのは、棄却が「実在しなかった」のか「実在するが会議の話では
         // なかった」のかが本番ログでも読めるようにするため(評価ハーネスの `VerifyTally` と対)。
         //
-        // **`reason` も `evidence` もモデルが書く自由文で、どちらも文脈を引き写しうる。**
-        // `reason` を出しているのは #23 からの既存の扱いで、棄却の追跡にはこれが要る。
-        // `evidence` を足さないのは、同じ危険を負う自由文をもう1本増やす価値が
-        // 内訳(定型)を出せる今は無いから。区別は「安全か否か」ではなく本数の問題。
+        // **`reason` も `evidence` も出さない。** どちらもモデルが書く自由文で、文脈を
+        // 引き写しうる。#23 から `reason` は出していたが、本番ログで会話の文脈が実際に
+        // 読めたのでやめた。棄却の追跡は内訳(定型)で行い、自由文は評価レポートで読む。
         // **ここは棄却だけの分岐ではない。** `isVerified()` は候補#2 が選ばれた
         // 「差し替え」でも false を返す。そのとき `rejection` は null なので、
         // 一律に棄却として扱うと **`(理由なし)` という自己矛盾した行**が本番ログに載る。
@@ -564,7 +563,7 @@ export class ExtractionScheduler {
           result.chosen === null
             ? REJECTION_LABEL[result.rejection ?? "unspecified"]
             : `別候補「${result.chosen}」が選ばれた`;
-        console.warn(`[scheduler] verification not verified "${card.term}" (${why}): ` + result.reason);
+        console.warn(`[scheduler] verification not verified "${card.term}" (${why})`);
       }
       // **棄却でも更新は必ず届ける。** 速報は `willEnrich: true` で送ってあり、クライアントは
       // `card_update` が来るまで「確認中」の表示を消さない(`public/app.js`)。ここで黙ると

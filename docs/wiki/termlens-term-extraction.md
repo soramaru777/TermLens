@@ -9,7 +9,7 @@ sources:
   - docs/raw/session-2026-08-13-fly-deploy.md
 related: [[termlens-architecture]], [[termlens-stt-pipeline]], [[termlens-open-issues]], [[termlens-testing]]
 confidence: high
-updated: 2026-09-01
+updated: 2026-11-09
 ---
 
 # TermLens 用語抽出と解説カード生成
@@ -226,8 +226,11 @@ SYSTEM も「用語表記だけを入れる」と明示）。ただし LLM の�
 
 > 2026-08-27 変更（Issue #24）: **棄却は `status: "unresolved"` として表示に反映される
 > ようになった。** 下記の「表示は変えない」は #23 時点の既定で、#24 で置き換わっている。
-> `console.warn` に `term` と `reason` だけを出す（**文字起こし本文は出さない**）ところは
-> そのまま。判定は従来どおり `isVerified(term, chosen)` に集約してある。
+> `console.warn` に `term` と定型の内訳だけを出す（**文字起こし本文もモデルの自由文も出さない**）。
+> 判定は従来どおり `isVerified(term, chosen)` に集約してある。
+
+> 2026-11-09 まで: `console.warn` に `reason` も出していた。モデルの自由文で、本番ログに会話の
+> 文脈が実際に残っていたためやめた（2026-11-09 更新）。`reason` は評価レポートで読める。
 
 > #23 時点: 棄却しても表示は変えず、内部に記録するだけだった。棄却の是非を測る土台
 > （誤補正率の変化）を先に作り、表示の変更は unresolved 状態の Issue でまとめて入れるほうが、
@@ -567,9 +570,9 @@ verification: { exists: boolean, fitsContext: boolean, evidence: string }
 順序は「候補の検査 → 検証の整合」。逆にすると、候補外の用語が返ったときの
 「候補に無い用語…」という具体的な理由が検証側の文言で上書きされる。
 
-棄却は `console.warn` にも内訳を出す（`実在: あり / 文脈整合: なし`）。**`evidence` は
-出さない** — モデルが書く自由文なので、文脈を引き写す余地がある（文字起こし本文をログに
-出さない方針の延長）。評価ハーネス側は `VerifyTally.rejected` を**理由別に**数え、
+棄却は `console.warn` にも内訳を出す（`実在: あり / 文脈整合: なし`）。**`evidence` と
+`reason` は出さない** — モデルが書く自由文なので、文脈を引き写す余地がある（文字起こし本文を
+ログに出さない方針の延長）。評価ハーネス側は `VerifyTally.rejected` を**理由別に**数え、
 `formatTable` に内訳を出す。
 
 > 2026-08-27 追記（#25 のレビュー指摘）: 内訳は `verification` から導かず、

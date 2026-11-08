@@ -18,3 +18,6 @@ docs/raw/*
 # LLM 評価レポート。実行のたびに内容が変わる生成物なので追跡しない
 # (`npm run eval:llm > eval-report.json` をリポジトリ直下で回したとき用)
 /eval-report*.json
+
+# ログファイル。会議の内容を含みうるので追跡しない
+*.log
