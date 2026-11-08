@@ -306,7 +306,7 @@ export function normalizeVerification<
 >(decision: T): T {
   const { exists, fitsContext } = decision.verification;
   if (decision.chosen === null || (exists && fitsContext)) return decision;
-  // 内訳は reason にも残す。棄却の理由は `console.warn` と評価レポートで読まれる。
+  // 内訳は reason にも残す。reason は評価レポートで読まれる(本番ログには出さない)。
   // **言葉は `REJECTION_LABEL` を使う** — ここで独自に書き分けると、同じ分類に
   // ログ・評価レポート・reason で3通りの綴りができる。
   const kind = rejectionOf(decision.verification);

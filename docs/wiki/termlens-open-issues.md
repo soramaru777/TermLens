@@ -9,7 +9,7 @@ sources:
   - https://github.com/soramaru777/TermLens/issues/65
 related: [[termlens-stt-pipeline]], [[termlens-term-extraction]], [[termlens-deployment]], [[termlens-architecture]], [[termlens-testing]]
 confidence: high
-updated: 2026-09-23
+updated: 2026-11-09
 ---
 
 # TermLens の課題と次の優先順位
@@ -652,6 +652,11 @@ updated: 2026-09-23
     残高切れは弱点12（バッファ肥大）を誘発する
 14. **Fly.io はカード登録が前提** — 未登録だとマシンが 5 分で強制停止される。
     登録済み（2026-08-13）。詳細は [[termlens-deployment]]
+
+> 2026-11-09 解決: **検証の `reason` を本番ログへ出すのをやめた。** モデルの自由文で、実際に会話の
+> 文脈が Fly のログに残っていた。以後の出力は `term` と定型の内訳だけになる。**過去のログは消えない**
+> ので、Fly 側の保持期間と過去分の有無は人が確認する（未確認。[[termlens-term-extraction]]、
+> [[termlens-deployment]]）。
 
 > 2026-08-19 追記: **WS 越しの入力は実行時の型を保証しない。** `start` の `shownTerms` を
 > 配列チェックだけで通していたため、文字列以外の要素があると `normalizeTerm()` の

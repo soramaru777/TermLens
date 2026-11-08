@@ -17,7 +17,7 @@ import type { TermCard, TermLink, TermStatus } from "../src/protocol.js";
  * 1. **検証対象の選定** — 補正あり・`status !== "confirmed"` は必ず通す。従来のレア度上位も残す
  * 2. **`candidates` をクライアントへ送らない** — `{ ...c }` のスプレッドなので放っておくと漏れる
  * 3. **棄却は `status: "unresolved"` として届く**（#24）。解説は速報のまま・リンクは空。
- *    記録は `term` と `reason` だけで、**文字起こし本文をログに出さない**
+ *    記録は `term` と定型の内訳だけで、**文字起こし本文もモデルの自由文もログに出さない**
  *
  * 実 API は叩かない。抽出は private `extract` を差し替え、清書は `enrich.ts` の
  * `client.responses.create` を差し替える。**`enrichCard` は `void` の投げっぱなしなので、
@@ -342,7 +342,7 @@ test("用語集は関連語だけが検証段へ渡る（参加者名は渡ら�
   assert.ok(!h.verifyInputs[0]!.includes("Cloud"), "当たった語以外は同じ行にあっても渡さない");
 });
 
-test("棄却は status: unresolved として届き、term と reason だけを記録する", async (t) => {
+test("棄却は status: unresolved として届き、term と定型の内訳だけを記録する", async (t) => {
   const chunk = utterance("A");
   const h = harness(t, () => null);
   const drafted = card("クーベルタン", { correctedFrom: "クバネテス", status: "probable" });
@@ -366,7 +366,8 @@ test("棄却は status: unresolved として届き、term と reason だけを�
   assert.notEqual(drafted.description, UNRESOLVED_DESCRIPTION, "速報の解説とは別物であること");
   assert.equal(h.warnings.length, 1);
   assert.ok(h.warnings[0]!.includes("クーベルタン"), "term は記録する");
-  assert.ok(h.warnings[0]!.includes("テストの判定"), "reason も記録する");
+  // reason はモデルの自由文で、会話の文脈を引き写しうる
+  assert.ok(!h.warnings[0]!.includes("テストの判定"), "reason は出さない");
   // **棄却の内訳も記録する**（#25）。「実在しなかった」のか「実在するが会議の話では
   // なかった」のかが本番ログでも読めないと、過剰 unresolved の原因分析ができない
   assert.ok(h.warnings[0]!.includes("文脈に合わず"), "棄却の理由を記録する");
@@ -403,6 +404,7 @@ test("候補#2 が選ばれても term は改名しない（protocol に経路�
   assert.equal(h.warnings.length, 1);
   assert.ok(h.warnings[0]!.includes("別候補"), "何が起きたのかを正しく書く");
   assert.ok(!h.warnings[0]!.includes("理由なし"), "棄却の内訳を差し替えに流用しない");
+  assert.ok(!h.warnings[0]!.includes("テストの判定"), "差し替えでも reason は出さない");
   assert.equal(h.warnings.length, 1);
   assert.ok(h.warnings[0]!.includes("クアドラント"));
 });
